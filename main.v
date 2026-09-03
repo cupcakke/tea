@@ -1,4 +1,3 @@
-```v
 module main
 
 import crypto.sha256

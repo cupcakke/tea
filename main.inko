@@ -1,0 +1,5310 @@
+import std.env
+import std.fs.file (ReadOnlyFile, WriteOnlyFile, ReadWriteFile)
+import std.fs.path (Path)
+import std.io (Buffer, Error as IoError, Read, Write)
+import std.int (Int)
+import std.json (Json, Parser as JsonParser)
+import std.net.ip (IpAddress)
+import std.net.socket (TcpClient, TcpServer)
+import std.rand (Random)
+import std.string (StringBuffer, ToString)
+import std.sync (Channel, Future, Promise)
+import std.sys (exit)
+import std.time (DateTime, Duration, Instant)
+import std.cmp (Ordering, min, max)
+import std.crypto.hash (Hash)
+import std.crypto.sha2 (Sha256)
+import std.bytes (Bytes)
+import std.float (Float)
+import std.iter (Stream)
+import std.process (sleep)
+import std.array (Array)
+import std.map (Map)
+import std.set (Set)
+import std.optional (Option)
+import std.result (Result)
+import std.error (Error as StdError)
+import std.fmt (Format, Formatter)
+import std.builtin.string (String)
+
+let VERSION = 'inko-agent-runtime/3.1.0'
+let DEFAULT_PORT = 8787
+let DEFAULT_HOST = '0.0.0.0'
+let MODEL_BASE_URL = 'https://api.modular.com/v1'
+let MODEL_HOST = 'api.modular.com'
+let MODEL_PATH = '/v1/chat/completions'
+let MODEL_PORT = 443
+let MODEL_NAME = 'zai-org/glm-5.3'
+let SYSTEM_PROMPT = 'You are a helpful assistant. Be concise and accurate. Answer in plain text without markdown unless asked.'
+let TEMPERATURE = 0.96
+let TOP_P = 1.0
+let MAX_TOKENS = 100000
+let FREQUENCY_PENALTY = 0.8
+let PRESENCE_PENALTY = 0.5
+let SEED = 1234
+let SYSTEM2_INTERVAL_MS = 1000
+let SYSTEM1_INTERVAL_MS = 50
+let COGNITION_TOKEN_K = 8
+let COGNITION_TOKEN_H = 16
+let MAX_STEPS_DEFAULT = 128
+let MAX_RETRIES = 3
+let TOKEN_BUDGET_DEFAULT = 2000000
+let CHECKPOINT_EVERY = 1
+let SKILL_INJECT_LIMIT = 2
+let RRF_K = 60.0
+let BM25_K1 = 1.2
+let BM25_B = 0.75
+let EMBED_DIM = 256
+let VALIDATION_GATE_THRESHOLD = 0.0
+let DB_PATH = 'agent_runtime.db'
+let WIKI_PATH = 'knowledge'
+let TRACE_PATH = 'traces'
+let SKILL_PATH = 'skills'
+let WORKSPACE_PATH = 'workspace'
+
+class enum LogLevel {
+  case Debug
+  case Info
+  case Warn
+  case Error
+
+  fn label -> String {
+    match self {
+      case Debug -> 'DEBUG'
+      case Info -> 'INFO'
+      case Warn -> 'WARN'
+      case Error -> 'ERROR'
+    }
+  }
+
+  fn rank -> Int {
+    match self {
+      case Debug -> 0
+      case Info -> 1
+      case Warn -> 2
+      case Error -> 3
+    }
+  }
+}
+
+class Logger {
+  let @level: LogLevel
+  let @sink: Option[WriteOnlyFile]
+
+  fn static new(level: LogLevel) -> Logger {
+    Logger(level: level, sink: Option.None)
+  }
+
+  fn static with_file(level: LogLevel, path: String) -> Logger {
+    let p = Path.new(path)
+    match WriteOnlyFile.append(p) {
+      case Ok(f) -> Logger(level: level, sink: Option.Some(f))
+      case Error(_) -> Logger(level: level, sink: Option.None)
+    }
+  }
+
+  fn mut log(level: LogLevel, message: String) {
+    if level.rank < @level.rank { return }
+    let now = DateTime.utc
+    let line = '[' + now.to_string + '] [' + level.label + '] ' + message + '\n'
+    match @sink {
+      case Some(f) -> {
+        let _ = f.write_string(line)
+        let _ = f.flush
+      }
+      case None -> {}
+    }
+    let mut out = std.stdio.Stdout.new
+    let _ = out.write_string(line)
+  }
+
+  fn mut debug(message: String) { log(LogLevel.Debug, message) }
+  fn mut info(message: String) { log(LogLevel.Info, message) }
+  fn mut warn(message: String) { log(LogLevel.Warn, message) }
+  fn mut error(message: String) { log(LogLevel.Error, message) }
+}
+
+class Clock {
+  fn static now_ms -> Int {
+    DateTime.utc.to_int * 1000
+  }
+
+  fn static iso_now -> String {
+    DateTime.utc.to_string
+  }
+}
+
+class Ids {
+  let @rng: Random
+  let @counter: Int
+
+  fn static new -> Ids {
+    Ids(rng: Random.new, counter: 0)
+  }
+
+  fn mut next(prefix: String) -> String {
+    @counter = @counter + 1
+    let a = @rng.int_between(100000, 999999)
+    let b = Clock.now_ms
+    prefix + '-' + b.to_string + '-' + a.to_string + '-' + @counter.to_string
+  }
+}
+
+class Hex {
+  fn static encode(bytes: ref ByteArray) -> String {
+    let buf = StringBuffer.new
+    let digits = '0123456789abcdef'
+    let mut i = 0
+    while i < bytes.size {
+      let b = bytes.get(i)
+      let hi = b >> 4 & 0xF
+      let lo = b & 0xF
+      buf.push(digits.byte(hi).to_string)
+      buf.push(digits.byte(lo).to_string)
+      i = i + 1
+    }
+    buf.to_string
+  }
+
+  fn static byte_to_hex(b: Int) -> String {
+    let digits = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f']
+    let hi = b >> 4 & 0xF
+    let lo = b & 0xF
+    digits.get(hi) + digits.get(lo)
+  }
+
+  fn static of_bytes(bytes: ref ByteArray) -> String {
+    let buf = StringBuffer.new
+    let mut i = 0
+    while i < bytes.size {
+      buf.push(Hex.byte_to_hex(bytes.get(i)))
+      i = i + 1
+    }
+    buf.to_string
+  }
+}
+
+class Digest {
+  fn static sha256_hex(input: String) -> String {
+    let mut h = Sha256.new
+    h.write(input.to_byte_array)
+    let out = h.finish
+    Hex.of_bytes(out.to_byte_array)
+  }
+
+  fn static short(input: String) -> String {
+    Digest.sha256_hex(input).slice(0, 16)
+  }
+}
+
+class JsonUtil {
+  fn static escape(input: String) -> String {
+    let buf = StringBuffer.new
+    let bytes = input.to_byte_array
+    let mut i = 0
+    while i < bytes.size {
+      let c = bytes.get(i)
+      if c == 34 {
+        buf.push('\\"')
+      } else if c == 92 {
+        buf.push('\\\\')
+      } else if c == 10 {
+        buf.push('\\n')
+      } else if c == 13 {
+        buf.push('\\r')
+      } else if c == 9 {
+        buf.push('\\t')
+      } else if c == 8 {
+        buf.push('\\b')
+      } else if c == 12 {
+        buf.push('\\f')
+      } else if c < 32 {
+        buf.push('\\u00')
+        buf.push(Hex.byte_to_hex(c))
+      } else {
+        buf.push(String.from_byte(c))
+      }
+      i = i + 1
+    }
+    buf.to_string
+  }
+
+  fn static string(value: String) -> String {
+    '"' + JsonUtil.escape(value) + '"'
+  }
+
+  fn static parse(input: String) -> Result[Json, String] {
+    match Json.parse(input) {
+      case Ok(v) -> Result.Ok(v)
+      case Error(e) -> Result.Error('json parse error: ' + e.to_string)
+    }
+  }
+
+  fn static get_string(obj: ref Json, key: String) -> Option[String] {
+    match obj {
+      case Object(map) -> {
+        match map.opt(key) {
+          case Some(v) -> {
+            match v {
+              case String(s) -> Option.Some(s)
+              case Int(i) -> Option.Some(i.to_string)
+              case Float(f) -> Option.Some(f.to_string)
+              case Bool(b) -> Option.Some(if b { 'true' } else { 'false' })
+              case _ -> Option.None
+            }
+          }
+          case None -> Option.None
+        }
+      }
+      case _ -> Option.None
+    }
+  }
+
+  fn static get_int(obj: ref Json, key: String) -> Option[Int] {
+    match obj {
+      case Object(map) -> {
+        match map.opt(key) {
+          case Some(v) -> {
+            match v {
+              case Int(i) -> Option.Some(i)
+              case Float(f) -> Option.Some(f.to_int)
+              case String(s) -> {
+                match Int.parse(s, 10) {
+                  case Some(i) -> Option.Some(i)
+                  case None -> Option.None
+                }
+              }
+              case _ -> Option.None
+            }
+          }
+          case None -> Option.None
+        }
+      }
+      case _ -> Option.None
+    }
+  }
+
+  fn static get_float(obj: ref Json, key: String) -> Option[Float] {
+    match obj {
+      case Object(map) -> {
+        match map.opt(key) {
+          case Some(v) -> {
+            match v {
+              case Float(f) -> Option.Some(f)
+              case Int(i) -> Option.Some(i.to_float)
+              case String(s) -> {
+                match Float.parse(s) {
+                  case Some(f) -> Option.Some(f)
+                  case None -> Option.None
+                }
+              }
+              case _ -> Option.None
+            }
+          }
+          case None -> Option.None
+        }
+      }
+      case _ -> Option.None
+    }
+  }
+
+  fn static get_bool(obj: ref Json, key: String) -> Option[Bool] {
+    match obj {
+      case Object(map) -> {
+        match map.opt(key) {
+          case Some(v) -> {
+            match v {
+              case Bool(b) -> Option.Some(b)
+              case String(s) -> Option.Some(s == 'true')
+              case Int(i) -> Option.Some(i != 0)
+              case _ -> Option.None
+            }
+          }
+          case None -> Option.None
+        }
+      }
+      case _ -> Option.None
+    }
+  }
+
+  fn static get_object(obj: ref Json, key: String) -> Option[Json] {
+    match obj {
+      case Object(map) -> {
+        match map.opt(key) {
+          case Some(v) -> {
+            match v {
+              case Object(_) -> Option.Some(v.clone)
+              case _ -> Option.None
+            }
+          }
+          case None -> Option.None
+        }
+      }
+      case _ -> Option.None
+    }
+  }
+
+  fn static get_array(obj: ref Json, key: String) -> Option[Array[Json]] {
+    match obj {
+      case Object(map) -> {
+        match map.opt(key) {
+          case Some(v) -> {
+            match v {
+              case Array(items) -> Option.Some(items.clone)
+              case _ -> Option.None
+            }
+          }
+          case None -> Option.None
+        }
+      }
+      case _ -> Option.None
+    }
+  }
+
+  fn static stringify(value: ref Json) -> String {
+    match value {
+      case Null -> 'null'
+      case Bool(b) -> if b { 'true' } else { 'false' }
+      case Int(i) -> i.to_string
+      case Float(f) -> f.to_string
+      case String(s) -> JsonUtil.string(s)
+      case Array(items) -> {
+        let buf = StringBuffer.new
+        buf.push('[')
+        let mut i = 0
+        while i < items.size {
+          if i > 0 { buf.push(',') }
+          buf.push(JsonUtil.stringify(items.get(i)))
+          i = i + 1
+        }
+        buf.push(']')
+        buf.to_string
+      }
+      case Object(map) -> {
+        let buf = StringBuffer.new
+        buf.push('{')
+        let keys = map.keys.to_array
+        keys.sort
+        let mut i = 0
+        while i < keys.size {
+          if i > 0 { buf.push(',') }
+          let k = keys.get(i)
+          buf.push(JsonUtil.string(k))
+          buf.push(':')
+          match map.opt(k) {
+            case Some(v) -> buf.push(JsonUtil.stringify(v))
+            case None -> buf.push('null')
+          }
+          i = i + 1
+        }
+        buf.push('}')
+        buf.to_string
+      }
+    }
+  }
+}
+
+class Sqlite {
+  let @path: String
+  let @tables: Map[String, Array[Map[String, String]]]
+  let @lock: Bool
+  let @wal: Array[String]
+
+  fn static open(path: String) -> Sqlite {
+    let db = Sqlite(path: path, tables: Map.new, lock: false, wal: Array.new)
+    db.bootstrap
+    db.recover
+    db
+  }
+
+  fn mut bootstrap {
+    let names = [
+      'sessions', 'messages', 'states', 'checkpoints', 'traces', 'skills',
+      'wiki', 'reflections', 'distill', 'tenants', 'budgets', 'receipts',
+      'cognition', 'validations', 'patches', 'embeddings', 'events', 'files'
+    ]
+    let mut i = 0
+    while i < names.size {
+      let n = names.get(i)
+      if @tables.opt(n).none? { @tables.set(n, Array.new) }
+      i = i + 1
+    }
+  }
+
+  fn mut recover {
+    let p = Path.new(@path)
+    if p.exists.false? { return }
+    match ReadOnlyFile.new(p) {
+      case Ok(mut f) -> {
+        let buf = ByteArray.new
+        match f.read_all(mut buf) {
+          case Ok(_) -> {
+            let content = buf.into_string
+            let lines = content.split('\n').to_array
+            let mut i = 0
+            while i < lines.size {
+              let line = lines.get(i)
+              if line.size > 0 { apply_wal_line(line) }
+              i = i + 1
+            }
+          }
+          case Error(_) -> {}
+        }
+      }
+      case Error(_) -> {}
+    }
+  }
+
+  fn mut apply_wal_line(line: String) {
+    match JsonUtil.parse(line) {
+      case Ok(j) -> {
+        let op = JsonUtil.get_string(j, 'op').or('')
+        let table = JsonUtil.get_string(j, 'table').or('')
+        if op == 'insert' {
+          match JsonUtil.get_object(j, 'row') {
+            case Some(row) -> {
+              let m = json_to_map(row)
+              insert_mem(table, m)
+            }
+            case None -> {}
+          }
+        } else if op == 'update' {
+          let key = JsonUtil.get_string(j, 'key').or('id')
+          let val = JsonUtil.get_string(j, 'value').or('')
+          match JsonUtil.get_object(j, 'row') {
+            case Some(row) -> {
+              let m = json_to_map(row)
+              update_mem(table, key, val, m)
+            }
+            case None -> {}
+          }
+        } else if op == 'delete' {
+          let key = JsonUtil.get_string(j, 'key').or('id')
+          let val = JsonUtil.get_string(j, 'value').or('')
+          delete_mem(table, key, val)
+        }
+      }
+      case Error(_) -> {}
+    }
+  }
+
+  fn json_to_map(j: ref Json) -> Map[String, String] {
+    let m = Map.new
+    match j {
+      case Object(map) -> {
+        let keys = map.keys.to_array
+        let mut i = 0
+        while i < keys.size {
+          let k = keys.get(i)
+          match map.opt(k) {
+            case Some(v) -> {
+              match v {
+                case String(s) -> m.set(k, s)
+                case Int(n) -> m.set(k, n.to_string)
+                case Float(f) -> m.set(k, f.to_string)
+                case Bool(b) -> m.set(k, if b { 'true' } else { 'false' })
+                case Null -> m.set(k, '')
+                case _ -> m.set(k, JsonUtil.stringify(v))
+              }
+            }
+            case None -> {}
+          }
+          i = i + 1
+        }
+      }
+      case _ -> {}
+    }
+    m
+  }
+
+  fn map_to_json(m: ref Map[String, String]) -> String {
+    let buf = StringBuffer.new
+    buf.push('{')
+    let keys = m.keys.to_array
+    keys.sort
+    let mut i = 0
+    while i < keys.size {
+      if i > 0 { buf.push(',') }
+      let k = keys.get(i)
+      buf.push(JsonUtil.string(k))
+      buf.push(':')
+      buf.push(JsonUtil.string(m.opt(k).or('')))
+      i = i + 1
+    }
+    buf.push('}')
+    buf.to_string
+  }
+
+  fn mut insert_mem(table: String, row: Map[String, String]) {
+    match @tables.opt_mut(table) {
+      case Some(rows) -> rows.push(row)
+      case None -> {
+        let rows = Array.new
+        rows.push(row)
+        @tables.set(table, rows)
+      }
+    }
+  }
+
+  fn mut update_mem(table: String, key: String, value: String, patch: ref Map[String, String]) {
+    match @tables.opt_mut(table) {
+      case Some(rows) -> {
+        let mut i = 0
+        while i < rows.size {
+          let row = rows.get_mut(i)
+          if row.opt(key).or('') == value {
+            let pk = patch.keys.to_array
+            let mut j = 0
+            while j < pk.size {
+              let k = pk.get(j)
+              row.set(k, patch.opt(k).or(''))
+              j = j + 1
+            }
+          }
+          i = i + 1
+        }
+      }
+      case None -> {}
+    }
+  }
+
+  fn mut delete_mem(table: String, key: String, value: String) {
+    match @tables.opt_mut(table) {
+      case Some(rows) -> {
+        let keep = Array.new
+        let mut i = 0
+        while i < rows.size {
+          let row = rows.get(i)
+          if row.opt(key).or('') != value { keep.push(row.clone) }
+          i = i + 1
+        }
+        @tables.set(table, keep)
+      }
+      case None -> {}
+    }
+  }
+
+  fn mut append_wal(line: String) {
+    let p = Path.new(@path)
+    match WriteOnlyFile.append(p) {
+      case Ok(mut f) -> {
+        let _ = f.write_string(line + '\n')
+        let _ = f.flush
+      }
+      case Error(_) -> {}
+    }
+  }
+
+  fn mut insert(table: String, row: Map[String, String]) {
+    let payload = '{"op":"insert","table":' + JsonUtil.string(table) + ',"row":' + map_to_json(row) + '}'
+    insert_mem(table, row.clone)
+    append_wal(payload)
+  }
+
+  fn mut update(table: String, key: String, value: String, patch: Map[String, String]) {
+    let payload = '{"op":"update","table":' + JsonUtil.string(table)
+      + ',"key":' + JsonUtil.string(key)
+      + ',"value":' + JsonUtil.string(value)
+      + ',"row":' + map_to_json(patch) + '}'
+    update_mem(table, key, value, patch)
+    append_wal(payload)
+  }
+
+  fn mut delete(table: String, key: String, value: String) {
+    let payload = '{"op":"delete","table":' + JsonUtil.string(table)
+      + ',"key":' + JsonUtil.string(key)
+      + ',"value":' + JsonUtil.string(value) + '}'
+    delete_mem(table, key, value)
+    append_wal(payload)
+  }
+
+  fn select_all(table: String) -> Array[Map[String, String]] {
+    match @tables.opt(table) {
+      case Some(rows) -> rows.clone
+      case None -> Array.new
+    }
+  }
+
+  fn select_where(table: String, key: String, value: String) -> Array[Map[String, String]] {
+    let out = Array.new
+    match @tables.opt(table) {
+      case Some(rows) -> {
+        let mut i = 0
+        while i < rows.size {
+          let row = rows.get(i)
+          if row.opt(key).or('') == value { out.push(row.clone) }
+          i = i + 1
+        }
+      }
+      case None -> {}
+    }
+    out
+  }
+
+  fn select_one(table: String, key: String, value: String) -> Option[Map[String, String]] {
+    let rows = select_where(table, key, value)
+    if rows.size > 0 { Option.Some(rows.get(0)) } else { Option.None }
+  }
+
+  fn count(table: String) -> Int {
+    match @tables.opt(table) {
+      case Some(rows) -> rows.size
+      case None -> 0
+    }
+  }
+}
+
+class Embedder {
+  let @dim: Int
+
+  fn static new(dim: Int) -> Embedder {
+    Embedder(dim: dim)
+  }
+
+  fn tokenize(text: String) -> Array[String] {
+    let out = Array.new
+    let lower = text.to_lower
+    let bytes = lower.to_byte_array
+    let cur = StringBuffer.new
+    let mut i = 0
+    while i < bytes.size {
+      let c = bytes.get(i)
+      let alnum = (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c == 95
+      if alnum {
+        cur.push(String.from_byte(c))
+      } else {
+        let t = cur.to_string
+        if t.size > 1 { out.push(t) }
+        cur.clear
+      }
+      i = i + 1
+    }
+    let t = cur.to_string
+    if t.size > 1 { out.push(t) }
+    out
+  }
+
+  fn hash_token(token: String) -> Int {
+    let mut h = 2166136261
+    let bytes = token.to_byte_array
+    let mut i = 0
+    while i < bytes.size {
+      h = h ^ bytes.get(i)
+      h = h * 16777619 & 0xFFFFFFFF
+      i = i + 1
+    }
+    h
+  }
+
+  fn embed(text: String) -> Array[Float] {
+    let vec = Array.filled(with: 0.0, times: @dim)
+    let toks = tokenize(text)
+    let mut i = 0
+    while i < toks.size {
+      let t = toks.get(i)
+      let h = hash_token(t)
+      let idx = h % @dim
+      let sign = if h >> 16 & 1 == 1 { 1.0 } else { -1.0 }
+      vec.set(idx, vec.get(idx) + sign)
+      let bi = (h >> 8) % @dim
+      vec.set(bi, vec.get(bi) + sign * 0.5)
+      i = i + 1
+    }
+    let mut norm = 0.0
+    let mut j = 0
+    while j < @dim {
+      norm = norm + vec.get(j) * vec.get(j)
+      j = j + 1
+    }
+    let n = norm.square_root
+    if n > 0.0 {
+      let mut k = 0
+      while k < @dim {
+        vec.set(k, vec.get(k) / n)
+        k = k + 1
+      }
+    }
+    vec
+  }
+
+  fn cosine(a: ref Array[Float], b: ref Array[Float]) -> Float {
+    let n = min(a.size, b.size)
+    let mut dot = 0.0
+    let mut i = 0
+    while i < n {
+      dot = dot + a.get(i) * b.get(i)
+      i = i + 1
+    }
+    dot
+  }
+
+  fn encode(vec: ref Array[Float]) -> String {
+    let buf = StringBuffer.new
+    let mut i = 0
+    while i < vec.size {
+      if i > 0 { buf.push(',') }
+      buf.push(vec.get(i).to_string)
+      i = i + 1
+    }
+    buf.to_string
+  }
+
+  fn decode(s: String) -> Array[Float] {
+    let out = Array.new
+    if s.size == 0 { return out }
+    let parts = s.split(',').to_array
+    let mut i = 0
+    while i < parts.size {
+      match Float.parse(parts.get(i)) {
+        case Some(f) -> out.push(f)
+        case None -> out.push(0.0)
+      }
+      i = i + 1
+    }
+    out
+  }
+}
+
+class Bm25Index {
+  let @docs: Map[String, Array[String]]
+  let @df: Map[String, Int]
+  let @avg_len: Float
+  let @total: Int
+  let @embedder: Embedder
+
+  fn static new -> Bm25Index {
+    Bm25Index(docs: Map.new, df: Map.new, avg_len: 0.0, total: 0, embedder: Embedder.new(EMBED_DIM))
+  }
+
+  fn mut add(id: String, text: String) {
+    let toks = @embedder.tokenize(text)
+    @docs.set(id, toks.clone)
+    let seen = Set.new
+    let mut i = 0
+    while i < toks.size {
+      let t = toks.get(i)
+      if seen.contains?(t).false? {
+        seen.insert(t)
+        @df.set(t, @df.opt(t).or(0) + 1)
+      }
+      i = i + 1
+    }
+    @total = @docs.size
+    let mut sum = 0
+    let keys = @docs.keys.to_array
+    let mut j = 0
+    while j < keys.size {
+      sum = sum + @docs.opt(keys.get(j)).or(Array.new).size
+      j = j + 1
+    }
+    @avg_len = if @total > 0 { sum.to_float / @total.to_float } else { 0.0 }
+  }
+
+  fn mut remove(id: String) {
+    match @docs.opt(id) {
+      case Some(toks) -> {
+        let seen = Set.new
+        let mut i = 0
+        while i < toks.size {
+          let t = toks.get(i)
+          if seen.contains?(t).false? {
+            seen.insert(t)
+            let d = @df.opt(t).or(1) - 1
+            if d <= 0 { @df.remove(t) } else { @df.set(t, d) }
+          }
+          i = i + 1
+        }
+      }
+      case None -> {}
+    }
+    @docs.remove(id)
+    @total = @docs.size
+  }
+
+  fn score(query: String) -> Array[(String, Float)] {
+    let qtoks = @embedder.tokenize(query)
+    let results = Array.new
+    let ids = @docs.keys.to_array
+    let mut i = 0
+    while i < ids.size {
+      let id = ids.get(i)
+      let toks = @docs.opt(id).or(Array.new)
+      let dl = toks.size.to_float
+      let mut s = 0.0
+      let mut q = 0
+      while q < qtoks.size {
+        let term = qtoks.get(q)
+        let mut tf = 0
+        let mut k = 0
+        while k < toks.size {
+          if toks.get(k) == term { tf = tf + 1 }
+          k = k + 1
+        }
+        if tf > 0 {
+          let dfv = @df.opt(term).or(0).to_float
+          let n = @total.to_float
+          let idf = ((n - dfv + 0.5) / (dfv + 0.5) + 1.0).logarithm_natural
+          let denom = tf.to_float + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / (if @avg_len > 0.0 { @avg_len } else { 1.0 }))
+          s = s + idf * (tf.to_float * (BM25_K1 + 1.0)) / denom
+        }
+        q = q + 1
+      }
+      if s > 0.0 { results.push((id, s)) }
+      i = i + 1
+    }
+    results
+  }
+}
+
+class VectorIndex {
+  let @vectors: Map[String, Array[Float]]
+  let @embedder: Embedder
+
+  fn static new -> VectorIndex {
+    VectorIndex(vectors: Map.new, embedder: Embedder.new(EMBED_DIM))
+  }
+
+  fn mut add(id: String, text: String) {
+    @vectors.set(id, @embedder.embed(text))
+  }
+
+  fn mut add_vector(id: String, vec: Array[Float]) {
+    @vectors.set(id, vec)
+  }
+
+  fn mut remove(id: String) {
+    @vectors.remove(id)
+  }
+
+  fn search(query: String) -> Array[(String, Float)] {
+    let qv = @embedder.embed(query)
+    let out = Array.new
+    let ids = @vectors.keys.to_array
+    let mut i = 0
+    while i < ids.size {
+      let id = ids.get(i)
+      let v = @vectors.opt(id).or(Array.new)
+      let s = @embedder.cosine(qv, v)
+      if s > 0.0 { out.push((id, s)) }
+      i = i + 1
+    }
+    out
+  }
+}
+
+class Rrf {
+  fn static rank_map(scored: ref Array[(String, Float)]) -> Map[String, Int] {
+    let arr = scored.clone
+    arr.sort_by fn (a: ref (String, Float), b: ref (String, Float)) -> Ordering {
+      if b.1 > a.1 { Ordering.Greater } else if b.1 < a.1 { Ordering.Less } else { Ordering.Equal }
+    }
+    let m = Map.new
+    let mut i = 0
+    while i < arr.size {
+      m.set(arr.get(i).0, i + 1)
+      i = i + 1
+    }
+    m
+  }
+
+  fn static fuse(a: ref Array[(String, Float)], b: ref Array[(String, Float)]) -> Array[(String, Float)] {
+    let ra = Rrf.rank_map(a)
+    let rb = Rrf.rank_map(b)
+    let ids = Set.new
+    let ka = ra.keys.to_array
+    let mut i = 0
+    while i < ka.size { ids.insert(ka.get(i)); i = i + 1 }
+    let kb = rb.keys.to_array
+    let mut j = 0
+    while j < kb.size { ids.insert(kb.get(j)); j = j + 1 }
+    let out = Array.new
+    let all = ids.to_array
+    let mut k = 0
+    while k < all.size {
+      let id = all.get(k)
+      let mut s = 0.0
+      match ra.opt(id) {
+        case Some(r) -> s = s + 1.0 / (RRF_K + r.to_float)
+        case None -> {}
+      }
+      match rb.opt(id) {
+        case Some(r) -> s = s + 1.0 / (RRF_K + r.to_float)
+        case None -> {}
+      }
+      out.push((id, s))
+      k = k + 1
+    }
+    out.sort_by fn (x: ref (String, Float), y: ref (String, Float)) -> Ordering {
+      if y.1 > x.1 { Ordering.Greater } else if y.1 < x.1 { Ordering.Less } else { Ordering.Equal }
+    }
+    out
+  }
+}
+
+class Spec {
+  let @id: String
+  let @task: String
+  let @constraints: Array[String]
+  let @success_criteria: Array[String]
+  let @tools_allowed: Array[String]
+  let @max_steps: Int
+  let @tenant: String
+  let @created_at: String
+
+  fn static new(id: String, task: String, tenant: String) -> Spec {
+    Spec(
+      id: id,
+      task: task,
+      constraints: Array.new,
+      success_criteria: Array.new,
+      tools_allowed: Array.new,
+      max_steps: MAX_STEPS_DEFAULT,
+      tenant: tenant,
+      created_at: Clock.iso_now
+    )
+  }
+
+  fn to_json -> String {
+    let buf = StringBuffer.new
+    buf.push('{"id":')
+    buf.push(JsonUtil.string(@id))
+    buf.push(',"task":')
+    buf.push(JsonUtil.string(@task))
+    buf.push(',"constraints":[')
+    let mut i = 0
+    while i < @constraints.size {
+      if i > 0 { buf.push(',') }
+      buf.push(JsonUtil.string(@constraints.get(i)))
+      i = i + 1
+    }
+    buf.push('],"success_criteria":[')
+    let mut j = 0
+    while j < @success_criteria.size {
+      if j > 0 { buf.push(',') }
+      buf.push(JsonUtil.string(@success_criteria.get(j)))
+      j = j + 1
+    }
+    buf.push('],"tools_allowed":[')
+    let mut k = 0
+    while k < @tools_allowed.size {
+      if k > 0 { buf.push(',') }
+      buf.push(JsonUtil.string(@tools_allowed.get(k)))
+      k = k + 1
+    }
+    buf.push('],"max_steps":')
+    buf.push(@max_steps.to_string)
+    buf.push(',"tenant":')
+    buf.push(JsonUtil.string(@tenant))
+    buf.push(',"created_at":')
+    buf.push(JsonUtil.string(@created_at))
+    buf.push('}')
+    buf.to_string
+  }
+
+  fn prompt_block -> String {
+    let buf = StringBuffer.new
+    buf.push('TASK SPECIFICATION (IMMUTABLE)\n')
+    buf.push('task_id: ' + @id + '\n')
+    buf.push('objective: ' + @task + '\n')
+    if @constraints.size > 0 {
+      buf.push('constraints:\n')
+      let mut i = 0
+      while i < @constraints.size {
+        buf.push('  - ' + @constraints.get(i) + '\n')
+        i = i + 1
+      }
+    }
+    if @success_criteria.size > 0 {
+      buf.push('success_criteria:\n')
+      let mut j = 0
+      while j < @success_criteria.size {
+        buf.push('  - ' + @success_criteria.get(j) + '\n')
+        j = j + 1
+      }
+    }
+    buf.push('max_steps: ' + @max_steps.to_string + '\n')
+    buf.to_string
+  }
+}
+
+class ExecState {
+  let @data: Map[String, String]
+  let @subgoals: Array[String]
+  let @done: Array[String]
+  let @blockers: Array[String]
+  let @facts: Array[String]
+  let @step: Int
+  let @version: Int
+  let @terminal: Bool
+  let @answer: String
+
+  fn static new -> ExecState {
+    ExecState(
+      data: Map.new,
+      subgoals: Array.new,
+      done: Array.new,
+      blockers: Array.new,
+      facts: Array.new,
+      step: 0,
+      version: 0,
+      terminal: false,
+      answer: ''
+    )
+  }
+
+  fn clone_state -> ExecState {
+    ExecState(
+      data: @data.clone,
+      subgoals: @subgoals.clone,
+      done: @done.clone,
+      blockers: @blockers.clone,
+      facts: @facts.clone,
+      step: @step,
+      version: @version,
+      terminal: @terminal,
+      answer: @answer
+    )
+  }
+
+  fn to_json -> String {
+    let buf = StringBuffer.new
+    buf.push('{"step":')
+    buf.push(@step.to_string)
+    buf.push(',"version":')
+    buf.push(@version.to_string)
+    buf.push(',"terminal":')
+    buf.push(if @terminal { 'true' } else { 'false' })
+    buf.push(',"answer":')
+    buf.push(JsonUtil.string(@answer))
+    buf.push(',"subgoals":[')
+    let mut i = 0
+    while i < @subgoals.size {
+      if i > 0 { buf.push(',') }
+      buf.push(JsonUtil.string(@subgoals.get(i)))
+      i = i + 1
+    }
+    buf.push('],"done":[')
+    let mut j = 0
+    while j < @done.size {
+      if j > 0 { buf.push(',') }
+      buf.push(JsonUtil.string(@done.get(j)))
+      j = j + 1
+    }
+    buf.push('],"blockers":[')
+    let mut k = 0
+    while k < @blockers.size {
+      if k > 0 { buf.push(',') }
+      buf.push(JsonUtil.string(@blockers.get(k)))
+      k = k + 1
+    }
+    buf.push('],"facts":[')
+    let mut m = 0
+    while m < @facts.size {
+      if m > 0 { buf.push(',') }
+      buf.push(JsonUtil.string(@facts.get(m)))
+      m = m + 1
+    }
+    buf.push('],"data":{')
+    let keys = @data.keys.to_array
+    keys.sort
+    let mut n = 0
+    while n < keys.size {
+      if n > 0 { buf.push(',') }
+      let key = keys.get(n)
+      buf.push(JsonUtil.string(key))
+      buf.push(':')
+      buf.push(JsonUtil.string(@data.opt(key).or('')))
+      n = n + 1
+    }
+    buf.push('}}')
+    buf.to_string
+  }
+
+  fn static from_json(j: ref Json) -> ExecState {
+    let s = ExecState.new
+    s.step = JsonUtil.get_int(j, 'step').or(0)
+    s.version = JsonUtil.get_int(j, 'version').or(0)
+    s.terminal = JsonUtil.get_bool(j, 'terminal').or(false)
+    s.answer = JsonUtil.get_string(j, 'answer').or('')
+    match JsonUtil.get_array(j, 'subgoals') {
+      case Some(arr) -> {
+        let mut i = 0
+        while i < arr.size {
+          match arr.get(i) {
+            case String(v) -> s.subgoals.push(v)
+            case _ -> {}
+          }
+          i = i + 1
+        }
+      }
+      case None -> {}
+    }
+    match JsonUtil.get_array(j, 'done') {
+      case Some(arr) -> {
+        let mut i = 0
+        while i < arr.size {
+          match arr.get(i) {
+            case String(v) -> s.done.push(v)
+            case _ -> {}
+          }
+          i = i + 1
+        }
+      }
+      case None -> {}
+    }
+    match JsonUtil.get_array(j, 'blockers') {
+      case Some(arr) -> {
+        let mut i = 0
+        while i < arr.size {
+          match arr.get(i) {
+            case String(v) -> s.blockers.push(v)
+            case _ -> {}
+          }
+          i = i + 1
+        }
+      }
+      case None -> {}
+    }
+    match JsonUtil.get_array(j, 'facts') {
+      case Some(arr) -> {
+        let mut i = 0
+        while i < arr.size {
+          match arr.get(i) {
+            case String(v) -> s.facts.push(v)
+            case _ -> {}
+          }
+          i = i + 1
+        }
+      }
+      case None -> {}
+    }
+    match JsonUtil.get_object(j, 'data') {
+      case Some(d) -> {
+        match d {
+          case Object(map) -> {
+            let keys = map.keys.to_array
+            let mut i = 0
+            while i < keys.size {
+              let k = keys.get(i)
+              match map.opt(k) {
+                case Some(v) -> {
+                  match v {
+                    case String(x) -> s.data.set(k, x)
+                    case Int(x) -> s.data.set(k, x.to_string)
+                    case Float(x) -> s.data.set(k, x.to_string)
+                    case Bool(x) -> s.data.set(k, if x { 'true' } else { 'false' })
+                    case _ -> s.data.set(k, JsonUtil.stringify(v))
+                  }
+                }
+                case None -> {}
+              }
+              i = i + 1
+            }
+          }
+          case _ -> {}
+        }
+      }
+      case None -> {}
+    }
+    s
+  }
+
+  fn prompt_block -> String {
+    let buf = StringBuffer.new
+    buf.push('EXECUTION STATE (SUFFICIENT STATISTIC)\n')
+    buf.push('step: ' + @step.to_string + '\n')
+    buf.push('version: ' + @version.to_string + '\n')
+    if @subgoals.size > 0 {
+      buf.push('open_subgoals:\n')
+      let mut i = 0
+      while i < @subgoals.size {
+        buf.push('  - ' + @subgoals.get(i) + '\n')
+        i = i + 1
+      }
+    } else {
+      buf.push('open_subgoals: none\n')
+    }
+    if @done.size > 0 {
+      buf.push('completed:\n')
+      let mut j = 0
+      while j < @done.size {
+        buf.push('  - ' + @done.get(j) + '\n')
+        j = j + 1
+      }
+    }
+    if @blockers.size > 0 {
+      buf.push('blockers:\n')
+      let mut k = 0
+      while k < @blockers.size {
+        buf.push('  - ' + @blockers.get(k) + '\n')
+        k = k + 1
+      }
+    }
+    if @facts.size > 0 {
+      buf.push('verified_facts:\n')
+      let mut m = 0
+      while m < @facts.size {
+        buf.push('  - ' + @facts.get(m) + '\n')
+        m = m + 1
+      }
+    }
+    let keys = @data.keys.to_array
+    keys.sort
+    if keys.size > 0 {
+      buf.push('state_slots:\n')
+      let mut n = 0
+      while n < keys.size {
+        buf.push('  ' + keys.get(n) + ': ' + @data.opt(keys.get(n)).or('') + '\n')
+        n = n + 1
+      }
+    }
+    buf.to_string
+  }
+
+  fn digest -> String {
+    Digest.short(to_json)
+  }
+}
+
+class Observation {
+  let @source: String
+  let @kind: String
+  let @content: String
+  let @ok: Bool
+  let @at: String
+
+  fn static new(source: String, kind: String, content: String, ok: Bool) -> Observation {
+    Observation(source: source, kind: kind, content: content, ok: ok, at: Clock.iso_now)
+  }
+
+  fn to_json -> String {
+    '{"source":' + JsonUtil.string(@source)
+      + ',"kind":' + JsonUtil.string(@kind)
+      + ',"ok":' + (if @ok { 'true' } else { 'false' })
+      + ',"content":' + JsonUtil.string(@content)
+      + ',"at":' + JsonUtil.string(@at) + '}'
+  }
+
+  fn prompt_block -> String {
+    let buf = StringBuffer.new
+    buf.push('LATEST OBSERVATION\n')
+    buf.push('source: ' + @source + '\n')
+    buf.push('kind: ' + @kind + '\n')
+    buf.push('ok: ' + (if @ok { 'true' } else { 'false' }) + '\n')
+    buf.push('content: ' + truncate(@content, 4000) + '\n')
+    buf.to_string
+  }
+
+  fn truncate(s: String, n: Int) -> String {
+    if s.size <= n { s } else { s.slice(0, n) + '...[truncated]' }
+  }
+}
+
+class StatePatch {
+  let @set_slots: Map[String, String]
+  let @delete_slots: Array[String]
+  let @add_subgoals: Array[String]
+  let @complete_subgoals: Array[String]
+  let @add_blockers: Array[String]
+  let @clear_blockers: Array[String]
+  let @add_facts: Array[String]
+  let @terminal: Bool
+  let @answer: String
+  let @raw: String
+
+  fn static new -> StatePatch {
+    StatePatch(
+      set_slots: Map.new,
+      delete_slots: Array.new,
+      add_subgoals: Array.new,
+      complete_subgoals: Array.new,
+      add_blockers: Array.new,
+      clear_blockers: Array.new,
+      add_facts: Array.new,
+      terminal: false,
+      answer: '',
+      raw: ''
+    )
+  }
+
+  fn static from_json(j: ref Json, raw: String) -> StatePatch {
+    let p = StatePatch.new
+    p.raw = raw
+    match JsonUtil.get_object(j, 'set') {
+      case Some(o) -> {
+        match o {
+          case Object(map) -> {
+            let keys = map.keys.to_array
+            let mut i = 0
+            while i < keys.size {
+              let k = keys.get(i)
+              match map.opt(k) {
+                case Some(v) -> {
+                  match v {
+                    case Null -> p.delete_slots.push(k)
+                    case String(s) -> p.set_slots.set(k, s)
+                    case Int(n) -> p.set_slots.set(k, n.to_string)
+                    case Float(f) -> p.set_slots.set(k, f.to_string)
+                    case Bool(b) -> p.set_slots.set(k, if b { 'true' } else { 'false' })
+                    case _ -> p.set_slots.set(k, JsonUtil.stringify(v))
+                  }
+                }
+                case None -> {}
+              }
+              i = i + 1
+            }
+          }
+          case _ -> {}
+        }
+      }
+      case None -> {}
+    }
+    match JsonUtil.get_array(j, 'delete') {
+      case Some(arr) -> {
+        let mut i = 0
+        while i < arr.size {
+          match arr.get(i) {
+            case String(s) -> p.delete_slots.push(s)
+            case _ -> {}
+          }
+          i = i + 1
+        }
+      }
+      case None -> {}
+    }
+    p.add_subgoals = StatePatch.str_array(j, 'add_subgoals')
+    p.complete_subgoals = StatePatch.str_array(j, 'complete_subgoals')
+    p.add_blockers = StatePatch.str_array(j, 'add_blockers')
+    p.clear_blockers = StatePatch.str_array(j, 'clear_blockers')
+    p.add_facts = StatePatch.str_array(j, 'add_facts')
+    p.terminal = JsonUtil.get_bool(j, 'terminal').or(false)
+    p.answer = JsonUtil.get_string(j, 'answer').or('')
+    p
+  }
+
+  fn static str_array(j: ref Json, key: String) -> Array[String] {
+    let out = Array.new
+    match JsonUtil.get_array(j, key) {
+      case Some(arr) -> {
+        let mut i = 0
+        while i < arr.size {
+          match arr.get(i) {
+            case String(s) -> out.push(s)
+            case Int(n) -> out.push(n.to_string)
+            case _ -> {}
+          }
+          i = i + 1
+        }
+      }
+      case None -> {}
+    }
+    out
+  }
+}
+
+class ActionCmd {
+  let @tool: String
+  let @args: Map[String, String]
+  let @rationale: String
+  let @raw: String
+
+  fn static new -> ActionCmd {
+    ActionCmd(tool: 'noop', args: Map.new, rationale: '', raw: '')
+  }
+
+  fn static from_json(j: ref Json, raw: String) -> ActionCmd {
+    let a = ActionCmd.new
+    a.raw = raw
+    a.tool = JsonUtil.get_string(j, 'tool').or('noop')
+    a.rationale = JsonUtil.get_string(j, 'rationale').or('')
+    match JsonUtil.get_object(j, 'args') {
+      case Some(o) -> {
+        match o {
+          case Object(map) -> {
+            let keys = map.keys.to_array
+            let mut i = 0
+            while i < keys.size {
+              let k = keys.get(i)
+              match map.opt(k) {
+                case Some(v) -> {
+                  match v {
+                    case String(s) -> a.args.set(k, s)
+                    case Int(n) -> a.args.set(k, n.to_string)
+                    case Float(f) -> a.args.set(k, f.to_string)
+                    case Bool(b) -> a.args.set(k, if b { 'true' } else { 'false' })
+                    case Null -> a.args.set(k, '')
+                    case _ -> a.args.set(k, JsonUtil.stringify(v))
+                  }
+                }
+                case None -> {}
+              }
+              i = i + 1
+            }
+          }
+          case _ -> {}
+        }
+      }
+      case None -> {}
+    }
+    a
+  }
+
+  fn to_json -> String {
+    let buf = StringBuffer.new
+    buf.push('{"tool":')
+    buf.push(JsonUtil.string(@tool))
+    buf.push(',"rationale":')
+    buf.push(JsonUtil.string(@rationale))
+    buf.push(',"args":{')
+    let keys = @args.keys.to_array
+    keys.sort
+    let mut i = 0
+    while i < keys.size {
+      if i > 0 { buf.push(',') }
+      buf.push(JsonUtil.string(keys.get(i)))
+      buf.push(':')
+      buf.push(JsonUtil.string(@args.opt(keys.get(i)).or('')))
+      i = i + 1
+    }
+    buf.push('}}')
+    buf.to_string
+  }
+}
+
+class ValidationResult {
+  let @ok: Bool
+  let @errors: Array[String]
+
+  fn static ok_result -> ValidationResult {
+    ValidationResult(ok: true, errors: Array.new)
+  }
+
+  fn static fail(message: String) -> ValidationResult {
+    let e = Array.new
+    e.push(message)
+    ValidationResult(ok: false, errors: e)
+  }
+
+  fn mut add(message: String) {
+    @errors.push(message)
+    @ok = false
+  }
+
+  fn message -> String {
+    let buf = StringBuffer.new
+    let mut i = 0
+    while i < @errors.size {
+      if i > 0 { buf.push('; ') }
+      buf.push(@errors.get(i))
+      i = i + 1
+    }
+    buf.to_string
+  }
+}
+
+class StateValidator {
+  let @allowed_tools: Set[String]
+  let @max_slots: Int
+  let @max_value_len: Int
+
+  fn static new(tools: ref Array[String]) -> StateValidator {
+    let s = Set.new
+    let mut i = 0
+    while i < tools.size {
+      s.insert(tools.get(i))
+      i = i + 1
+    }
+    StateValidator(allowed_tools: s, max_slots: 256, max_value_len: 20000)
+  }
+
+  fn validate_patch(patch: ref StatePatch, state: ref ExecState) -> ValidationResult {
+    let res = ValidationResult.ok_result
+    let keys = patch.set_slots.keys.to_array
+    if state.data.size + keys.size > @max_slots {
+      let r = ValidationResult.fail('state slot budget exceeded')
+      return r
+    }
+    let mut i = 0
+    while i < keys.size {
+      let k = keys.get(i)
+      if k.size == 0 {
+        let r = ValidationResult.fail('empty slot key')
+        return r
+      }
+      if k.size > 128 {
+        let r = ValidationResult.fail('slot key too long: ' + k)
+        return r
+      }
+      let v = patch.set_slots.opt(k).or('')
+      if v.size > @max_value_len {
+        let r = ValidationResult.fail('slot value too long for key ' + k)
+        return r
+      }
+      i = i + 1
+    }
+    if patch.terminal and patch.answer.size == 0 {
+      let r = ValidationResult.fail('terminal patch requires non-empty answer')
+      return r
+    }
+    res
+  }
+
+  fn validate_action(action: ref ActionCmd) -> ValidationResult {
+    if action.tool.size == 0 {
+      return ValidationResult.fail('missing tool name')
+    }
+    if @allowed_tools.contains?(action.tool).false? {
+      return ValidationResult.fail('tool not authorized: ' + action.tool)
+    }
+    ValidationResult.ok_result
+  }
+}
+
+class StateMerger {
+  fn static apply(state: ref ExecState, patch: ref StatePatch) -> ExecState {
+    let next = state.clone_state
+    let sk = patch.set_slots.keys.to_array
+    let mut i = 0
+    while i < sk.size {
+      let k = sk.get(i)
+      next.data.set(k, patch.set_slots.opt(k).or(''))
+      i = i + 1
+    }
+    let mut j = 0
+    while j < patch.delete_slots.size {
+      next.data.remove(patch.delete_slots.get(j))
+      j = j + 1
+    }
+    let mut k = 0
+    while k < patch.add_subgoals.size {
+      let g = patch.add_subgoals.get(k)
+      if StateMerger.contains(next.subgoals, g).false? and StateMerger.contains(next.done, g).false? {
+        next.subgoals.push(g)
+      }
+      k = k + 1
+    }
+    let mut m = 0
+    while m < patch.complete_subgoals.size {
+      let g = patch.complete_subgoals.get(m)
+      next.subgoals = StateMerger.without(next.subgoals, g)
+      if StateMerger.contains(next.done, g).false? { next.done.push(g) }
+      m = m + 1
+    }
+    let mut n = 0
+    while n < patch.add_blockers.size {
+      let b = patch.add_blockers.get(n)
+      if StateMerger.contains(next.blockers, b).false? { next.blockers.push(b) }
+      n = n + 1
+    }
+    let mut o = 0
+    while o < patch.clear_blockers.size {
+      next.blockers = StateMerger.without(next.blockers, patch.clear_blockers.get(o))
+      o = o + 1
+    }
+    let mut p = 0
+    while p < patch.add_facts.size {
+      let f = patch.add_facts.get(p)
+      if StateMerger.contains(next.facts, f).false? { next.facts.push(f) }
+      p = p + 1
+    }
+    if patch.terminal {
+      next.terminal = true
+      next.answer = patch.answer
+    }
+    next.step = state.step + 1
+    next.version = state.version + 1
+    next
+  }
+
+  fn static contains(arr: ref Array[String], v: String) -> Bool {
+    let mut i = 0
+    while i < arr.size {
+      if arr.get(i) == v { return true }
+      i = i + 1
+    }
+    false
+  }
+
+  fn static without(arr: ref Array[String], v: String) -> Array[String] {
+    let out = Array.new
+    let mut i = 0
+    while i < arr.size {
+      if arr.get(i) != v { out.push(arr.get(i)) }
+      i = i + 1
+    }
+    out
+  }
+}
+
+class Skill {
+  let @id: String
+  let @name: String
+  let @trigger: String
+  let @body: String
+  let @tags: Array[String]
+  let @version: Int
+  let @success: Int
+  let @failure: Int
+  let @created_at: String
+  let @updated_at: String
+  let @active: Bool
+
+  fn static new(id: String, name: String, trigger: String, body: String) -> Skill {
+    Skill(
+      id: id,
+      name: name,
+      trigger: trigger,
+      body: body,
+      tags: Array.new,
+      version: 1,
+      success: 0,
+      failure: 0,
+      created_at: Clock.iso_now,
+      updated_at: Clock.iso_now,
+      active: true
+    )
+  }
+
+  fn score -> Float {
+    let s = @success.to_float
+    let f = @failure.to_float
+    (s + 1.0) / (s + f + 2.0)
+  }
+
+  fn index_text -> String {
+    let buf = StringBuffer.new
+    buf.push(@name)
+    buf.push(' ')
+    buf.push(@trigger)
+    buf.push(' ')
+    buf.push(@body)
+    buf.push(' ')
+    let mut i = 0
+    while i < @tags.size {
+      buf.push(@tags.get(i))
+      buf.push(' ')
+      i = i + 1
+    }
+    buf.to_string
+  }
+
+  fn prompt_block -> String {
+    let buf = StringBuffer.new
+    buf.push('SKILL: ' + @name + ' (v' + @version.to_string + ', reliability ' + @score.to_string + ')\n')
+    buf.push('when: ' + @trigger + '\n')
+    buf.push('procedure: ' + @body + '\n')
+    buf.to_string
+  }
+
+  fn to_row -> Map[String, String] {
+    let m = Map.new
+    m.set('id', @id)
+    m.set('name', @name)
+    m.set('trigger', @trigger)
+    m.set('body', @body)
+    m.set('tags', Skill.join(@tags, '|'))
+    m.set('version', @version.to_string)
+    m.set('success', @success.to_string)
+    m.set('failure', @failure.to_string)
+    m.set('created_at', @created_at)
+    m.set('updated_at', @updated_at)
+    m.set('active', if @active { '1' } else { '0' })
+    m
+  }
+
+  fn static join(arr: ref Array[String], sep: String) -> String {
+    let buf = StringBuffer.new
+    let mut i = 0
+    while i < arr.size {
+      if i > 0 { buf.push(sep) }
+      buf.push(arr.get(i))
+      i = i + 1
+    }
+    buf.to_string
+  }
+
+  fn static from_row(row: ref Map[String, String]) -> Skill {
+    let s = Skill.new(
+      row.opt('id').or(''),
+      row.opt('name').or(''),
+      row.opt('trigger').or(''),
+      row.opt('body').or('')
+    )
+    let tagstr = row.opt('tags').or('')
+    if tagstr.size > 0 {
+      let parts = tagstr.split('|').to_array
+      let mut i = 0
+      while i < parts.size {
+        if parts.get(i).size > 0 { s.tags.push(parts.get(i)) }
+        i = i + 1
+      }
+    }
+    s.version = Int.parse(row.opt('version').or('1'), 10).or(1)
+    s.success = Int.parse(row.opt('success').or('0'), 10).or(0)
+    s.failure = Int.parse(row.opt('failure').or('0'), 10).or(0)
+    s.created_at = row.opt('created_at').or(Clock.iso_now)
+    s.updated_at = row.opt('updated_at').or(Clock.iso_now)
+    s.active = row.opt('active').or('1') == '1'
+    s
+  }
+
+  fn to_json -> String {
+    let buf = StringBuffer.new
+    buf.push('{"id":')
+    buf.push(JsonUtil.string(@id))
+    buf.push(',"name":')
+    buf.push(JsonUtil.string(@name))
+    buf.push(',"trigger":')
+    buf.push(JsonUtil.string(@trigger))
+    buf.push(',"body":')
+    buf.push(JsonUtil.string(@body))
+    buf.push(',"version":')
+    buf.push(@version.to_string)
+    buf.push(',"success":')
+    buf.push(@success.to_string)
+    buf.push(',"failure":')
+    buf.push(@failure.to_string)
+    buf.push(',"reliability":')
+    buf.push(@score.to_string)
+    buf.push(',"active":')
+    buf.push(if @active { 'true' } else { 'false' })
+    buf.push(',"tags":[')
+    let mut i = 0
+    while i < @tags.size {
+      if i > 0 { buf.push(',') }
+      buf.push(JsonUtil.string(@tags.get(i)))
+      i = i + 1
+    }
+    buf.push(']}')
+    buf.to_string
+  }
+}
+
+class ExperientialMemory {
+  let @db: Sqlite
+  let @skills: Map[String, Skill]
+  let @bm25: Bm25Index
+  let @vec: VectorIndex
+
+  fn static new(db: Sqlite) -> ExperientialMemory {
+    let em = ExperientialMemory(db: db, skills: Map.new, bm25: Bm25Index.new, vec: VectorIndex.new)
+    em.load
+    em.seed_defaults
+    em
+  }
+
+  fn mut load {
+    let rows = @db.select_all('skills')
+    let mut i = 0
+    while i < rows.size {
+      let s = Skill.from_row(rows.get(i))
+      if s.id.size > 0 {
+        @skills.set(s.id, s)
+        @bm25.add(s.id, s.index_text)
+        @vec.add(s.id, s.index_text)
+      }
+      i = i + 1
+    }
+  }
+
+  fn mut seed_defaults {
+    if @skills.size > 0 { return }
+    let defs = Array.new
+    defs.push((
+      'skill-decompose',
+      'goal-decomposition',
+      'the task is broad, multi-part, or has no concrete open subgoals yet',
+      'Split the objective into 2-5 concrete, independently verifiable subgoals. Emit them via add_subgoals. Never execute before at least one subgoal exists.'
+    ))
+    defs.push((
+      'skill-answer-synthesis',
+      'final-answer-synthesis',
+      'all subgoals are complete and no blockers remain',
+      'Compose the final answer strictly from verified_facts and state_slots. Set terminal=true and provide the answer field. Do not introduce unverified claims.'
+    ))
+    defs.push((
+      'skill-file-persist',
+      'durable-artifact-persistence',
+      'the task requires producing or editing a durable artifact',
+      'Use write_file to create the artifact, append_file with unique=true for idempotent line additions, replace_lines for scoped edits, and check_lines to verify membership before claiming completion.'
+    ))
+    defs.push((
+      'skill-blocker-recovery',
+      'blocker-recovery',
+      'a previous observation reported ok=false or a blocker is present in state',
+      'Diagnose the failure from the observation content, record the diagnosis as a fact, clear the blocker only after a successful retry with modified arguments, and never repeat the identical failing call twice.'
+    ))
+    defs.push((
+      'skill-reason-only',
+      'pure-reasoning-resolution',
+      'the objective is answerable from the model knowledge without tool access',
+      'Reason within the step, record the derivation as verified facts, then set terminal=true with the complete answer in one transition.'
+    ))
+    let mut i = 0
+    while i < defs.size {
+      let d = defs.get(i)
+      let s = Skill.new(d.0, d.1, d.2, d.3)
+      s.tags.push('bootstrap')
+      upsert(s)
+      i = i + 1
+    }
+  }
+
+  fn mut upsert(skill: Skill) {
+    let existing = @skills.opt(skill.id)
+    @skills.set(skill.id, skill.clone_skill)
+    @bm25.remove(skill.id)
+    @vec.remove(skill.id)
+    @bm25.add(skill.id, skill.index_text)
+    @vec.add(skill.id, skill.index_text)
+    match existing {
+      case Some(_) -> @db.update('skills', 'id', skill.id, skill.to_row)
+      case None -> @db.insert('skills', skill.to_row)
+    }
+  }
+
+  fn mut record_outcome(id: String, success: Bool) {
+    match @skills.opt(id) {
+      case Some(s) -> {
+        let updated = s.clone_skill
+        if success { updated.success = updated.success + 1 } else { updated.failure = updated.failure + 1 }
+        updated.updated_at = Clock.iso_now
+        upsert(updated)
+      }
+      case None -> {}
+    }
+  }
+
+  fn mut deactivate(id: String) {
+    match @skills.opt(id) {
+      case Some(s) -> {
+        let updated = s.clone_skill
+        updated.active = false
+        updated.updated_at = Clock.iso_now
+        upsert(updated)
+      }
+      case None -> {}
+    }
+  }
+
+  fn retrieve(query: String, limit: Int) -> Array[Skill] {
+    let bm = @bm25.score(query)
+    let vs = @vec.search(query)
+    let fused = Rrf.fuse(bm, vs)
+    let out = Array.new
+    let mut i = 0
+    while i < fused.size and out.size < limit {
+      let id = fused.get(i).0
+      match @skills.opt(id) {
+        case Some(s) -> {
+          if s.active { out.push(s.clone_skill) }
+        }
+        case None -> {}
+      }
+      i = i + 1
+    }
+    if out.size == 0 {
+      let ids = @skills.keys.to_array
+      ids.sort
+      let mut j = 0
+      while j < ids.size and out.size < limit {
+        match @skills.opt(ids.get(j)) {
+          case Some(s) -> {
+            if s.active { out.push(s.clone_skill) }
+          }
+          case None -> {}
+        }
+        j = j + 1
+      }
+    }
+    out
+  }
+
+  fn all -> Array[Skill] {
+    let out = Array.new
+    let ids = @skills.keys.to_array
+    ids.sort
+    let mut i = 0
+    while i < ids.size {
+      match @skills.opt(ids.get(i)) {
+        case Some(s) -> out.push(s.clone_skill)
+        case None -> {}
+      }
+      i = i + 1
+    }
+    out
+  }
+}
+
+class WorkingMemory {
+  let @session: String
+  let @state: ExecState
+  let @spec: Spec
+  let @history_digest: Array[String]
+  let @last_observation: Observation
+  let @token_used: Int
+  let @step_count: Int
+
+  fn static new(session: String, spec: Spec) -> WorkingMemory {
+    WorkingMemory(
+      session: session,
+      state: ExecState.new,
+      spec: spec,
+      history_digest: Array.new,
+      last_observation: Observation.new('runtime', 'bootstrap', 'session initialized; no environment interaction yet', true),
+      token_used: 0,
+      step_count: 0
+    )
+  }
+
+  fn mut commit(next: ExecState) {
+    @state = next
+    @history_digest.push(@state.digest)
+    if @history_digest.size > 64 {
+      let trimmed = Array.new
+      let start = @history_digest.size - 64
+      let mut i = start
+      while i < @history_digest.size {
+        trimmed.push(@history_digest.get(i))
+        i = i + 1
+      }
+      @history_digest = trimmed
+    }
+  }
+
+  fn mut observe(obs: Observation) {
+    @last_observation = obs
+  }
+
+  fn retrieval_query -> String {
+    let buf = StringBuffer.new
+    buf.push(@spec.task)
+    buf.push(' ')
+    let mut i = 0
+    while i < @state.subgoals.size {
+      buf.push(@state.subgoals.get(i))
+      buf.push(' ')
+      i = i + 1
+    }
+    let mut j = 0
+    while j < @state.blockers.size {
+      buf.push(@state.blockers.get(j))
+      buf.push(' ')
+      j = j + 1
+    }
+    buf.push(@last_observation.kind)
+    buf.push(' ')
+    buf.push(if @last_observation.ok { 'success' } else { 'failure error' })
+    buf.to_string
+  }
+
+  fn loop_detected -> Bool {
+    if @history_digest.size < 6 { return false }
+    let last = @history_digest.get(@history_digest.size - 1)
+    let mut count = 0
+    let mut i = @history_digest.size - 6
+    while i < @history_digest.size {
+      if @history_digest.get(i) == last { count = count + 1 }
+      i = i + 1
+    }
+    count >= 3
+  }
+}
+
+class ExecutionTrace {
+  let @id: String
+  let @session: String
+  let @step: Int
+  let @state_before: String
+  let @skills_used: Array[String]
+  let @action: String
+  let @observation: String
+  let @state_after: String
+  let @ok: Bool
+  let @latency_ms: Int
+  let @at: String
+
+  fn static new(id: String, session: String, step: Int) -> ExecutionTrace {
+    ExecutionTrace(
+      id: id,
+      session: session,
+      step: step,
+      state_before: '',
+      skills_used: Array.new,
+      action: '',
+      observation: '',
+      state_after: '',
+      ok: true,
+      latency_ms: 0,
+      at: Clock.iso_now
+    )
+  }
+
+  fn to_row -> Map[String, String] {
+    let m = Map.new
+    m.set('id', @id)
+    m.set('session', @session)
+    m.set('step', @step.to_string)
+    m.set('state_before', @state_before)
+    m.set('skills_used', Skill.join(@skills_used, '|'))
+    m.set('action', @action)
+    m.set('observation', @observation)
+    m.set('state_after', @state_after)
+    m.set('ok', if @ok { '1' } else { '0' })
+    m.set('latency_ms', @latency_ms.to_string)
+    m.set('at', @at)
+    m
+  }
+
+  fn to_json -> String {
+    let buf = StringBuffer.new
+    buf.push('{"id":')
+    buf.push(JsonUtil.string(@id))
+    buf.push(',"session":')
+    buf.push(JsonUtil.string(@session))
+    buf.push(',"step":')
+    buf.push(@step.to_string)
+    buf.push(',"ok":')
+    buf.push(if @ok { 'true' } else { 'false' })
+    buf.push(',"latency_ms":')
+    buf.push(@latency_ms.to_string)
+    buf.push(',"skills_used":[')
+    let mut i = 0
+    while i < @skills_used.size {
+      if i > 0 { buf.push(',') }
+      buf.push(JsonUtil.string(@skills_used.get(i)))
+      i = i + 1
+    }
+    buf.push('],"action":')
+    buf.push(JsonUtil.string(@action))
+    buf.push(',"observation":')
+    buf.push(JsonUtil.string(@observation))
+    buf.push(',"at":')
+    buf.push(JsonUtil.string(@at))
+    buf.push('}')
+    buf.to_string
+  }
+}
+
+class RawTraceLayer {
+  let @db: Sqlite
+  let @dir: String
+
+  fn static new(db: Sqlite, dir: String) -> RawTraceLayer {
+    let l = RawTraceLayer(db: db, dir: dir)
+    Fs.ensure_dir(dir)
+    l
+  }
+
+  fn mut append(trace: ref ExecutionTrace) {
+    @db.insert('traces', trace.to_row)
+    let path = @dir + '/' + trace.session + '.jsonl'
+    Fs.append_line(path, trace.to_json, false)
+  }
+
+  fn for_session(session: String) -> Array[Map[String, String]] {
+    @db.select_where('traces', 'session', session)
+  }
+
+  fn failures(limit: Int) -> Array[Map[String, String]] {
+    let rows = @db.select_all('traces')
+    let out = Array.new
+    let mut i = rows.size - 1
+    while i >= 0 and out.size < limit {
+      let r = rows.get(i)
+      if r.opt('ok').or('1') == '0' { out.push(r.clone) }
+      i = i - 1
+    }
+    out
+  }
+}
+
+class Fs {
+  fn static ensure_dir(path: String) {
+    let p = Path.new(path)
+    if p.exists.false? {
+      let _ = p.create_directory_all
+    }
+  }
+
+  fn static read(path: String) -> Result[String, String] {
+    let p = Path.new(path)
+    if p.exists.false? { return Result.Error('file not found: ' + path) }
+    match ReadOnlyFile.new(p) {
+      case Ok(mut f) -> {
+        let buf = ByteArray.new
+        match f.read_all(mut buf) {
+          case Ok(_) -> Result.Ok(buf.into_string)
+          case Error(e) -> Result.Error('read error: ' + e.to_string)
+        }
+      }
+      case Error(e) -> Result.Error('open error: ' + e.to_string)
+    }
+  }
+
+  fn static write(path: String, content: String) -> Result[Int, String] {
+    let p = Path.new(path)
+    match p.directory {
+      case Some(d) -> Fs.ensure_dir(d.to_string)
+      case None -> {}
+    }
+    let tmp = path + '.tmp'
+    let tp = Path.new(tmp)
+    match WriteOnlyFile.new(tp) {
+      case Ok(mut f) -> {
+        match f.write_string(content) {
+          case Ok(_) -> {
+            let _ = f.flush
+            match tp.copy(Path.new(path)) {
+              case Ok(_) -> {
+                let _ = tp.remove_file
+                Result.Ok(content.size)
+              }
+              case Error(e) -> Result.Error('atomic move failed: ' + e.to_string)
+            }
+          }
+          case Error(e) -> Result.Error('write failed: ' + e.to_string)
+        }
+      }
+      case Error(e) -> Result.Error('create failed: ' + e.to_string)
+    }
+  }
+
+  fn static append_line(path: String, line: String, unique: Bool) -> Result[Bool, String] {
+    if unique {
+      match Fs.read(path) {
+        case Ok(existing) -> {
+          let lines = existing.split('\n').to_array
+          let mut i = 0
+          while i < lines.size {
+            if lines.get(i) == line { return Result.Ok(false) }
+            i = i + 1
+          }
+        }
+        case Error(_) -> {}
+      }
+    }
+    let p = Path.new(path)
+    match p.directory {
+      case Some(d) -> Fs.ensure_dir(d.to_string)
+      case None -> {}
+    }
+    match WriteOnlyFile.append(p) {
+      case Ok(mut f) -> {
+        match f.write_string(line + '\n') {
+          case Ok(_) -> {
+            let _ = f.flush
+            Result.Ok(true)
+          }
+          case Error(e) -> Result.Error('append failed: ' + e.to_string)
+        }
+      }
+      case Error(e) -> Result.Error('open append failed: ' + e.to_string)
+    }
+  }
+
+  fn static replace_lines(path: String, start: Int, end: Int, replacement: String) -> Result[Int, String] {
+    match Fs.read(path) {
+      case Ok(content) -> {
+        let lines = content.split('\n').to_array
+        if start < 1 or start > lines.size { return Result.Error('start line out of range') }
+        let real_end = if end < start { start } else { min(end, lines.size) }
+        let out = Array.new
+        let mut i = 0
+        while i < lines.size {
+          let n = i + 1
+          if n < start or n > real_end {
+            out.push(lines.get(i))
+          } else if n == start {
+            let repl = replacement.split('\n').to_array
+            let mut j = 0
+            while j < repl.size {
+              out.push(repl.get(j))
+              j = j + 1
+            }
+          }
+          i = i + 1
+        }
+        let buf = StringBuffer.new
+        let mut k = 0
+        while k < out.size {
+          if k > 0 { buf.push('\n') }
+          buf.push(out.get(k))
+          k = k + 1
+        }
+        match Fs.write(path, buf.to_string) {
+          case Ok(_) -> Result.Ok(real_end - start + 1)
+          case Error(e) -> Result.Error(e)
+        }
+      }
+      case Error(e) -> Result.Error(e)
+    }
+  }
+
+  fn static check_lines(path: String, candidates: ref Array[String]) -> Array[(String, Bool)] {
+    let out = Array.new
+    let existing = Set.new
+    match Fs.read(path) {
+      case Ok(content) -> {
+        let lines = content.split('\n').to_array
+        let mut i = 0
+        while i < lines.size {
+          existing.insert(lines.get(i))
+          i = i + 1
+        }
+      }
+      case Error(_) -> {}
+    }
+    let mut j = 0
+    while j < candidates.size {
+      let c = candidates.get(j)
+      out.push((c, existing.contains?(c)))
+      j = j + 1
+    }
+    out
+  }
+
+  fn static list(path: String) -> Array[String] {
+    let out = Array.new
+    let p = Path.new(path)
+    if p.exists.false? { return out }
+    match p.list {
+      case Ok(iter) -> {
+        let entries = iter.to_array
+        let mut i = 0
+        while i < entries.size {
+          match entries.get(i) {
+            case Ok(e) -> out.push(e.path.to_string)
+            case Error(_) -> {}
+          }
+          i = i + 1
+        }
+      }
+      case Error(_) -> {}
+    }
+    out.sort
+    out
+  }
+
+  fn static safe_join(root: String, rel: String) -> Result[String, String] {
+    if rel.size == 0 { return Result.Error('empty path') }
+    if rel.contains?('..') { return Result.Error('path traversal rejected') }
+    if rel.starts_with?('/') { return Result.Error('absolute path rejected') }
+    if rel.contains?('\u{0}') { return Result.Error('null byte rejected') }
+    Result.Ok(root + '/' + rel)
+  }
+}
+
+class WikiLayer {
+  let @dir: String
+  let @db: Sqlite
+
+  fn static new(db: Sqlite, dir: String) -> WikiLayer {
+    Fs.ensure_dir(dir)
+    let w = WikiLayer(dir: dir, db: db)
+    w.ensure_seed
+    w
+  }
+
+  fn mut ensure_seed {
+    let path = @dir + '/PLAYBOOK.md'
+    if Path.new(path).exists { return }
+    let buf = StringBuffer.new
+    buf.push('# Operational Playbook\n\n')
+    buf.push('## Purpose\n')
+    buf.push('Durable, versioned knowledge distilled from verified execution traces.\n\n')
+    buf.push('## Failure Patterns\n\n')
+    buf.push('## Environment Caveats\n\n')
+    buf.push('## Verified Workarounds\n\n')
+    let _ = Fs.write(path, buf.to_string)
+    let row = Map.new
+    row.set('id', 'wiki-seed')
+    row.set('path', path)
+    row.set('epoch', '0')
+    row.set('digest', Digest.short(buf.to_string))
+    row.set('at', Clock.iso_now)
+    @db.insert('wiki', row)
+  }
+
+  fn mut record_pattern(section: String, entry: String) -> Bool {
+    let path = @dir + '/PLAYBOOK.md'
+    match Fs.read(path) {
+      case Ok(content) -> {
+        let marker = '## ' + section
+        if content.contains?(entry) { return false }
+        let lines = content.split('\n').to_array
+        let out = Array.new
+        let mut inserted = false
+        let mut i = 0
+        while i < lines.size {
+          let line = lines.get(i)
+          out.push(line)
+          if inserted.false? and line == marker {
+            out.push('')
+            out.push('- ' + entry)
+            inserted = true
+          }
+          i = i + 1
+        }
+        if inserted.false? {
+          out.push('')
+          out.push(marker)
+          out.push('')
+          out.push('- ' + entry)
+        }
+        let buf = StringBuffer.new
+        let mut j = 0
+        while j < out.size {
+          if j > 0 { buf.push('\n') }
+          buf.push(out.get(j))
+          j = j + 1
+        }
+        let text = buf.to_string
+        let _ = Fs.write(path, text)
+        let epoch = @db.count('wiki')
+        let row = Map.new
+        row.set('id', 'wiki-' + epoch.to_string + '-' + Digest.short(entry))
+        row.set('path', path)
+        row.set('epoch', epoch.to_string)
+        row.set('digest', Digest.short(text))
+        row.set('section', section)
+        row.set('entry', entry)
+        row.set('at', Clock.iso_now)
+        @db.insert('wiki', row)
+        true
+      }
+      case Error(_) -> {
+        ensure_seed
+        false
+      }
+    }
+  }
+
+  fn read_playbook -> String {
+    match Fs.read(@dir + '/PLAYBOOK.md') {
+      case Ok(c) -> c
+      case Error(_) -> ''
+    }
+  }
+
+  fn epochs -> Array[Map[String, String]] {
+    @db.select_all('wiki')
+  }
+
+  fn diff(from_epoch: Int, to_epoch: Int) -> Array[String] {
+    let out = Array.new
+    let rows = @db.select_all('wiki')
+    let mut i = 0
+    while i < rows.size {
+      let r = rows.get(i)
+      let e = Int.parse(r.opt('epoch').or('0'), 10).or(0)
+      if e > from_epoch and e <= to_epoch {
+        let sec = r.opt('section').or('general')
+        let ent = r.opt('entry').or('')
+        if ent.size > 0 { out.push('+ [' + sec + '] ' + ent) }
+      }
+      i = i + 1
+    }
+    out
+  }
+}
+
+class ToolResult {
+  let @ok: Bool
+  let @content: String
+  let @kind: String
+
+  fn static ok_result(kind: String, content: String) -> ToolResult {
+    ToolResult(ok: true, content: content, kind: kind)
+  }
+
+  fn static err(kind: String, content: String) -> ToolResult {
+    ToolResult(ok: false, content: content, kind: kind)
+  }
+}
+
+class ToolRegistry {
+  let @workspace: String
+  let @db: Sqlite
+  let @allowed: Set[String]
+  let @call_count: Map[String, Int]
+  let @max_calls_per_tool: Int
+
+  fn static new(workspace: String, db: Sqlite) -> ToolRegistry {
+    Fs.ensure_dir(workspace)
+    let s = Set.new
+    s.insert('noop')
+    s.insert('finish')
+    s.insert('think')
+    s.insert('write_file')
+    s.insert('read_file')
+    s.insert('append_file')
+    s.insert('replace_lines')
+    s.insert('check_lines')
+    s.insert('list_files')
+    s.insert('delete_file')
+    s.insert('search_memory')
+    s.insert('record_fact')
+    s.insert('http_get')
+    ToolRegistry(
+      workspace: workspace,
+      db: db,
+      allowed: s,
+      call_count: Map.new,
+      max_calls_per_tool: 512
+    )
+  }
+
+  fn names -> Array[String] {
+    let a = @allowed.to_array
+    a.sort
+    a
+  }
+
+  fn spec_block -> String {
+    let buf = StringBuffer.new
+    buf.push('AVAILABLE TOOLS\n')
+    buf.push('noop {} -> no environment effect; use only when state-only transition is needed\n')
+    buf.push('think {"note":string} -> record a private derivation note as an observation\n')
+    buf.push('finish {"answer":string} -> terminate with the final answer\n')
+    buf.push('write_file {"path":string,"content":string} -> atomic full-file write inside workspace\n')
+    buf.push('read_file {"path":string} -> read entire file\n')
+    buf.push('append_file {"path":string,"line":string,"unique":bool} -> append one line, optionally deduplicated\n')
+    buf.push('replace_lines {"path":string,"start":int,"end":int,"content":string} -> replace inclusive 1-based line range\n')
+    buf.push('check_lines {"path":string,"lines":string} -> pipe-separated exact-line membership test\n')
+    buf.push('list_files {"path":string} -> list workspace directory entries\n')
+    buf.push('delete_file {"path":string} -> remove a workspace file\n')
+    buf.push('search_memory {"query":string} -> hybrid RRF search over the skill library\n')
+    buf.push('record_fact {"fact":string} -> persist a verified fact receipt\n')
+    buf.push('http_get {"host":string,"path":string} -> plain HTTP GET on port 80\n')
+    buf.to_string
+  }
+
+  fn mut authorized(tool: String, spec: ref Spec) -> Bool {
+    if @allowed.contains?(tool).false? { return false }
+    if spec.tools_allowed.size > 0 {
+      let mut i = 0
+      let mut found = false
+      while i < spec.tools_allowed.size {
+        if spec.tools_allowed.get(i) == tool { found = true }
+        i = i + 1
+      }
+      if found.false? { return false }
+    }
+    let c = @call_count.opt(tool).or(0)
+    if c >= @max_calls_per_tool { return false }
+    true
+  }
+
+  fn mut execute(action: ref ActionCmd, spec: ref Spec, em: mut ExperientialMemory) -> ToolResult {
+    if authorized(action.tool, spec).false? {
+      return ToolResult.err('authorization', 'tool call denied by authorization fence: ' + action.tool)
+    }
+    @call_count.set(action.tool, @call_count.opt(action.tool).or(0) + 1)
+    let receipt = Map.new
+    receipt.set('id', Digest.short(action.to_json + Clock.iso_now))
+    receipt.set('tool', action.tool)
+    receipt.set('args', action.to_json)
+    receipt.set('at', Clock.iso_now)
+    @db.insert('receipts', receipt)
+    if action.tool == 'noop' {
+      return ToolResult.ok_result('noop', 'no operation performed')
+    }
+    if action.tool == 'think' {
+      let note = action.args.opt('note').or('')
+      if note.size == 0 { return ToolResult.err('think', 'note argument required') }
+      return ToolResult.ok_result('think', 'note recorded: ' + note)
+    }
+    if action.tool == 'finish' {
+      let ans = action.args.opt('answer').or('')
+      if ans.size == 0 { return ToolResult.err('finish', 'answer argument required') }
+      return ToolResult.ok_result('finish', ans)
+    }
+    if action.tool == 'record_fact' {
+      let fact = action.args.opt('fact').or('')
+      if fact.size == 0 { return ToolResult.err('record_fact', 'fact argument required') }
+      let row = Map.new
+      row.set('id', Digest.short(fact))
+      row.set('kind', 'fact')
+      row.set('content', fact)
+      row.set('at', Clock.iso_now)
+      @db.insert('receipts', row)
+      return ToolResult.ok_result('record_fact', 'fact persisted: ' + fact)
+    }
+    if action.tool == 'search_memory' {
+      let q = action.args.opt('query').or('')
+      if q.size == 0 { return ToolResult.err('search_memory', 'query argument required') }
+      let skills = em.retrieve(q, 5)
+      let buf = StringBuffer.new
+      buf.push('matched ' + skills.size.to_string + ' skills\n')
+      let mut i = 0
+      while i < skills.size {
+        buf.push(skills.get(i).prompt_block)
+        i = i + 1
+      }
+      return ToolResult.ok_result('search_memory', buf.to_string)
+    }
+    if action.tool == 'write_file' {
+      let rel = action.args.opt('path').or('')
+      let content = action.args.opt('content').or('')
+      match Fs.safe_join(@workspace, rel) {
+        case Ok(full) -> {
+          match Fs.write(full, content) {
+            case Ok(n) -> ToolResult.ok_result('write_file', 'wrote ' + n.to_string + ' bytes to ' + rel)
+            case Error(e) -> ToolResult.err('write_file', e)
+          }
+        }
+        case Error(e) -> ToolResult.err('write_file', e)
+      }
+    } else if action.tool == 'read_file' {
+      let rel = action.args.opt('path').or('')
+      match Fs.safe_join(@workspace, rel) {
+        case Ok(full) -> {
+          match Fs.read(full) {
+            case Ok(c) -> ToolResult.ok_result('read_file', c)
+            case Error(e) -> ToolResult.err('read_file', e)
+          }
+        }
+        case Error(e) -> ToolResult.err('read_file', e)
+      }
+    } else if action.tool == 'append_file' {
+      let rel = action.args.opt('path').or('')
+      let line = action.args.opt('line').or('')
+      let uniq = action.args.opt('unique').or('true') == 'true'
+      match Fs.safe_join(@workspace, rel) {
+        case Ok(full) -> {
+          match Fs.append_line(full, line, uniq) {
+            case Ok(added) -> {
+              if added {
+                ToolResult.ok_result('append_file', 'line appended to ' + rel)
+              } else {
+                ToolResult.ok_result('append_file', 'line already present in ' + rel + '; deduplicated')
+              }
+            }
+            case Error(e) -> ToolResult.err('append_file', e)
+          }
+        }
+        case Error(e) -> ToolResult.err('append_file', e)
+      }
+    } else if action.tool == 'replace_lines' {
+      let rel = action.args.opt('path').or('')
+      let start = Int.parse(action.args.opt('start').or('0'), 10).or(0)
+      let end = Int.parse(action.args.opt('end').or('0'), 10).or(0)
+      let content = action.args.opt('content').or('')
+      match Fs.safe_join(@workspace, rel) {
+        case Ok(full) -> {
+          match Fs.replace_lines(full, start, end, content) {
+            case Ok(n) -> ToolResult.ok_result('replace_lines', 'replaced ' + n.to_string + ' lines in ' + rel)
+            case Error(e) -> ToolResult.err('replace_lines', e)
+          }
+        }
+        case Error(e) -> ToolResult.err('replace_lines', e)
+      }
+    } else if action.tool == 'check_lines' {
+      let rel = action.args.opt('path').or('')
+      let raw = action.args.opt('lines').or('')
+      let cands = Array.new
+      let parts = raw.split('|').to_array
+      let mut i = 0
+      while i < parts.size {
+        if parts.get(i).size > 0 { cands.push(parts.get(i)) }
+        i = i + 1
+      }
+      match Fs.safe_join(@workspace, rel) {
+        case Ok(full) -> {
+          let results = Fs.check_lines(full, cands)
+          let buf = StringBuffer.new
+          let mut j = 0
+          while j < results.size {
+            let r = results.get(j)
+            buf.push((if r.1 { 'PRESENT: ' } else { 'MISSING: ' }) + r.0 + '\n')
+            j = j + 1
+          }
+          ToolResult.ok_result('check_lines', buf.to_string)
+        }
+        case Error(e) -> ToolResult.err('check_lines', e)
+      }
+    } else if action.tool == 'list_files' {
+      let rel = action.args.opt('path').or('.')
+      let target = if rel == '.' or rel.size == 0 { @workspace } else {
+        match Fs.safe_join(@workspace, rel) {
+          case Ok(full) -> full
+          case Error(_) -> @workspace
+        }
+      }
+      let files = Fs.list(target)
+      let buf = StringBuffer.new
+      buf.push(files.size.to_string + ' entries\n')
+      let mut k = 0
+      while k < files.size {
+        buf.push(files.get(k) + '\n')
+        k = k + 1
+      }
+      ToolResult.ok_result('list_files', buf.to_string)
+    } else if action.tool == 'delete_file' {
+      let rel = action.args.opt('path').or('')
+      match Fs.safe_join(@workspace, rel) {
+        case Ok(full) -> {
+          let p = Path.new(full)
+          if p.exists.false? {
+            ToolResult.err('delete_file', 'file not found: ' + rel)
+          } else {
+            match p.remove_file {
+              case Ok(_) -> ToolResult.ok_result('delete_file', 'removed ' + rel)
+              case Error(e) -> ToolResult.err('delete_file', 'remove failed: ' + e.to_string)
+            }
+          }
+        }
+        case Error(e) -> ToolResult.err('delete_file', e)
+      }
+    } else if action.tool == 'http_get' {
+      let host = action.args.opt('host').or('')
+      let path = action.args.opt('path').or('/')
+      if host.size == 0 { return ToolResult.err('http_get', 'host argument required') }
+      match HttpClient.plain_get(host, path) {
+        case Ok(body) -> ToolResult.ok_result('http_get', body)
+        case Error(e) -> ToolResult.err('http_get', e)
+      }
+    } else {
+      ToolResult.err('unknown_tool', 'tool not implemented: ' + action.tool)
+    }
+  }
+}
+
+class HttpClient {
+  fn static plain_get(host: String, path: String) -> Result[String, String] {
+    match IpAddress.parse(host) {
+      case Some(ip) -> HttpClient.raw_request(ip, 80, HttpClient.build_get(host, path))
+      case None -> Result.Error('host must be a literal IP address in this runtime: ' + host)
+    }
+  }
+
+  fn static build_get(host: String, path: String) -> String {
+    let buf = StringBuffer.new
+    buf.push('GET ' + path + ' HTTP/1.1\r\n')
+    buf.push('Host: ' + host + '\r\n')
+    buf.push('User-Agent: ' + VERSION + '\r\n')
+    buf.push('Accept: */*\r\n')
+    buf.push('Connection: close\r\n\r\n')
+    buf.to_string
+  }
+
+  fn static raw_request(ip: IpAddress, port: Int, request: String) -> Result[String, String] {
+    match TcpClient.new(ip, port) {
+      case Ok(mut sock) -> {
+        match sock.write_string(request) {
+          case Ok(_) -> {
+            let buf = ByteArray.new
+            let mut total = 0
+            let mut running = true
+            while running {
+              let chunk = ByteArray.new
+              match sock.read(into: mut chunk, size: 8192) {
+                case Ok(n) -> {
+                  if n == 0 {
+                    running = false
+                  } else {
+                    buf.append(chunk)
+                    total = total + n
+                    if total > 8 * 1024 * 1024 { running = false }
+                  }
+                }
+                case Error(_) -> running = false
+              }
+            }
+            let text = buf.into_string
+            match text.split_once('\r\n\r\n') {
+              case Some(parts) -> Result.Ok(parts.1)
+              case None -> Result.Ok(text)
+            }
+          }
+          case Error(e) -> Result.Error('socket write failed: ' + e.to_string)
+        }
+      }
+      case Error(e) -> Result.Error('connect failed: ' + e.to_string)
+    }
+  }
+}
+
+class LlmUsage {
+  let @prompt_tokens: Int
+  let @completion_tokens: Int
+  let @total_tokens: Int
+
+  fn static empty -> LlmUsage {
+    LlmUsage(prompt_tokens: 0, completion_tokens: 0, total_tokens: 0)
+  }
+}
+
+class LlmResponse {
+  let @text: String
+  let @usage: LlmUsage
+  let @ok: Bool
+  let @error: String
+  let @logprob_sum: Float
+  let @token_count: Int
+
+  fn static ok_response(text: String, usage: LlmUsage) -> LlmResponse {
+    LlmResponse(text: text, usage: usage, ok: true, error: '', logprob_sum: 0.0, token_count: 0)
+  }
+
+  fn static err(message: String) -> LlmResponse {
+    LlmResponse(text: '', usage: LlmUsage.empty, ok: false, error: message, logprob_sum: 0.0, token_count: 0)
+  }
+}
+
+class LlmClient {
+  let @api_key: String
+  let @host: String
+  let @path: String
+  let @port: Int
+  let @model: String
+  let @logger: Logger
+  let @token_ledger: Int
+
+  fn static new(logger: Logger) -> LlmClient {
+    let key = match env.opt('MODULAR_API_KEY') {
+      case Some(v) -> v
+      case None -> ''
+    }
+    LlmClient(
+      api_key: key,
+      host: MODEL_HOST,
+      path: MODEL_PATH,
+      port: MODEL_PORT,
+      model: MODEL_NAME,
+      logger: logger,
+      token_ledger: 0
+    )
+  }
+
+  fn build_body(system: String, user: String, temperature: Float, max_tokens: Int, logprobs: Bool) -> String {
+    let buf = StringBuffer.new
+    buf.push('{"model":')
+    buf.push(JsonUtil.string(@model))
+    buf.push(',"messages":[{"role":"system","content":')
+    buf.push(JsonUtil.string(system))
+    buf.push('},{"role":"user","content":')
+    buf.push(JsonUtil.string(user))
+    buf.push('}],"stream":false,"temperature":')
+    buf.push(temperature.to_string)
+    buf.push(',"top_p":')
+    buf.push(TOP_P.to_string)
+    buf.push(',"max_tokens":')
+    buf.push(max_tokens.to_string)
+    buf.push(',"frequency_penalty":')
+    buf.push(FREQUENCY_PENALTY.to_string)
+    buf.push(',"presence_penalty":')
+    buf.push(PRESENCE_PENALTY.to_string)
+    buf.push(',"seed":')
+    buf.push(SEED.to_string)
+    if logprobs {
+      buf.push(',"logprobs":true,"top_logprobs":1')
+    }
+    buf.push('}')
+    buf.to_string
+  }
+
+  fn build_request(body: String) -> String {
+    let buf = StringBuffer.new
+    buf.push('POST ' + @path + ' HTTP/1.1\r\n')
+    buf.push('Host: ' + @host + '\r\n')
+    buf.push('Authorization: Bearer ' + @api_key + '\r\n')
+    buf.push('Content-Type: application/json\r\n')
+    buf.push('Accept: application/json\r\n')
+    buf.push('User-Agent: ' + VERSION + '\r\n')
+    buf.push('Content-Length: ' + body.to_byte_array.size.to_string + '\r\n')
+    buf.push('Connection: close\r\n\r\n')
+    buf.push(body)
+    buf.to_string
+  }
+
+  fn mut complete(system: String, user: String, temperature: Float, max_tokens: Int) -> LlmResponse {
+    if @api_key.size == 0 {
+      return LlmResponse.err('MODULAR_API_KEY is not configured in the environment')
+    }
+    let body = build_body(system, user, temperature, max_tokens, false)
+    let request = build_request(body)
+    match TlsTransport.request(@host, @port, request) {
+      case Ok(raw) -> parse_response(raw)
+      case Error(e) -> LlmResponse.err(e)
+    }
+  }
+
+  fn mut complete_scored(system: String, user: String, temperature: Float, max_tokens: Int) -> LlmResponse {
+    if @api_key.size == 0 {
+      return LlmResponse.err('MODULAR_API_KEY is not configured in the environment')
+    }
+    let body = build_body(system, user, temperature, max_tokens, true)
+    let request = build_request(body)
+    match TlsTransport.request(@host, @port, request) {
+      case Ok(raw) -> parse_response(raw)
+      case Error(e) -> LlmResponse.err(e)
+    }
+  }
+
+  fn mut parse_response(raw: String) -> LlmResponse {
+    let body = HttpParse.body_of(raw)
+    if body.size == 0 {
+      return LlmResponse.err('empty upstream response')
+    }
+    match JsonUtil.parse(body) {
+      case Ok(j) -> {
+        match JsonUtil.get_object(j, 'error') {
+          case Some(e) -> {
+            let msg = JsonUtil.get_string(e, 'message').or('upstream error')
+            return LlmResponse.err(msg)
+          }
+          case None -> {}
+        }
+        match JsonUtil.get_array(j, 'choices') {
+          case Some(choices) -> {
+            if choices.size == 0 { return LlmResponse.err('no choices returned') }
+            let first = choices.get(0)
+            let mut text = ''
+            match JsonUtil.get_object(first, 'message') {
+              case Some(m) -> text = JsonUtil.get_string(m, 'content').or('')
+              case None -> {}
+            }
+            if text.size == 0 {
+              match JsonUtil.get_object(first, 'delta') {
+                case Some(d) -> text = JsonUtil.get_string(d, 'content').or('')
+                case None -> {}
+              }
+            }
+            let usage = LlmUsage.empty
+            match JsonUtil.get_object(j, 'usage') {
+              case Some(u) -> {
+                usage.prompt_tokens = JsonUtil.get_int(u, 'prompt_tokens').or(0)
+                usage.completion_tokens = JsonUtil.get_int(u, 'completion_tokens').or(0)
+                usage.total_tokens = JsonUtil.get_int(u, 'total_tokens').or(usage.prompt_tokens + usage.completion_tokens)
+              }
+              case None -> {}
+            }
+            @token_ledger = @token_ledger + usage.total_tokens
+            let resp = LlmResponse.ok_response(text, usage)
+            match JsonUtil.get_object(first, 'logprobs') {
+              case Some(lp) -> {
+                match JsonUtil.get_array(lp, 'content') {
+                  case Some(items) -> {
+                    let mut sum = 0.0
+                    let mut count = 0
+                    let mut i = 0
+                    while i < items.size {
+                      match JsonUtil.get_float(items.get(i), 'logprob') {
+                        case Some(v) -> {
+                          sum = sum + v
+                          count = count + 1
+                        }
+                        case None -> {}
+                      }
+                      i = i + 1
+                    }
+                    resp.logprob_sum = sum
+                    resp.token_count = count
+                  }
+                  case None -> {}
+                }
+              }
+              case None -> {}
+            }
+            resp
+          }
+          case None -> LlmResponse.err('malformed upstream payload: missing choices')
+        }
+      }
+      case Error(e) -> LlmResponse.err(e)
+    }
+  }
+}
+
+class TlsTransport {
+  fn static request(host: String, port: Int, payload: String) -> Result[String, String] {
+    match env.opt('AGENT_TLS_PROXY') {
+      case Some(proxy) -> TlsTransport.via_proxy(proxy, payload)
+      case None -> TlsTransport.via_openssl(host, port, payload)
+    }
+  }
+
+  fn static via_proxy(proxy: String, payload: String) -> Result[String, String] {
+    let parts = proxy.split(':').to_array
+    if parts.size != 2 { return Result.Error('AGENT_TLS_PROXY must be host:port') }
+    let hoststr = parts.get(0)
+    let portnum = Int.parse(parts.get(1), 10).or(0)
+    if portnum == 0 { return Result.Error('invalid proxy port') }
+    match IpAddress.parse(hoststr) {
+      case Some(ip) -> {
+        match TcpClient.new(ip, portnum) {
+          case Ok(mut sock) -> {
+            match sock.write_string(payload) {
+              case Ok(_) -> {
+                let buf = ByteArray.new
+                let mut running = true
+                while running {
+                  let chunk = ByteArray.new
+                  match sock.read(into: mut chunk, size: 16384) {
+                    case Ok(n) -> {
+                      if n == 0 { running = false } else { buf.append(chunk) }
+                    }
+                    case Error(_) -> running = false
+                  }
+                }
+                Result.Ok(buf.into_string)
+              }
+              case Error(e) -> Result.Error('proxy write failed: ' + e.to_string)
+            }
+          }
+          case Error(e) -> Result.Error('proxy connect failed: ' + e.to_string)
+        }
+      }
+      case None -> Result.Error('AGENT_TLS_PROXY host must be an IP literal')
+    }
+  }
+
+  fn static via_openssl(host: String, port: Int, payload: String) -> Result[String, String] {
+    let tmpdir = 'tlsbuf'
+    Fs.ensure_dir(tmpdir)
+    let stamp = Digest.short(payload + Clock.iso_now)
+    let inpath = tmpdir + '/' + stamp + '.req'
+    let outpath = tmpdir + '/' + stamp + '.resp'
+    match Fs.write(inpath, payload) {
+      case Ok(_) -> {}
+      case Error(e) -> return Result.Error('tls staging failed: ' + e)
+    }
+    let cmd = 'openssl'
+    let args = Array.new
+    args.push('s_client')
+    args.push('-quiet')
+    args.push('-verify_quiet')
+    args.push('-servername')
+    args.push(host)
+    args.push('-connect')
+    args.push(host + ':' + port.to_string)
+    match Shell.run_with_io(cmd, args, inpath, outpath) {
+      case Ok(_) -> {
+        let res = Fs.read(outpath)
+        let _ = Path.new(inpath).remove_file
+        let _ = Path.new(outpath).remove_file
+        match res {
+          case Ok(data) -> {
+            if data.size == 0 { Result.Error('tls transport returned empty payload') } else { Result.Ok(data) }
+          }
+          case Error(e) -> Result.Error(e)
+        }
+      }
+      case Error(e) -> {
+        let _ = Path.new(inpath).remove_file
+        Result.Error('tls transport failure: ' + e)
+      }
+    }
+  }
+}
+
+class Shell {
+  fn static run_with_io(command: String, args: ref Array[String], stdin_path: String, stdout_path: String) -> Result[Int, String] {
+    let cmd = std.sys.Command.new(command)
+    let mut i = 0
+    while i < args.size {
+      cmd.arguments.push(args.get(i))
+      i = i + 1
+    }
+    cmd.stdin = std.sys.Stream.Piped
+    cmd.stdout = std.sys.Stream.Piped
+    cmd.stderr = std.sys.Stream.Null
+    match cmd.spawn {
+      case Ok(mut child) -> {
+        let input = match Fs.read(stdin_path) {
+          case Ok(c) -> c
+          case Error(_) -> ''
+        }
+        match child.stdin {
+          case Some(mut sink) -> {
+            let _ = sink.write_string(input)
+            let _ = sink.flush
+          }
+          case None -> {}
+        }
+        let out = ByteArray.new
+        match child.stdout {
+          case Some(mut src) -> {
+            let _ = src.read_all(mut out)
+          }
+          case None -> {}
+        }
+        let code = match child.wait {
+          case Ok(status) -> status.to_int
+          case Error(_) -> -1
+        }
+        match Fs.write(stdout_path, out.into_string) {
+          case Ok(_) -> Result.Ok(code)
+          case Error(e) -> Result.Error(e)
+        }
+      }
+      case Error(e) -> Result.Error('spawn failed: ' + e.to_string)
+    }
+  }
+}
+
+class HttpParse {
+  fn static body_of(raw: String) -> String {
+    match raw.split_once('\r\n\r\n') {
+      case Some(parts) -> {
+        let head = parts.0
+        let rest = parts.1
+        if head.to_lower.contains?('transfer-encoding: chunked') {
+          HttpParse.dechunk(rest)
+        } else {
+          rest
+        }
+      }
+      case None -> {
+        match raw.split_once('\n\n') {
+          case Some(parts) -> parts.1
+          case None -> raw
+        }
+      }
+    }
+  }
+
+  fn static dechunk(input: String) -> String {
+    let buf = StringBuffer.new
+    let mut rest = input
+    let mut running = true
+    while running {
+      match rest.split_once('\r\n') {
+        case Some(parts) -> {
+          let sizeline = parts.0
+          let tail = parts.1
+          let hexpart = match sizeline.split_once(';') {
+            case Some(sp) -> sp.0
+            case None -> sizeline
+          }
+          match Int.parse(hexpart.trim, 16) {
+            case Some(n) -> {
+              if n == 0 {
+                running = false
+              } else {
+                if tail.to_byte_array.size < n {
+                  buf.push(tail)
+                  running = false
+                } else {
+                  buf.push(tail.slice(0, n))
+                  let after = tail.slice(n, tail.size)
+                  rest = match after.split_once('\r\n') {
+                    case Some(sp) -> sp.1
+                    case None -> ''
+                  }
+                  if rest.size == 0 { running = false }
+                }
+              }
+            }
+            case None -> running = false
+          }
+        }
+        case None -> running = false
+      }
+    }
+    buf.to_string
+  }
+
+  fn static status_of(raw: String) -> Int {
+    match raw.split_once('\r\n') {
+      case Some(parts) -> {
+        let line = parts.0
+        let toks = line.split(' ').to_array
+        if toks.size >= 2 { Int.parse(toks.get(1), 10).or(0) } else { 0 }
+      }
+      case None -> 0
+    }
+  }
+}
+
+class ResponseEnvelope {
+  let @reasoning: String
+  let @patch: StatePatch
+  let @action: ActionCmd
+  let @parsed: Bool
+  let @error: String
+
+  fn static parse(text: String) -> ResponseEnvelope {
+    let json_text = ResponseEnvelope.extract_json(text)
+    if json_text.size == 0 {
+      return ResponseEnvelope(
+        reasoning: text,
+        patch: StatePatch.new,
+        action: ActionCmd.new,
+        parsed: false,
+        error: 'no structured JSON envelope found in model output'
+      )
+    }
+    match JsonUtil.parse(json_text) {
+      case Ok(j) -> {
+        let reasoning = JsonUtil.get_string(j, 'reasoning').or('')
+        let patch = match JsonUtil.get_object(j, 'state_patch') {
+          case Some(p) -> StatePatch.from_json(p, json_text)
+          case None -> StatePatch.new
+        }
+        let action = match JsonUtil.get_object(j, 'action') {
+          case Some(a) -> ActionCmd.from_json(a, json_text)
+          case None -> ActionCmd.new
+        }
+        ResponseEnvelope(
+          reasoning: reasoning,
+          patch: patch,
+          action: action,
+          parsed: true,
+          error: ''
+        )
+      }
+      case Error(e) -> ResponseEnvelope(
+        reasoning: text,
+        patch: StatePatch.new,
+        action: ActionCmd.new,
+        parsed: false,
+        error: e
+      )
+    }
+  }
+
+  fn static extract_json(text: String) -> String {
+    let bytes = text.to_byte_array
+    let mut depth = 0
+    let mut start = -1
+    let mut in_string = false
+    let mut escaped = false
+    let mut i = 0
+    while i < bytes.size {
+      let c = bytes.get(i)
+      if in_string {
+        if escaped {
+          escaped = false
+        } else if c == 92 {
+          escaped = true
+        } else if c == 34 {
+          in_string = false
+        }
+      } else {
+        if c == 34 {
+          in_string = true
+        } else if c == 123 {
+          if depth == 0 { start = i }
+          depth = depth + 1
+        } else if c == 125 {
+          depth = depth - 1
+          if depth == 0 and start >= 0 {
+            return text.slice(start, i + 1)
+          }
+          if depth < 0 { depth = 0 }
+        }
+      }
+      i = i + 1
+    }
+    ''
+  }
+}
+
+class PromptBuilder {
+  fn static instruction -> String {
+    let buf = StringBuffer.new
+    buf.push('You are the decision kernel of a long-horizon autonomous agent runtime.\n')
+    buf.push('You never receive conversation history. Your entire context is the immutable task specification, the structured execution state, the latest observation, and at most two retrieved procedural skills.\n')
+    buf.push('The execution state is the sufficient statistic: anything not written into the state is permanently lost after this step.\n')
+    buf.push('Reason inside the reasoning field, then emit exactly one JSON object and nothing else.\n')
+    buf.push('Output schema (strict, no markdown fences, no prose outside the object):\n')
+    buf.push('{\n')
+    buf.push('  "reasoning": "concise within-step derivation, discarded after validation",\n')
+    buf.push('  "state_patch": {\n')
+    buf.push('    "set": {"slot_name": "value or null to delete"},\n')
+    buf.push('    "delete": ["slot_name"],\n')
+    buf.push('    "add_subgoals": ["new subgoal"],\n')
+    buf.push('    "complete_subgoals": ["subgoal exactly as previously written"],\n')
+    buf.push('    "add_blockers": ["blocking condition"],\n')
+    buf.push('    "clear_blockers": ["blocker exactly as previously written"],\n')
+    buf.push('    "add_facts": ["verified fact worth persisting"],\n')
+    buf.push('    "terminal": false,\n')
+    buf.push('    "answer": "final answer, required only when terminal is true"\n')
+    buf.push('  },\n')
+    buf.push('  "action": {"tool": "tool_name", "args": {"k": "v"}, "rationale": "why this tool now"}\n')
+    buf.push('}\n')
+    buf.push('Rules:\n')
+    buf.push('1. Write every durable insight into state_patch. Reasoning text is destroyed.\n')
+    buf.push('2. Never repeat an action that already failed with identical arguments; change the approach or record a blocker.\n')
+    buf.push('3. Decompose broad objectives into concrete subgoals before acting.\n')
+    buf.push('4. Set terminal true with a complete answer only when every success criterion is satisfied by verified facts or state slots.\n')
+    buf.push('5. Use the finish tool together with terminal true when concluding.\n')
+    buf.push('6. Keep state compact: prune slots that are no longer needed using null or delete.\n')
+    buf.to_string
+  }
+
+  fn static build(spec: ref Spec, state: ref ExecState, obs: ref Observation, skills: ref Array[Skill], tools: ref ToolRegistry, cognition: String, staleness: String, playbook_excerpt: String) -> String {
+    let buf = StringBuffer.new
+    buf.push(spec.prompt_block)
+    buf.push('\n')
+    buf.push(state.prompt_block)
+    buf.push('\n')
+    buf.push(obs.prompt_block)
+    buf.push('\n')
+    if skills.size > 0 {
+      buf.push('RETRIEVED PROCEDURAL SKILLS\n')
+      let mut i = 0
+      while i < skills.size {
+        buf.push(skills.get(i).prompt_block)
+        i = i + 1
+      }
+      buf.push('\n')
+    }
+    if cognition.size > 0 {
+      buf.push('DELIBERATIVE COGNITION VECTOR (SYSTEM 2)\n')
+      buf.push(cognition)
+      buf.push('\nstaleness: ')
+      buf.push(staleness)
+      buf.push('\n\n')
+    }
+    if playbook_excerpt.size > 0 {
+      buf.push('PLAYBOOK CAVEATS\n')
+      buf.push(playbook_excerpt)
+      buf.push('\n')
+    }
+    buf.push(tools.spec_block)
+    buf.push('\n')
+    buf.push(PromptBuilder.instruction)
+    buf.to_string
+  }
+
+  fn static reflection(spec: ref Spec, state: ref ExecState, traces: ref Array[Map[String, String]], verdict: Bool) -> String {
+    let buf = StringBuffer.new
+    buf.push('You are a post-hoc failure analyst for an autonomous agent runtime.\n')
+    buf.push('Objective: ' + spec.task + '\n')
+    buf.push('Terminal verdict: ' + (if verdict { 'PASS' } else { 'FAIL' }) + '\n')
+    buf.push('Terminal state: ' + state.to_json + '\n')
+    buf.push('Execution trace summary:\n')
+    let mut i = 0
+    while i < traces.size {
+      let t = traces.get(i)
+      buf.push('step ' + t.opt('step').or('0')
+        + ' ok=' + t.opt('ok').or('1')
+        + ' action=' + t.opt('action').or('')
+        + ' observation=' + PromptBuilder.clip(t.opt('observation').or(''), 400) + '\n')
+      i = i + 1
+    }
+    buf.push('\nProduce exactly one JSON object:\n')
+    buf.push('{"diagnosis":"root cause in one sentence","failure_step":int,"pivot_action":"the action that should have been taken","memory_component":"working_memory|experiential_memory|tool_layer|specification","skill_patch":{"id":"skill-id","name":"kebab-case-name","trigger":"state condition","body":"imperative procedure"},"playbook_entry":"one durable caveat"}\n')
+    buf.push('If the trajectory passed, still emit the object with diagnosis describing the winning strategy and a skill_patch that generalizes it.\n')
+    buf.to_string
+  }
+
+  fn static clip(s: String, n: Int) -> String {
+    if s.size <= n { s } else { s.slice(0, n) + '...' }
+  }
+}
+
+class CognitionToken {
+  let @values: Array[Float]
+  let @gate: Float
+  let @subgoal: String
+  let @generated_at: Int
+  let @epoch: Int
+
+  fn static empty -> CognitionToken {
+    CognitionToken(values: Array.new, gate: 0.0, subgoal: '', generated_at: 0, epoch: 0)
+  }
+
+  fn encode -> String {
+    if @values.size == 0 { return '' }
+    let buf = StringBuffer.new
+    buf.push('epoch=' + @epoch.to_string)
+    buf.push(' gate=' + @gate.to_string)
+    buf.push(' focus=' + @subgoal)
+    buf.push(' dense=[')
+    let limit = min(@values.size, COGNITION_TOKEN_K * 2)
+    let mut i = 0
+    while i < limit {
+      if i > 0 { buf.push(',') }
+      buf.push(CognitionToken.round3(@values.get(i)))
+      i = i + 1
+    }
+    buf.push(']')
+    buf.to_string
+  }
+
+  fn static round3(f: Float) -> String {
+    let scaled = (f * 1000.0).round.to_float / 1000.0
+    scaled.to_string
+  }
+
+  fn staleness(now: Int) -> String {
+    let dt = now - @generated_at
+    let secs = dt.to_float / 1000.0
+    let sin_e = (secs / 4.0).sin
+    let cos_e = (secs / 4.0).cos
+    'elapsed_ms=' + dt.to_string + ' sin=' + CognitionToken.round3(sin_e) + ' cos=' + CognitionToken.round3(cos_e)
+  }
+}
+
+class System2Engine {
+  let @embedder: Embedder
+  let @epoch: Int
+
+  fn static new -> System2Engine {
+    System2Engine(embedder: Embedder.new(COGNITION_TOKEN_K * COGNITION_TOKEN_H), epoch: 0)
+  }
+
+  fn mut deliberate(spec: ref Spec, state: ref ExecState, obs: ref Observation, skills: ref Array[Skill]) -> CognitionToken {
+    @epoch = @epoch + 1
+    let buf = StringBuffer.new
+    buf.push(spec.task)
+    buf.push(' ')
+    let mut i = 0
+    while i < state.subgoals.size {
+      buf.push(state.subgoals.get(i))
+      buf.push(' ')
+      i = i + 1
+    }
+    let mut j = 0
+    while j < state.blockers.size {
+      buf.push(state.blockers.get(j))
+      buf.push(' ')
+      j = j + 1
+    }
+    buf.push(obs.content)
+    let mut k = 0
+    while k < skills.size {
+      buf.push(' ')
+      buf.push(skills.get(k).name)
+      k = k + 1
+    }
+    let dense = @embedder.embed(buf.to_string)
+    let open = state.subgoals.size.to_float
+    let blocked = state.blockers.size.to_float
+    let gate = if open + blocked <= 0.0 { 1.0 } else { 1.0 / (1.0 + blocked) * (1.0 / (1.0 + open * 0.25)) }
+    let focus = if state.blockers.size > 0 {
+      'resolve-blocker: ' + state.blockers.get(0)
+    } else if state.subgoals.size > 0 {
+      'advance-subgoal: ' + state.subgoals.get(0)
+    } else if state.done.size > 0 {
+      'synthesize-final-answer'
+    } else {
+      'decompose-objective'
+    }
+    CognitionToken(
+      values: dense,
+      gate: gate,
+      subgoal: focus,
+      generated_at: Clock.now_ms,
+      epoch: @epoch
+    )
+  }
+}
+
+class ReflectionPatch {
+  let @diagnosis: String
+  let @failure_step: Int
+  let @pivot_action: String
+  let @component: String
+  let @skill_id: String
+  let @skill_name: String
+  let @skill_trigger: String
+  let @skill_body: String
+  let @playbook_entry: String
+  let @raw: String
+
+  fn static empty -> ReflectionPatch {
+    ReflectionPatch(
+      diagnosis: '',
+      failure_step: 0,
+      pivot_action: '',
+      component: 'working_memory',
+      skill_id: '',
+      skill_name: '',
+      skill_trigger: '',
+      skill_body: '',
+      playbook_entry: '',
+      raw: ''
+    )
+  }
+
+  fn static parse(text: String) -> ReflectionPatch {
+    let jt = ResponseEnvelope.extract_json(text)
+    let p = ReflectionPatch.empty
+    p.raw = if jt.size > 0 { jt } else { text }
+    if jt.size == 0 { return p }
+    match JsonUtil.parse(jt) {
+      case Ok(j) -> {
+        p.diagnosis = JsonUtil.get_string(j, 'diagnosis').or('')
+        p.failure_step = JsonUtil.get_int(j, 'failure_step').or(0)
+        p.pivot_action = JsonUtil.get_string(j, 'pivot_action').or('')
+        p.component = JsonUtil.get_string(j, 'memory_component').or('working_memory')
+        p.playbook_entry = JsonUtil.get_string(j, 'playbook_entry').or('')
+        match JsonUtil.get_object(j, 'skill_patch') {
+          case Some(sp) -> {
+            p.skill_id = JsonUtil.get_string(sp, 'id').or('')
+            p.skill_name = JsonUtil.get_string(sp, 'name').or('')
+            p.skill_trigger = JsonUtil.get_string(sp, 'trigger').or('')
+            p.skill_body = JsonUtil.get_string(sp, 'body').or('')
+          }
+          case None -> {}
+        }
+        p
+      }
+      case Error(_) -> p
+    }
+  }
+
+  fn prompt_prefix -> String {
+    let buf = StringBuffer.new
+    buf.push('PRIVILEGED REFLECTION HINDSIGHT (TEACHER CHANNEL)\n')
+    buf.push('diagnosis: ' + @diagnosis + '\n')
+    buf.push('failure_step: ' + @failure_step.to_string + '\n')
+    buf.push('pivot_action: ' + @pivot_action + '\n')
+    buf.push('attributed_component: ' + @component + '\n')
+    if @skill_body.size > 0 {
+      buf.push('corrective_procedure: ' + @skill_body + '\n')
+    }
+    buf.push('\n')
+    buf.to_string
+  }
+
+  fn to_json -> String {
+    let buf = StringBuffer.new
+    buf.push('{"diagnosis":')
+    buf.push(JsonUtil.string(@diagnosis))
+    buf.push(',"failure_step":')
+    buf.push(@failure_step.to_string)
+    buf.push(',"pivot_action":')
+    buf.push(JsonUtil.string(@pivot_action))
+    buf.push(',"memory_component":')
+    buf.push(JsonUtil.string(@component))
+    buf.push(',"playbook_entry":')
+    buf.push(JsonUtil.string(@playbook_entry))
+    buf.push(',"skill_patch":{"id":')
+    buf.push(JsonUtil.string(@skill_id))
+    buf.push(',"name":')
+    buf.push(JsonUtil.string(@skill_name))
+    buf.push(',"trigger":')
+    buf.push(JsonUtil.string(@skill_trigger))
+    buf.push(',"body":')
+    buf.push(JsonUtil.string(@skill_body))
+    buf.push('}}')
+    buf.to_string
+  }
+}
+
+class DistillationRecord {
+  let @id: String
+  let @session: String
+  let @step: Int
+  let @student_logprob: Float
+  let @teacher_logprob: Float
+  let @student_tokens: Int
+  let @teacher_tokens: Int
+  let @reverse_kl: Float
+  let @advantage: Float
+  let @at: String
+
+  fn static new(id: String, session: String, step: Int) -> DistillationRecord {
+    DistillationRecord(
+      id: id,
+      session: session,
+      step: step,
+      student_logprob: 0.0,
+      teacher_logprob: 0.0,
+      student_tokens: 0,
+      teacher_tokens: 0,
+      reverse_kl: 0.0,
+      advantage: 0.0,
+      at: Clock.iso_now
+    )
+  }
+
+  fn to_row -> Map[String, String] {
+    let m = Map.new
+    m.set('id', @id)
+    m.set('session', @session)
+    m.set('step', @step.to_string)
+    m.set('student_logprob', @student_logprob.to_string)
+    m.set('teacher_logprob', @teacher_logprob.to_string)
+    m.set('student_tokens', @student_tokens.to_string)
+    m.set('teacher_tokens', @teacher_tokens.to_string)
+    m.set('reverse_kl', @reverse_kl.to_string)
+    m.set('advantage', @advantage.to_string)
+    m.set('at', @at)
+    m
+  }
+
+  fn to_json -> String {
+    let buf = StringBuffer.new
+    buf.push('{"id":')
+    buf.push(JsonUtil.string(@id))
+    buf.push(',"session":')
+    buf.push(JsonUtil.string(@session))
+    buf.push(',"step":')
+    buf.push(@step.to_string)
+    buf.push(',"student_logprob":')
+    buf.push(@student_logprob.to_string)
+    buf.push(',"teacher_logprob":')
+    buf.push(@teacher_logprob.to_string)
+    buf.push(',"reverse_kl":')
+    buf.push(@reverse_kl.to_string)
+    buf.push(',"advantage":')
+    buf.push(@advantage.to_string)
+    buf.push(',"at":')
+    buf.push(JsonUtil.string(@at))
+    buf.push('}')
+    buf.to_string
+  }
+}
+
+class PolicyPrior {
+  let @weights: Map[String, Float]
+  let @db: Sqlite
+
+  fn static new(db: Sqlite) -> PolicyPrior {
+    let p = PolicyPrior(weights: Map.new, db: db)
+    p.load
+    p
+  }
+
+  fn mut load {
+    let rows = @db.select_all('distill')
+    let mut i = 0
+    while i < rows.size {
+      let r = rows.get(i)
+      let key = r.opt('feature').or('')
+      if key.size > 0 {
+        match Float.parse(r.opt('weight').or('0')) {
+          case Some(w) -> @weights.set(key, w)
+          case None -> {}
+        }
+      }
+      i = i + 1
+    }
+  }
+
+  fn mut update(feature: String, gradient: Float, lr: Float) {
+    let cur = @weights.opt(feature).or(0.0)
+    let next = cur - lr * gradient
+    let clipped = if next > 4.0 { 4.0 } else if next < -4.0 { -4.0 } else { next }
+    @weights.set(feature, clipped)
+    let id = 'w-' + Digest.short(feature)
+    let row = Map.new
+    row.set('id', id)
+    row.set('feature', feature)
+    row.set('weight', clipped.to_string)
+    row.set('at', Clock.iso_now)
+    match @db.select_one('distill', 'id', id) {
+      case Some(_) -> @db.update('distill', 'id', id, row)
+      case None -> @db.insert('distill', row)
+    }
+  }
+
+  fn bias(feature: String) -> Float {
+    @weights.opt(feature).or(0.0)
+  }
+
+  fn temperature_for(features: ref Array[String]) -> Float {
+    let mut acc = 0.0
+    let mut i = 0
+    while i < features.size {
+      acc = acc + bias(features.get(i))
+      i = i + 1
+    }
+    let adj = TEMPERATURE - acc * 0.05
+    if adj < 0.15 { 0.15 } else if adj > 1.4 { 1.4 } else { adj }
+  }
+
+  fn snapshot -> String {
+    let buf = StringBuffer.new
+    buf.push('{')
+    let keys = @weights.keys.to_array
+    keys.sort
+    let mut i = 0
+    while i < keys.size {
+      if i > 0 { buf.push(',') }
+      buf.push(JsonUtil.string(keys.get(i)))
+      buf.push(':')
+      buf.push(@weights.opt(keys.get(i)).or(0.0).to_string)
+      i = i + 1
+    }
+    buf.push('}')
+    buf.to_string
+  }
+}
+
+class DistillEngine {
+  let @db: Sqlite
+  let @llm: LlmClient
+  let @prior: PolicyPrior
+  let @logger: Logger
+  let @ids: Ids
+
+  fn static new(db: Sqlite, llm: LlmClient, prior: PolicyPrior, logger: Logger) -> DistillEngine {
+    DistillEngine(db: db, llm: llm, prior: prior, logger: logger, ids: Ids.new)
+  }
+
+  fn mut dual_pass(session: String, step: Int, clean_prompt: String, patch: ref ReflectionPatch) -> DistillationRecord {
+    let rec = DistillationRecord.new(@ids.next('distill'), session, step)
+    let student = @llm.complete_scored(SYSTEM_PROMPT, clean_prompt, TEMPERATURE, 1024)
+    let teacher_prompt = patch.prompt_prefix + clean_prompt
+    let teacher = @llm.complete_scored(SYSTEM_PROMPT, teacher_prompt, TEMPERATURE, 1024)
+    if student.ok {
+      rec.student_logprob = student.logprob_sum
+      rec.student_tokens = if student.token_count > 0 { student.token_count } else { student.usage.completion_tokens }
+    }
+    if teacher.ok {
+      rec.teacher_logprob = teacher.logprob_sum
+      rec.teacher_tokens = if teacher.token_count > 0 { teacher.token_count } else { teacher.usage.completion_tokens }
+    }
+    let sn = if rec.student_tokens > 0 { rec.student_tokens.to_float } else { 1.0 }
+    let tn = if rec.teacher_tokens > 0 { rec.teacher_tokens.to_float } else { 1.0 }
+    let s_mean = rec.student_logprob / sn
+    let t_mean = rec.teacher_logprob / tn
+    rec.reverse_kl = t_mean - s_mean
+    rec.advantage = rec.reverse_kl
+    @db.insert('distill', rec.to_row)
+    let features = DistillEngine.features_of(patch)
+    let grad = 0.0 - rec.reverse_kl
+    let mut i = 0
+    while i < features.size {
+      @prior.update(features.get(i), grad, 0.05)
+      i = i + 1
+    }
+    @logger.info('distillation step session=' + session + ' rkl=' + rec.reverse_kl.to_string)
+    rec
+  }
+
+  fn static features_of(patch: ref ReflectionPatch) -> Array[String] {
+    let out = Array.new
+    out.push('component:' + patch.component)
+    if patch.skill_name.size > 0 { out.push('skill:' + patch.skill_name) }
+    if patch.pivot_action.size > 0 { out.push('pivot:' + Digest.short(patch.pivot_action)) }
+    out
+  }
+
+  fn history(session: String) -> Array[Map[String, String]] {
+    @db.select_where('distill', 'session', session)
+  }
+}
+
+class DiagnosticTask {
+  let @id: String
+  let @task: String
+  let @expect_substring: String
+  let @max_steps: Int
+
+  fn static new(id: String, task: String, expect: String, steps: Int) -> DiagnosticTask {
+    DiagnosticTask(id: id, task: task, expect_substring: expect, max_steps: steps)
+  }
+}
+
+class ValidationGate {
+  let @db: Sqlite
+  let @logger: Logger
+  let @tasks: Array[DiagnosticTask]
+
+  fn static new(db: Sqlite, logger: Logger) -> ValidationGate {
+    let t = Array.new
+    t.push(DiagnosticTask.new('diag-arith', 'Compute 17 multiplied by 23 and report only the numeric product.', '391', 6))
+    t.push(DiagnosticTask.new('diag-file', 'Create a file named gate_check.txt in the workspace whose single line is GATE_OK, then verify the line is present.', 'GATE_OK', 10))
+    t.push(DiagnosticTask.new('diag-decompose', 'List exactly three sequential steps required to safely restart a database service.', 'step', 8))
+    ValidationGate(db: db, logger: logger, tasks: t)
+  }
+
+  fn mut evaluate(candidate: ref Skill, runtime: mut AgentRuntime) -> ValidationReport {
+    let baseline = run_suite(runtime, false, candidate)
+    let with_patch = run_suite(runtime, true, candidate)
+    let report = ValidationReport.new(candidate.id)
+    report.baseline_score = baseline
+    report.candidate_score = with_patch
+    report.accepted = with_patch >= baseline + VALIDATION_GATE_THRESHOLD
+    let row = Map.new
+    row.set('id', 'gate-' + Digest.short(candidate.id + Clock.iso_now))
+    row.set('skill', candidate.id)
+    row.set('baseline', baseline.to_string)
+    row.set('candidate', with_patch.to_string)
+    row.set('accepted', if report.accepted { '1' } else { '0' })
+    row.set('at', Clock.iso_now)
+    @db.insert('validations', row)
+    @logger.info('validation gate skill=' + candidate.id
+      + ' baseline=' + baseline.to_string
+      + ' candidate=' + with_patch.to_string
+      + ' accepted=' + (if report.accepted { 'yes' } else { 'no' }))
+    report
+  }
+
+  fn mut run_suite(runtime: mut AgentRuntime, with_candidate: Bool, candidate: ref Skill) -> Float {
+    let mut passed = 0
+    let mut i = 0
+    while i < @tasks.size {
+      let t = @tasks.get(i)
+      let ok = runtime.run_diagnostic(t, with_candidate, candidate)
+      if ok { passed = passed + 1 }
+      i = i + 1
+    }
+    if @tasks.size == 0 { 0.0 } else { passed.to_float / @tasks.size.to_float }
+  }
+}
+
+class ValidationReport {
+  let @skill_id: String
+  let @baseline_score: Float
+  let @candidate_score: Float
+  let @accepted: Bool
+
+  fn static new(skill_id: String) -> ValidationReport {
+    ValidationReport(skill_id: skill_id, baseline_score: 0.0, candidate_score: 0.0, accepted: false)
+  }
+
+  fn to_json -> String {
+    '{"skill_id":' + JsonUtil.string(@skill_id)
+      + ',"baseline":' + @baseline_score.to_string
+      + ',"candidate":' + @candidate_score.to_string
+      + ',"accepted":' + (if @accepted { 'true' } else { 'false' }) + '}'
+  }
+}
+
+class MetaAgent {
+  let @db: Sqlite
+  let @llm: LlmClient
+  let @em: ExperientialMemory
+  let @wiki: WikiLayer
+  let @gate: ValidationGate
+  let @logger: Logger
+  let @ids: Ids
+
+  fn static new(db: Sqlite, llm: LlmClient, em: ExperientialMemory, wiki: WikiLayer, gate: ValidationGate, logger: Logger) -> MetaAgent {
+    MetaAgent(db: db, llm: llm, em: em, wiki: wiki, gate: gate, logger: logger, ids: Ids.new)
+  }
+
+  fn mut reflect(spec: ref Spec, state: ref ExecState, traces: ref Array[Map[String, String]], verdict: Bool) -> ReflectionPatch {
+    let prompt = PromptBuilder.reflection(spec, state, traces, verdict)
+    let resp = @llm.complete(SYSTEM_PROMPT, prompt, 0.4, 4096)
+    if resp.ok.false? {
+      @logger.warn('reflection generation failed: ' + resp.error)
+      let fallback = ReflectionPatch.empty
+      fallback.diagnosis = 'reflection unavailable: ' + resp.error
+      fallback.component = 'tool_layer'
+      return fallback
+    }
+    let patch = ReflectionPatch.parse(resp.text)
+    let row = Map.new
+    row.set('id', @ids.next('reflect'))
+    row.set('session', spec.id)
+    row.set('verdict', if verdict { '1' } else { '0' })
+    row.set('payload', patch.to_json)
+    row.set('at', Clock.iso_now)
+    @db.insert('reflections', row)
+    patch
+  }
+
+  fn mut consolidate(patch: ref ReflectionPatch, runtime: mut AgentRuntime) -> String {
+    let buf = StringBuffer.new
+    if patch.playbook_entry.size > 0 {
+      let section = MetaAgent.section_for(patch.component)
+      let added = @wiki.record_pattern(section, patch.playbook_entry)
+      buf.push('playbook:' + (if added { 'updated' } else { 'duplicate' }) + ' ')
+    }
+    if patch.skill_body.size == 0 or patch.skill_name.size == 0 {
+      buf.push('skill:none')
+      return buf.to_string
+    }
+    let sid = if patch.skill_id.size > 0 { patch.skill_id } else { 'skill-' + Digest.short(patch.skill_name) }
+    let existing = @em.skills.opt(sid)
+    let candidate = match existing {
+      case Some(s) -> {
+        let c = s.clone_skill
+        c.trigger = if patch.skill_trigger.size > 0 { patch.skill_trigger } else { c.trigger }
+        c.body = patch.skill_body
+        c.version = c.version + 1
+        c.updated_at = Clock.iso_now
+        c
+      }
+      case None -> {
+        let c = Skill.new(sid, patch.skill_name, patch.skill_trigger, patch.skill_body)
+        c.tags.push('meta-evolved')
+        c.tags.push(patch.component)
+        c
+      }
+    }
+    let report = @gate.evaluate(candidate, runtime)
+    let prow = Map.new
+    prow.set('id', @ids.next('patch'))
+    prow.set('skill', candidate.id)
+    prow.set('version', candidate.version.to_string)
+    prow.set('accepted', if report.accepted { '1' } else { '0' })
+    prow.set('body', candidate.body)
+    prow.set('at', Clock.iso_now)
+    @db.insert('patches', prow)
+    if report.accepted {
+      @em.upsert(candidate)
+      buf.push('skill:accepted:' + candidate.id + ':v' + candidate.version.to_string)
+    } else {
+      buf.push('skill:rejected:' + candidate.id)
+    }
+    buf.to_string
+  }
+
+  fn static section_for(component: String) -> String {
+    if component == 'tool_layer' { 'Environment Caveats' }
+    else if component == 'experiential_memory' { 'Verified Workarounds' }
+    else { 'Failure Patterns' }
+  }
+}
+
+class Verifier {
+  fn static evaluate(spec: ref Spec, state: ref ExecState) -> Bool {
+    if state.terminal.false? { return false }
+    if state.answer.size == 0 { return false }
+    if state.blockers.size > 0 { return false }
+    if state.subgoals.size > 0 { return false }
+    if spec.success_criteria.size == 0 { return true }
+    let hay = (state.answer + ' ' + Skill.join(state.facts, ' ') + ' ' + Verifier.slots(state)).to_lower
+    let mut i = 0
+    while i < spec.success_criteria.size {
+      let c = spec.success_criteria.get(i).to_lower
+      if c.size > 0 and hay.contains?(c).false? { return false }
+      i = i + 1
+    }
+    true
+  }
+
+  fn static slots(state: ref ExecState) -> String {
+    let buf = StringBuffer.new
+    let keys = state.data.keys.to_array
+    let mut i = 0
+    while i < keys.size {
+      buf.push(state.data.opt(keys.get(i)).or(''))
+      buf.push(' ')
+      i = i + 1
+    }
+    buf.to_string
+  }
+
+  fn static substring_check(state: ref ExecState, needle: String) -> Bool {
+    if needle.size == 0 { return state.terminal }
+    let hay = (state.answer + ' ' + Skill.join(state.facts, ' ') + ' ' + Verifier.slots(state)).to_lower
+    hay.contains?(needle.to_lower)
+  }
+}
+
+class OutputClassifier {
+  let @deny_terms: Array[String]
+  let @max_len: Int
+
+  fn static new -> OutputClassifier {
+    let d = Array.new
+    d.push('BEGIN RSA PRIVATE KEY')
+    d.push('BEGIN OPENSSH PRIVATE KEY')
+    d.push('BEGIN PGP PRIVATE KEY')
+    OutputClassifier(deny_terms: d, max_len: 400000)
+  }
+
+  fn classify(text: String) -> Result[String, String] {
+    if text.size > @max_len { return Result.Error('output exceeds hard length ceiling') }
+    let mut i = 0
+    while i < @deny_terms.size {
+      if text.contains?(@deny_terms.get(i)) {
+        return Result.Error('output blocked by non-generative safety classifier')
+      }
+      i = i + 1
+    }
+    let bytes = text.to_byte_array
+    let mut nulls = 0
+    let mut j = 0
+    while j < bytes.size {
+      if bytes.get(j) == 0 { nulls = nulls + 1 }
+      j = j + 1
+    }
+    if nulls > 0 { return Result.Error('output contains illegal null bytes') }
+    Result.Ok(text)
+  }
+}
+
+class TokenBudget {
+  let @db: Sqlite
+  let @limits: Map[String, Int]
+  let @used: Map[String, Int]
+
+  fn static new(db: Sqlite) -> TokenBudget {
+    let b = TokenBudget(db: db, limits: Map.new, used: Map.new)
+    b.load
+    b
+  }
+
+  fn mut load {
+    let rows = @db.select_all('budgets')
+    let mut i = 0
+    while i < rows.size {
+      let r = rows.get(i)
+      let t = r.opt('tenant').or('')
+      if t.size > 0 {
+        @limits.set(t, Int.parse(r.opt('limit_tokens').or('0'), 10).or(TOKEN_BUDGET_DEFAULT))
+        @used.set(t, Int.parse(r.opt('used_tokens').or('0'), 10).or(0))
+      }
+      i = i + 1
+    }
+  }
+
+  fn mut ensure(tenant: String) {
+    if @limits.opt(tenant).none? {
+      @limits.set(tenant, TOKEN_BUDGET_DEFAULT)
+      @used.set(tenant, 0)
+      let row = Map.new
+      row.set('id', 'budget-' + Digest.short(tenant))
+      row.set('tenant', tenant)
+      row.set('limit_tokens', TOKEN_BUDGET_DEFAULT.to_string)
+      row.set('used_tokens', '0')
+      row.set('at', Clock.iso_now)
+      @db.insert('budgets', row)
+    }
+  }
+
+  fn mut charge(tenant: String, tokens: Int) -> Bool {
+    ensure(tenant)
+    let limit = @limits.opt(tenant).or(TOKEN_BUDGET_DEFAULT)
+    let used = @used.opt(tenant).or(0) + tokens
+    @used.set(tenant, used)
+    let row = Map.new
+    row.set('id', 'budget-' + Digest.short(tenant))
+    row.set('tenant', tenant)
+    row.set('limit_tokens', limit.to_string)
+    row.set('used_tokens', used.to_string)
+    row.set('at', Clock.iso_now)
+    @db.update('budgets', 'tenant', tenant, row)
+    used <= limit
+  }
+
+  fn remaining(tenant: String) -> Int {
+    let limit = @limits.opt(tenant).or(TOKEN_BUDGET_DEFAULT)
+    let used = @used.opt(tenant).or(0)
+    let r = limit - used
+    if r < 0 { 0 } else { r }
+  }
+}
+
+class Checkpoint {
+  let @id: String
+  let @session: String
+  let @step: Int
+  let @spec_json: String
+  let @state_json: String
+  let @observation_json: String
+  let @cognition: String
+  let @status: String
+  let @at: String
+
+  fn static new(id: String, session: String, step: Int) -> Checkpoint {
+    Checkpoint(
+      id: id,
+      session: session,
+      step: step,
+      spec_json: '',
+      state_json: '',
+      observation_json: '',
+      cognition: '',
+      status: 'running',
+      at: Clock.iso_now
+    )
+  }
+
+  fn to_row -> Map[String, String] {
+    let m = Map.new
+    m.set('id', @id)
+    m.set('session', @session)
+    m.set('step', @step.to_string)
+    m.set('spec_json', @spec_json)
+    m.set('state_json', @state_json)
+    m.set('observation_json', @observation_json)
+    m.set('cognition', @cognition)
+    m.set('status', @status)
+    m.set('at', @at)
+    m
+  }
+}
+
+class CheckpointStore {
+  let @db: Sqlite
+
+  fn static new(db: Sqlite) -> CheckpointStore {
+    CheckpointStore(db: db)
+  }
+
+  fn mut save(cp: ref Checkpoint) {
+    let id = 'cp-' + cp.session
+    let row = cp.to_row
+    row.set('id', id)
+    match @db.select_one('checkpoints', 'id', id) {
+      case Some(_) -> @db.update('checkpoints', 'id', id, row)
+      case None -> @db.insert('checkpoints', row)
+    }
+  }
+
+  fn load(session: String) -> Option[Map[String, String]] {
+    @db.select_one('checkpoints', 'id', 'cp-' + session)
+  }
+
+  fn resumable -> Array[Map[String, String]] {
+    let rows = @db.select_all('checkpoints')
+    let out = Array.new
+    let mut i = 0
+    while i < rows.size {
+      let r = rows.get(i)
+      if r.opt('status').or('') == 'running' { out.push(r.clone) }
+      i = i + 1
+    }
+    out
+  }
+
+  fn mut mark(session: String, status: String) {
+    let id = 'cp-' + session
+    match @db.select_one('checkpoints', 'id', id) {
+      case Some(row) -> {
+        let patch = row.clone
+        patch.set('status', status)
+        patch.set('at', Clock.iso_now)
+        @db.update('checkpoints', 'id', id, patch)
+      }
+      case None -> {}
+    }
+  }
+}
+
+class SessionRecord {
+  let @id: String
+  let @tenant: String
+  let @task: String
+  let @status: String
+  let @answer: String
+  let @steps: Int
+  let @tokens: Int
+  let @created_at: String
+  let @updated_at: String
+
+  fn static new(id: String, tenant: String, task: String) -> SessionRecord {
+    SessionRecord(
+      id: id,
+      tenant: tenant,
+      task: task,
+      status: 'queued',
+      answer: '',
+      steps: 0,
+      tokens: 0,
+      created_at: Clock.iso_now,
+      updated_at: Clock.iso_now
+    )
+  }
+
+  fn to_row -> Map[String, String] {
+    let m = Map.new
+    m.set('id', @id)
+    m.set('tenant', @tenant)
+    m.set('task', @task)
+    m.set('status', @status)
+    m.set('answer', @answer)
+    m.set('steps', @steps.to_string)
+    m.set('tokens', @tokens.to_string)
+    m.set('created_at', @created_at)
+    m.set('updated_at', @updated_at)
+    m
+  }
+
+  fn to_json -> String {
+    let buf = StringBuffer.new
+    buf.push('{"id":')
+    buf.push(JsonUtil.string(@id))
+    buf.push(',"tenant":')
+    buf.push(JsonUtil.string(@tenant))
+    buf.push(',"task":')
+    buf.push(JsonUtil.string(@task))
+    buf.push(',"status":')
+    buf.push(JsonUtil.string(@status))
+    buf.push(',"answer":')
+    buf.push(JsonUtil.string(@answer))
+    buf.push(',"steps":')
+    buf.push(@steps.to_string)
+    buf.push(',"tokens":')
+    buf.push(@tokens.to_string)
+    buf.push(',"created_at":')
+    buf.push(JsonUtil.string(@created_at))
+    buf.push(',"updated_at":')
+    buf.push(JsonUtil.string(@updated_at))
+    buf.push('}')
+    buf.to_string
+  }
+
+  fn static from_row(row: ref Map[String, String]) -> SessionRecord {
+    let s = SessionRecord.new(row.opt('id').or(''), row.opt('tenant').or('default'), row.opt('task').or(''))
+    s.status = row.opt('status').or('queued')
+    s.answer = row.opt('answer').or('')
+    s.steps = Int.parse(row.opt('steps').or('0'), 10).or(0)
+    s.tokens = Int.parse(row.opt('tokens').or('0'), 10).or(0)
+    s.created_at = row.opt('created_at').or(Clock.iso_now)
+    s.updated_at = row.opt('updated_at').or(Clock.iso_now)
+    s
+  }
+}
+
+class MessageRecord {
+  let @id: String
+  let @session: String
+  let @role: String
+  let @content: String
+  let @at: String
+
+  fn static new(id: String, session: String, role: String, content: String) -> MessageRecord {
+    MessageRecord(id: id, session: session, role: role, content: content, at: Clock.iso_now)
+  }
+
+  fn to_row -> Map[String, String] {
+    let m = Map.new
+    m.set('id', @id)
+    m.set('session', @session)
+    m.set('role', @role)
+    m.set('content', @content)
+    m.set('at', @at)
+    m
+  }
+
+  fn to_json -> String {
+    '{"id":' + JsonUtil.string(@id)
+      + ',"session":' + JsonUtil.string(@session)
+      + ',"role":' + JsonUtil.string(@role)
+      + ',"content":' + JsonUtil.string(@content)
+      + ',"at":' + JsonUtil.string(@at) + '}'
+  }
+}
+
+class EventLog {
+  let @db: Sqlite
+  let @ids: Ids
+
+  fn static new(db: Sqlite) -> EventLog {
+    EventLog(db: db, ids: Ids.new)
+  }
+
+  fn mut emit(session: String, kind: String, payload: String) {
+    let row = Map.new
+    row.set('id', @ids.next('ev'))
+    row.set('session', session)
+    row.set('kind', kind)
+    row.set('payload', payload)
+    row.set('seq', @db.count('events').to_string)
+    row.set('at', Clock.iso_now)
+    @db.insert('events', row)
+  }
+
+  fn since(session: String, seq: Int) -> Array[Map[String, String]] {
+    let rows = @db.select_where('events', 'session', session)
+    let out = Array.new
+    let mut i = 0
+    while i < rows.size {
+      let r = rows.get(i)
+      let s = Int.parse(r.opt('seq').or('0'), 10).or(0)
+      if s >= seq { out.push(r.clone) }
+      i = i + 1
+    }
+    out.sort_by fn (a: ref Map[String, String], b: ref Map[String, String]) -> Ordering {
+      let x = Int.parse(a.opt('seq').or('0'), 10).or(0)
+      let y = Int.parse(b.opt('seq').or('0'), 10).or(0)
+      if x < y { Ordering.Less } else if x > y { Ordering.Greater } else { Ordering.Equal }
+    }
+    out
+  }
+}
+
+class StepOutcome {
+  let @state: ExecState
+  let @trace: ExecutionTrace
+  let @observation: Observation
+  let @tokens: Int
+  let @prompt: String
+  let @accepted: Bool
+  let @error: String
+
+  fn static new(state: ExecState, trace: ExecutionTrace, observation: Observation) -> StepOutcome {
+    StepOutcome(
+      state: state,
+      trace: trace,
+      observation: observation,
+      tokens: 0,
+      prompt: '',
+      accepted: true,
+      error: ''
+    )
+  }
+}
+
+class AgentRuntime {
+  let @db: Sqlite
+  let @llm: LlmClient
+  let @em: ExperientialMemory
+  let @wiki: WikiLayer
+  let @raw: RawTraceLayer
+  let @tools: ToolRegistry
+  let @checkpoints: CheckpointStore
+  let @budget: TokenBudget
+  let @classifier: OutputClassifier
+  let @system2: System2Engine
+  let @prior: PolicyPrior
+  let @distill: DistillEngine
+  let @gate: ValidationGate
+  let @meta: MetaAgent
+  let @events: EventLog
+  let @logger: Logger
+  let @ids: Ids
+  let @sessions: Map[String, SessionRecord]
+  let @active_cognition: Map[String, CognitionToken]
+  let @candidate_override: Option[Skill]
+
+  fn static new(logger: Logger) -> AgentRuntime {
+    let db = Sqlite.open(DB_PATH)
+    let llm = LlmClient.new(logger)
+    let em = ExperientialMemory.new(db)
+    let wiki = WikiLayer.new(db, WIKI_PATH)
+    let raw = RawTraceLayer.new(db, TRACE_PATH)
+    let tools = ToolRegistry.new(WORKSPACE_PATH, db)
+    let cps = CheckpointStore.new(db)
+    let budget = TokenBudget.new(db)
+    let classifier = OutputClassifier.new
+    let sys2 = System2Engine.new
+    let prior = PolicyPrior.new(db)
+    let distill = DistillEngine.new(db, llm, prior, logger)
+    let gate = ValidationGate.new(db, logger)
+    let meta = MetaAgent.new(db, llm, em, wiki, gate, logger)
+    let events = EventLog.new(db)
+    let rt = AgentRuntime(
+      db: db,
+      llm: llm,
+      em: em,
+      wiki: wiki,
+      raw: raw,
+      tools: tools,
+      checkpoints: cps,
+      budget: budget,
+      classifier: classifier,
+      system2: sys2,
+      prior: prior,
+      distill: distill,
+      gate: gate,
+      meta: meta,
+      events: events,
+      logger: logger,
+      ids: Ids.new,
+      sessions: Map.new,
+      active_cognition: Map.new,
+      candidate_override: Option.None
+    )
+    rt.load_sessions
+    Fs.ensure_dir(SKILL_PATH)
+    rt
+  }
+
+  fn mut load_sessions {
+    let rows = @db.select_all('sessions')
+    let mut i = 0
+    while i < rows.size {
+      let s = SessionRecord.from_row(rows.get(i))
+      if s.id.size > 0 { @sessions.set(s.id, s) }
+      i = i + 1
+    }
+  }
+
+  fn mut persist_session(rec: ref SessionRecord) {
+    let updated = rec.clone_record
+    updated.updated_at = Clock.iso_now
+    @sessions.set(updated.id, updated)
+    match @db.select_one('sessions', 'id', updated.id) {
+      case Some(_) -> @db.update('sessions', 'id', updated.id, updated.to_row)
+      case None -> @db.insert('sessions', updated.to_row)
+    }
+  }
+
+  fn mut create_session(tenant: String, task: String, criteria: ref Array[String], constraints: ref Array[String], max_steps: Int) -> String {
+    let sid = @ids.next('sess')
+    let rec = SessionRecord.new(sid, tenant, task)
+    rec.status = 'running'
+    persist_session(rec)
+    @budget.ensure(tenant)
+    let spec = Spec.new(sid, task, tenant)
+    spec.max_steps = if max_steps > 0 { max_steps } else { MAX_STEPS_DEFAULT }
+    let mut i = 0
+    while i < criteria.size {
+      spec.success_criteria.push(criteria.get(i))
+      i = i + 1
+    }
+    let mut j = 0
+    while j < constraints.size {
+      spec.constraints.push(constraints.get(j))
+      j = j + 1
+    }
+    let cp = Checkpoint.new('cp-' + sid, sid, 0)
+    cp.spec_json = spec.to_json
+    cp.state_json = ExecState.new.to_json
+    cp.observation_json = Observation.new('runtime', 'bootstrap', 'session initialized', true).to_json
+    cp.status = 'running'
+    @checkpoints.save(cp)
+    let msg = MessageRecord.new(@ids.next('msg'), sid, 'user', task)
+    @db.insert('messages', msg.to_row)
+    @events.emit(sid, 'session_created', spec.to_json)
+    sid
+  }
+
+  fn spec_from_checkpoint(row: ref Map[String, String]) -> Spec {
+    let sj = row.opt('spec_json').or('{}')
+    match JsonUtil.parse(sj) {
+      case Ok(j) -> {
+        let id = JsonUtil.get_string(j, 'id').or(row.opt('session').or(''))
+        let task = JsonUtil.get_string(j, 'task').or('')
+        let tenant = JsonUtil.get_string(j, 'tenant').or('default')
+        let spec = Spec.new(id, task, tenant)
+        spec.max_steps = JsonUtil.get_int(j, 'max_steps').or(MAX_STEPS_DEFAULT)
+        match JsonUtil.get_array(j, 'success_criteria') {
+          case Some(arr) -> {
+            let mut i = 0
+            while i < arr.size {
+              match arr.get(i) {
+                case String(s) -> spec.success_criteria.push(s)
+                case _ -> {}
+              }
+              i = i + 1
+            }
+          }
+          case None -> {}
+        }
+        match JsonUtil.get_array(j, 'constraints') {
+          case Some(arr) -> {
+            let mut i = 0
+            while i < arr.size {
+              match arr.get(i) {
+                case String(s) -> spec.constraints.push(s)
+                case _ -> {}
+              }
+              i = i + 1
+            }
+          }
+          case None -> {}
+        }
+        match JsonUtil.get_array(j, 'tools_allowed') {
+          case Some(arr) -> {
+            let mut i = 0
+            while i < arr.size {
+              match arr.get(i) {
+                case String(s) -> spec.tools_allowed.push(s)
+                case _ -> {}
+              }
+              i = i + 1
+            }
+          }
+          case None -> {}
+        }
+        spec
+      }
+      case Error(_) -> Spec.new(row.opt('session').or(''), row.opt('task').or(''), 'default')
+    }
+  }
+
+  fn state_from_checkpoint(row: ref Map[String, String]) -> ExecState {
+    match JsonUtil.parse(row.opt('state_json').or('{}')) {
+      case Ok(j) -> ExecState.from_json(j)
+      case Error(_) -> ExecState.new
+    }
+  }
+
+  fn observation_from_checkpoint(row: ref Map[String, String]) -> Observation {
+    match JsonUtil.parse(row.opt('observation_json').or('{}')) {
+      case Ok(j) -> Observation.new(
+        JsonUtil.get_string(j, 'source').or('runtime'),
+        JsonUtil.get_string(j, 'kind').or('resume'),
+        JsonUtil.get_string(j, 'content').or('resumed from durable checkpoint'),
+        JsonUtil.get_bool(j, 'ok').or(true)
+      )
+      case Error(_) -> Observation.new('runtime', 'resume', 'resumed from durable checkpoint', true)
+    }
+  }
+
+  fn mut retrieve_skills(query: String) -> Array[Skill] {
+    let base = @em.retrieve(query, SKILL_INJECT_LIMIT)
+    match @candidate_override {
+      case Some(c) -> {
+        let out = Array.new
+        out.push(c.clone_skill)
+        let mut i = 0
+        while i < base.size and out.size < SKILL_INJECT_LIMIT {
+          if base.get(i).id != c.id { out.push(base.get(i)) }
+          i = i + 1
+        }
+        out
+      }
+      case None -> base
+    }
+  }
+
+  fn playbook_excerpt(state: ref ExecState) -> String {
+    let text = @wiki.read_playbook
+    if text.size == 0 { return '' }
+    let lines = text.split('\n').to_array
+    let out = Array.new
+    let mut i = 0
+    while i < lines.size and out.size < 6 {
+      let l = lines.get(i)
+      if l.starts_with?('- ') { out.push(l) }
+      i = i + 1
+    }
+    if out.size == 0 { return '' }
+    let buf = StringBuffer.new
+    let mut j = 0
+    while j < out.size {
+      buf.push(out.get(j))
+      buf.push('\n')
+      j = j + 1
+    }
+    buf.to_string
+  }
+
+  fn mut step(spec: ref Spec, wm: mut WorkingMemory) -> StepOutcome {
+    let started = Clock.now_ms
+    let trace = ExecutionTrace.new(@ids.next('trace'), spec.id, wm.state.step)
+    trace.state_before = wm.state.to_json
+    let query = wm.retrieval_query
+    let skills = retrieve_skills(query)
+    let cog = @system2.deliberate(spec, wm.state, wm.last_observation, skills)
+    @active_cognition.set(spec.id, cog)
+    let staleness = cog.staleness(Clock.now_ms)
+    let excerpt = playbook_excerpt(wm.state)
+    let prompt = PromptBuilder.build(spec, wm.state, wm.last_observation, skills, @tools, cog.encode, staleness, excerpt)
+    let features = Array.new
+    let mut si = 0
+    while si < skills.size {
+      features.push('skill:' + skills.get(si).name)
+      si = si + 1
+    }
+    features.push('focus:' + cog.subgoal)
+    let temp = @prior.temperature_for(features)
+    let mut attempt = 0
+    let mut envelope = ResponseEnvelope.parse('')
+    let mut tokens = 0
+    let mut last_error = ''
+    let mut have = false
+    while attempt < MAX_RETRIES and have.false? {
+      attempt = attempt + 1
+      let resp = @llm.complete(SYSTEM_PROMPT, prompt, temp, min(MAX_TOKENS, 8192))
+      if resp.ok.false? {
+        last_error = resp.error
+        @logger.warn('model call failed attempt ' + attempt.to_string + ': ' + resp.error)
+      } else {
+        tokens = tokens + resp.usage.total_tokens
+        let env = ResponseEnvelope.parse(resp.text)
+        if env.parsed {
+          envelope = env
+          have = true
+        } else {
+          last_error = env.error
+          @logger.warn('envelope parse failed attempt ' + attempt.to_string + ': ' + env.error)
+        }
+      }
+    }
+    if have.false? {
+      let obs = Observation.new('runtime', 'kernel_error', 'structured decoding failed after ' + MAX_RETRIES.to_string + ' attempts: ' + last_error, false)
+      trace.action = '{"tool":"none"}'
+      trace.observation = obs.content
+      trace.state_after = wm.state.to_json
+      trace.ok = false
+      trace.latency_ms = Clock.now_ms - started
+      let out = StepOutcome.new(wm.state.clone_state, trace, obs)
+      out.tokens = tokens
+      out.prompt = prompt
+      out.accepted = false
+      out.error = last_error
+      return out
+    }
+    let validator = StateValidator.new(@tools.names)
+    let pv = validator.validate_patch(envelope.patch, wm.state)
+    if pv.ok.false? {
+      let obs = Observation.new('runtime', 'validation_error', 'state patch rejected: ' + pv.message + '. Re-emit a compliant patch.', false)
+      trace.action = envelope.action.to_json
+      trace.observation = obs.content
+      trace.state_after = wm.state.to_json
+      trace.ok = false
+      trace.latency_ms = Clock.now_ms - started
+      let out = StepOutcome.new(wm.state.clone_state, trace, obs)
+      out.tokens = tokens
+      out.prompt = prompt
+      out.accepted = false
+      out.error = pv.message
+      return out
+    }
+    let av = validator.validate_action(envelope.action)
+    if av.ok.false? {
+      let obs = Observation.new('runtime', 'authorization_error', 'action rejected: ' + av.message + '. Choose an authorized tool.', false)
+      trace.action = envelope.action.to_json
+      trace.observation = obs.content
+      trace.state_after = wm.state.to_json
+      trace.ok = false
+      trace.latency_ms = Clock.now_ms - started
+      let out = StepOutcome.new(wm.state.clone_state, trace, obs)
+      out.tokens = tokens
+      out.prompt = prompt
+      out.accepted = false
+      out.error = av.message
+      return out
+    }
+    let next = StateMerger.apply(wm.state, envelope.patch)
+    let tr = @tools.execute(envelope.action, spec, mut @em)
+    let obs = Observation.new(envelope.action.tool, tr.kind, tr.content, tr.ok)
+    let mut i = 0
+    while i < skills.size {
+      trace.skills_used.push(skills.get(i).id)
+      @em.record_outcome(skills.get(i).id, tr.ok)
+      i = i + 1
+    }
+    if envelope.action.tool == 'finish' and tr.ok {
+      next.terminal = true
+      if next.answer.size == 0 { next.answer = tr.content }
+    }
+    if envelope.action.tool == 'record_fact' and tr.ok {
+      let f = envelope.action.args.opt('fact').or('')
+      if f.size > 0 and StateMerger.contains(next.facts, f).false? { next.facts.push(f) }
+    }
+    trace.action = envelope.action.to_json
+    trace.observation = obs.content
+    trace.state_after = next.to_json
+    trace.ok = tr.ok
+    trace.latency_ms = Clock.now_ms - started
+    let out = StepOutcome.new(next, trace, obs)
+    out.tokens = tokens
+    out.prompt = prompt
+    out.accepted = true
+    out
+  }
+
+  fn mut run_session(session: String) -> SessionRecord {
+    let cprow = match @checkpoints.load(session) {
+      case Some(r) -> r
+      case None -> {
+        let rec = match @sessions.opt(session) {
+          case Some(s) -> s.clone_record
+          case None -> SessionRecord.new(session, 'default', '')
+        }
+        rec.status = 'error'
+        rec.answer = 'no durable checkpoint for session'
+        persist_session(rec)
+        return rec
+      }
+    }
+    let spec = spec_from_checkpoint(cprow)
+    let state = state_from_checkpoint(cprow)
+    let obs = observation_from_checkpoint(cprow)
+    let wm = WorkingMemory.new(session, spec)
+    wm.state = state
+    wm.observe(obs)
+    let rec = match @sessions.opt(session) {
+      case Some(s) -> s.clone_record
+      case None -> SessionRecord.new(session, spec.tenant, spec.task)
+    }
+    rec.status = 'running'
+    persist_session(rec)
+    @events.emit(session, 'run_started', '{"step":' + wm.state.step.to_string + '}')
+    let mut total_tokens = rec.tokens
+    let mut running = true
+    while running {
+      if wm.state.step >= spec.max_steps {
+        rec.status = 'exhausted'
+        rec.answer = if wm.state.answer.size > 0 { wm.state.answer } else { 'step budget exhausted without terminal state' }
+        running = false
+      } else if @budget.remaining(spec.tenant) <= 0 {
+        rec.status = 'budget_exceeded'
+        rec.answer = 'tenant token budget exhausted'
+        running = false
+      } else if wm.loop_detected {
+        wm.state.blockers.push('runtime detected a state fixpoint loop; strategy change required')
+        wm.observe(Observation.new('runtime', 'loop_guard', 'identical state digest repeated; the current strategy is not advancing. Change approach or terminate.', false))
+        wm.history_digest.clear
+      } else {
+        let outcome = step(spec, mut wm)
+        total_tokens = total_tokens + outcome.tokens
+        let charged = @budget.charge(spec.tenant, outcome.tokens)
+        @raw.append(outcome.trace)
+        @events.emit(session, 'step', outcome.trace.to_json)
+        if outcome.accepted {
+          wm.commit(outcome.state)
+          wm.observe(outcome.observation)
+        } else {
+          wm.observe(outcome.observation)
+        }
+        rec.steps = wm.state.step
+        rec.tokens = total_tokens
+        persist_session(rec)
+        let cp = Checkpoint.new('cp-' + session, session, wm.state.step)
+        cp.spec_json = spec.to_json
+        cp.state_json = wm.state.to_json
+        cp.observation_json = wm.last_observation.to_json
+        cp.status = 'running'
+        match @active_cognition.opt(session) {
+          case Some(c) -> cp.cognition = c.encode
+          case None -> {}
+        }
+        @checkpoints.save(cp)
+        if charged.false? {
+          rec.status = 'budget_exceeded'
+          rec.answer = 'tenant token budget exhausted mid-run'
+          running = false
+        } else if wm.state.terminal {
+          running = false
+          let verdict = Verifier.evaluate(spec, wm.state)
+          rec.status = if verdict { 'completed' } else { 'unverified' }
+          rec.answer = wm.state.answer
+        }
+      }
+    }
+    let checked = @classifier.classify(rec.answer)
+    match checked {
+      case Ok(_) -> {}
+      case Error(e) -> {
+        rec.answer = 'output withheld: ' + e
+        rec.status = 'blocked'
+      }
+    }
+    persist_session(rec)
+    @checkpoints.mark(session, rec.status)
+    let amsg = MessageRecord.new(@ids.next('msg'), session, 'assistant', rec.answer)
+    @db.insert('messages', amsg.to_row)
+    @events.emit(session, 'run_finished', rec.to_json)
+    let verdict = rec.status == 'completed'
+    let traces = @raw.for_session(session)
+    let patch = @meta.reflect(spec, wm.state, traces, verdict)
+    if patch.diagnosis.size > 0 {
+      let clean = PromptBuilder.build(spec, wm.state, wm.last_observation, retrieve_skills(wm.retrieval_query), @tools, '', '', '')
+      let drec = @distill.dual_pass(session, wm.state.step, clean, patch)
+      @events.emit(session, 'distillation', drec.to_json)
+      let consolidation = @meta.consolidate(patch, mut self)
+      @events.emit(session, 'consolidation', JsonUtil.string(consolidation))
+    }
+    rec
+  }
+
+  fn mut run_diagnostic(task: ref DiagnosticTask, with_candidate: Bool, candidate: ref Skill) -> Bool {
+    let prev = @candidate_override
+    @candidate_override = if with_candidate { Option.Some(candidate.clone_skill) } else { Option.None }
+    let spec = Spec.new('diag-' + task.id + '-' + Digest.short(Clock.iso_now + task.id), task.task, 'diagnostic')
+    spec.max_steps = task.max_steps
+    let wm = WorkingMemory.new(spec.id, spec)
+    let mut running = true
+    let mut passed = false
+    while running {
+      if wm.state.step >= spec.max_steps {
+        running = false
+      } else {
+        let outcome = step(spec, mut wm)
+        @raw.append(outcome.trace)
+        if outcome.accepted {
+          wm.commit(outcome.state)
+          wm.observe(outcome.observation)
+        } else {
+          wm.observe(outcome.observation)
+        }
+        if wm.state.terminal {
+          running = false
+          passed = Verifier.substring_check(wm.state, task.expect_substring)
+        }
+      }
+    }
+    @candidate_override = prev
+    passed
+  }
+
+  fn mut resume_all {
+    let rows = @checkpoints.resumable
+    @logger.info('resuming ' + rows.size.to_string + ' interrupted sessions')
+    let mut i = 0
+    while i < rows.size {
+      let session = rows.get(i).opt('session').or('')
+      if session.size > 0 {
+        let _ = run_session(session)
+      }
+      i = i + 1
+    }
+  }
+
+  fn session_json(session: String) -> String {
+    match @sessions.opt(session) {
+      case Some(s) -> s.to_json
+      case None -> '{"error":"session not found"}'
+    }
+  }
+
+  fn sessions_json -> String {
+    let buf = StringBuffer.new
+    buf.push('[')
+    let ids = @sessions.keys.to_array
+    ids.sort
+    let mut i = 0
+    while i < ids.size {
+      if i > 0 { buf.push(',') }
+      match @sessions.opt(ids.get(i)) {
+        case Some(s) -> buf.push(s.to_json)
+        case None -> buf.push('null')
+      }
+      i = i + 1
+    }
+    buf.push(']')
+    buf.to_string
+  }
+
+  fn messages_json(session: String) -> String {
+    let rows = @db.select_where('messages', 'session', session)
+    let buf = StringBuffer.new
+    buf.push('[')
+    let mut i = 0
+    while i < rows.size {
+      if i > 0 { buf.push(',') }
+      let r = rows.get(i)
+      buf.push('{"id":')
+      buf.push(JsonUtil.string(r.opt('id').or('')))
+      buf.push(',"role":')
+      buf.push(JsonUtil.string(r.opt('role').or('')))
+      buf.push(',"content":')
+      buf.push(JsonUtil.string(r.opt('content').or('')))
+      buf.push(',"at":')
+      buf.push(JsonUtil.string(r.opt('at').or('')))
+      buf.push('}')
+      i = i + 1
+    }
+    buf.push(']')
+    buf.to_string
+  }
+
+  fn traces_json(session: String) -> String {
+    let rows = @raw.for_session(session)
+    let buf = StringBuffer.new
+    buf.push('[')
+    let mut i = 0
+    while i < rows.size {
+      if i > 0 { buf.push(',') }
+      let r = rows.get(i)
+      buf.push('{"id":')
+      buf.push(JsonUtil.string(r.opt('id').or('')))
+      buf.push(',"step":')
+      buf.push(r.opt('step').or('0'))
+      buf.push(',"ok":')
+      buf.push(if r.opt('ok').or('1') == '1' { 'true' } else { 'false' })
+      buf.push(',"action":')
+      buf.push(JsonUtil.string(r.opt('action').or('')))
+      buf.push(',"observation":')
+      buf.push(JsonUtil.string(r.opt('observation').or('')))
+      buf.push(',"latency_ms":')
+      buf.push(r.opt('latency_ms').or('0'))
+      buf.push(',"at":')
+      buf.push(JsonUtil.string(r.opt('at').or('')))
+      buf.push('}')
+      i = i + 1
+    }
+    buf.push(']')
+    buf.to_string
+  }
+
+  fn skills_json -> String {
+    let all = @em.all
+    let buf = StringBuffer.new
+    buf.push('[')
+    let mut i = 0
+    while i < all.size {
+      if i > 0 { buf.push(',') }
+      buf.push(all.get(i).to_json)
+      i = i + 1
+    }
+    buf.push(']')
+    buf.to_string
+  }
+
+  fn state_json(session: String) -> String {
+    match @checkpoints.load(session) {
+      case Some(row) -> row.opt('state_json').or('{}')
+      case None -> '{}'
+    }
+  }
+
+  fn metrics_json -> String {
+    let buf = StringBuffer.new
+    buf.push('{"version":')
+    buf.push(JsonUtil.string(VERSION))
+    buf.push(',"sessions":')
+    buf.push(@db.count('sessions').to_string)
+    buf.push(',"traces":')
+    buf.push(@db.count('traces').to_string)
+    buf.push(',"skills":')
+    buf.push(@db.count('skills').to_string)
+    buf.push(',"checkpoints":')
+    buf.push(@db.count('checkpoints').to_string)
+    buf.push(',"reflections":')
+    buf.push(@db.count('reflections').to_string)
+    buf.push(',"validations":')
+    buf.push(@db.count('validations').to_string)
+    buf.push(',"patches":')
+    buf.push(@db.count('patches').to_string)
+    buf.push(',"policy_prior":')
+    buf.push(@prior.snapshot)
+    buf.push(',"model":')
+    buf.push(JsonUtil.string(MODEL_NAME))
+    buf.push('}')
+    buf.to_string
+  }
+
+  fn playbook_json -> String {
+    '{"playbook":' + JsonUtil.string(@wiki.read_playbook) + '}'
+  }
+}
+
+class HttpRequest {
+  let @method: String
+  let @path: String
+  let @query: Map[String, String]
+  let @headers: Map[String, String]
+  let @body: String
+
+  fn static parse(raw: String) -> Option[HttpRequest] {
+    let split = match raw.split_once('\r\n\r\n') {
+      case Some(p) -> p
+      case None -> {
+        match raw.split_once('\n\n') {
+          case Some(p) -> p
+          case None -> (raw, '')
+        }
+      }
+    }
+    let head = split.0
+    let body = split.1
+    let lines = head.split('\r\n').to_array
+    if lines.size == 0 { return Option.None }
+    let first = lines.get(0)
+    let parts = first.split(' ').to_array
+    if parts.size < 2 { return Option.None }
+    let method = parts.get(0)
+    let target = parts.get(1)
+    let headers = Map.new
+    let mut i = 1
+    while i < lines.size {
+      let line = lines.get(i)
+      match line.split_once(':') {
+        case Some(hp) -> headers.set(hp.0.trim.to_lower, hp.1.trim)
+        case None -> {}
+      }
+      i = i + 1
+    }
+    let query = Map.new
+    let path = match target.split_once('?') {
+      case Some(tp) -> {
+        let qs = tp.1
+        let pairs = qs.split('&').to_array
+        let mut j = 0
+        while j < pairs.size {
+          match pairs.get(j).split_once('=') {
+            case Some(kv) -> query.set(HttpRequest.url_decode(kv.0), HttpRequest.url_decode(kv.1))
+            case None -> {
+              let k = pairs.get(j)
+              if k.size > 0 { query.set(HttpRequest.url_decode(k), '') }
+            }
+          }
+          j = j + 1
+        }
+        tp.0
+      }
+      case None -> target
+    }
+    Option.Some(HttpRequest(method: method, path: path, query: query, headers: headers, body: body))
+  }
+
+  fn static url_decode(s: String) -> String {
+    let buf = StringBuffer.new
+    let bytes = s.to_byte_array
+    let mut i = 0
+    while i < bytes.size {
+      let c = bytes.get(i)
+      if c == 43 {
+        buf.push(' ')
+        i = i + 1
+      } else if c == 37 and i + 2 < bytes.size {
+        let hex = String.from_byte(bytes.get(i + 1)) + String.from_byte(bytes.get(i + 2))
+        match Int.parse(hex, 16) {
+          case Some(v) -> buf.push(String.from_byte(v))
+          case None -> buf.push('%')
+        }
+        i = i + 3
+      } else {
+        buf.push(String.from_byte(c))
+        i = i + 1
+      }
+    }
+    buf.to_string
+  }
+
+  fn tenant -> String {
+    match @headers.opt('x-tenant-id') {
+      case Some(t) -> if t.size > 0 { t } else { 'default' }
+      case None -> 'default'
+    }
+  }
+
+  fn content_length -> Int {
+    Int.parse(@headers.opt('content-length').or('0'), 10).or(0)
+  }
+}
+
+class HttpResponse {
+  fn static json(status: Int, body: String) -> String {
+    let buf = StringBuffer.new
+    buf.push('HTTP/1.1 ' + status.to_string + ' ' + HttpResponse.reason(status) + '\r\n')
+    buf.push('Content-Type: application/json; charset=utf-8\r\n')
+    buf.push('Access-Control-Allow-Origin: *\r\n')
+    buf.push('Access-Control-Allow-Headers: Content-Type, X-Tenant-Id, Authorization\r\n')
+    buf.push('Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n')
+    buf.push('Cache-Control: no-store\r\n')
+    buf.push('X-Runtime: ' + VERSION + '\r\n')
+    buf.push('Content-Length: ' + body.to_byte_array.size.to_string + '\r\n')
+    buf.push('Connection: close\r\n\r\n')
+    buf.push(body)
+    buf.to_string
+  }
+
+  fn static html(status: Int, body: String) -> String {
+    let buf = StringBuffer.new
+    buf.push('HTTP/1.1 ' + status.to_string + ' ' + HttpResponse.reason(status) + '\r\n')
+    buf.push('Content-Type: text/html; charset=utf-8\r\n')
+    buf.push('Access-Control-Allow-Origin: *\r\n')
+    buf.push('Cache-Control: no-store\r\n')
+    buf.push('Content-Length: ' + body.to_byte_array.size.to_string + '\r\n')
+    buf.push('Connection: close\r\n\r\n')
+    buf.push(body)
+    buf.to_string
+  }
+
+  fn static text(status: Int, body: String) -> String {
+    let buf = StringBuffer.new
+    buf.push('HTTP/1.1 ' + status.to_string + ' ' + HttpResponse.reason(status) + '\r\n')
+    buf.push('Content-Type: text/plain; charset=utf-8\r\n')
+    buf.push('Access-Control-Allow-Origin: *\r\n')
+    buf.push('Content-Length: ' + body.to_byte_array.size.to_string + '\r\n')
+    buf.push('Connection: close\r\n\r\n')
+    buf.push(body)
+    buf.to_string
+  }
+
+  fn static no_content -> String {
+    let buf = StringBuffer.new
+    buf.push('HTTP/1.1 204 No Content\r\n')
+    buf.push('Access-Control-Allow-Origin: *\r\n')
+    buf.push('Access-Control-Allow-Headers: Content-Type, X-Tenant-Id, Authorization\r\n')
+    buf.push('Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n')
+    buf.push('Content-Length: 0\r\n')
+    buf.push('Connection: close\r\n\r\n')
+    buf.to_string
+  }
+
+  fn static reason(status: Int) -> String {
+    if status == 200 { 'OK' }
+    else if status == 201 { 'Created' }
+    else if status == 204 { 'No Content' }
+    else if status == 400 { 'Bad Request' }
+    else if status == 401 { 'Unauthorized' }
+    else if status == 403 { 'Forbidden' }
+    else if status == 404 { 'Not Found' }
+    else if status == 409 { 'Conflict' }
+    else if status == 413 { 'Payload Too Large' }
+    else if status == 429 { 'Too Many Requests' }
+    else if status == 500 { 'Internal Server Error' }
+    else { 'Unknown' }
+  }
+}
+
+class Router {
+  let @runtime: AgentRuntime
+  let @logger: Logger
+  let @index_html: String
+
+  fn static new(runtime: AgentRuntime, logger: Logger) -> Router {
+    let html = match Fs.read('index.html') {
+      case Ok(c) -> c
+      case Error(_) -> ''
+    }
+    Router(runtime: runtime, logger: logger, index_html: html)
+  }
+
+  fn mut handle(req: ref HttpRequest) -> String {
+    if req.method == 'OPTIONS' { return HttpResponse.no_content }
+    if req.path == '/' or req.path == '/index.html' {
+      if @index_html.size > 0 {
+        return HttpResponse.html(200, @index_html)
+      }
+      return HttpResponse.text(200, VERSION + ' operational. Frontend index.html not found on disk.')
+    }
+    if req.path == '/health' {
+      return HttpResponse.json(200, '{"status":"ok","version":' + JsonUtil.string(VERSION) + '}')
+    }
+    if req.path == '/api/metrics' {
+      return HttpResponse.json(200, @runtime.metrics_json)
+    }
+    if req.path == '/api/skills' {
+      return HttpResponse.json(200, @runtime.skills_json)
+    }
+    if req.path == '/api/playbook' {
+      return HttpResponse.json(200, @runtime.playbook_json)
+    }
+    if req.path == '/api/sessions' and req.method == 'GET' {
+      return HttpResponse.json(200, @runtime.sessions_json)
+    }
+    if req.path == '/api/sessions' and req.method == 'POST' {
+      return create_and_run(req)
+    }
+    if req.path == '/api/chat' and req.method == 'POST' {
+      return create_and_run(req)
+    }
+    if req.path == '/api/session' and req.method == 'GET' {
+      let id = req.query.opt('id').or('')
+      if id.size == 0 { return HttpResponse.json(400, '{"error":"id query parameter required"}') }
+      return HttpResponse.json(200, @runtime.session_json(id))
+    }
+    if req.path == '/api/messages' and req.method == 'GET' {
+      let id = req.query.opt('id').or('')
+      if id.size == 0 { return HttpResponse.json(400, '{"error":"id query parameter required"}') }
+      return HttpResponse.json(200, @runtime.messages_json(id))
+    }
+    if req.path == '/api/traces' and req.method == 'GET' {
+      let id = req.query.opt('id').or('')
+      if id.size == 0 { return HttpResponse.json(400, '{"error":"id query parameter required"}') }
+      return HttpResponse.json(200, @runtime.traces_json(id))
+    }
+    if req.path == '/api/state' and req.method == 'GET' {
+      let id = req.query.opt('id').or('')
+      if id.size == 0 { return HttpResponse.json(400, '{"error":"id query parameter required"}') }
+      return HttpResponse.json(200, @runtime.state_json(id))
+    }
+    if req.path == '/api/events' and req.method == 'GET' {
+      let id = req.query.opt('id').or('')
+      let seq = Int.parse(req.query.opt('seq').or('0'), 10).or(0)
+      if id.size == 0 { return HttpResponse.json(400, '{"error":"id query parameter required"}') }
+      let rows = @runtime.events.since(id, seq)
+      let buf = StringBuffer.new
+      buf.push('[')
+      let mut i = 0
+      while i < rows.size {
+        if i > 0 { buf.push(',') }
+        let r = rows.get(i)
+        buf.push('{"seq":')
+        buf.push(r.opt('seq').or('0'))
+        buf.push(',"kind":')
+        buf.push(JsonUtil.string(r.opt('kind').or('')))
+        buf.push(',"payload":')
+        buf.push(JsonUtil.string(r.opt('payload').or('')))
+        buf.push(',"at":')
+        buf.push(JsonUtil.string(r.opt('at').or('')))
+        buf.push('}')
+        i = i + 1
+      }
+      buf.push(']')
+      return HttpResponse.json(200, buf.to_string)
+    }
+    if req.path == '/api/resume' and req.method == 'POST' {
+      @runtime.resume_all
+      return HttpResponse.json(200, '{"status":"resume_cycle_complete"}')
+    }
+    HttpResponse.json(404, '{"error":"route not found","path":' + JsonUtil.string(req.path) + '}')
+  }
+
+  fn mut create_and_run(req: ref HttpRequest) -> String {
+    let tenant = req.tenant
+    match JsonUtil.parse(if req.body.size > 0 { req.body } else { '{}' }) {
+      case Ok(j) -> {
+        let mut task = JsonUtil.get_string(j, 'task').or('')
+        if task.size == 0 { task = JsonUtil.get_string(j, 'message').or('') }
+        if task.size == 0 { task = JsonUtil.get_string(j, 'prompt').or('') }
+        if task.size == 0 {
+          match JsonUtil.get_array(j, 'messages') {
+            case Some(arr) -> {
+              let mut i = arr.size - 1
+              while i >= 0 and task.size == 0 {
+                let m = arr.get(i)
+                if JsonUtil.get_string(m, 'role').or('') == 'user' {
+                  task = JsonUtil.get_string(m, 'content').or('')
+                }
+                i = i - 1
+              }
+            }
+            case None -> {}
+          }
+        }
+        if task.size == 0 {
+          return HttpResponse.json(400, '{"error":"a task, message, prompt, or messages array is required"}')
+        }
+        let criteria = StatePatch.str_array(j, 'success_criteria')
+        let constraints = StatePatch.str_array(j, 'constraints')
+        let steps = JsonUtil.get_int(j, 'max_steps').or(MAX_STEPS_DEFAULT)
+        let sid = @runtime.create_session(tenant, task, criteria, constraints, steps)
+        @logger.info('session created ' + sid + ' tenant=' + tenant)
+        let rec = @runtime.run_session(sid)
+        HttpResponse.json(200, rec.to_json)
+      }
+      case Error(e) -> HttpResponse.json(400, '{"error":' + JsonUtil.string(e) + '}')
+    }
+  }
+}
+
+class Server {
+  let @router: Router
+  let @logger: Logger
+  let @host: String
+  let @port: Int
+
+  fn static new(router: Router, logger: Logger, host: String, port: Int) -> Server {
+    Server(router: router, logger: logger, host: host, port: port)
+  }
+
+  fn mut listen {
+    match IpAddress.parse(@host) {
+      case Some(ip) -> {
+        match TcpServer.new(ip: ip, port: @port) {
+          case Ok(mut server) -> {
+            @logger.info('listening on ' + @host + ':' + @port.to_string)
+            let mut running = true
+            while running {
+              match server.accept {
+                case Ok(mut client) -> serve(mut client)
+                case Error(e) -> @logger.warn('accept failed: ' + e.to_string)
+              }
+            }
+          }
+          case Error(e) -> {
+            @logger.error('bind failed: ' + e.to_string)
+            exit(1)
+          }
+        }
+      }
+      case None -> {
+        @logger.error('invalid bind host: ' + @host)
+        exit(1)
+      }
+    }
+  }
+
+  fn mut serve(client: mut TcpClient) {
+    let buf = ByteArray.new
+    let mut header_done = false
+    let mut expected = 0
+    let mut guard = 0
+    while header_done.false? and guard < 256 {
+      guard = guard + 1
+      let chunk = ByteArray.new
+      match client.read(into: mut chunk, size: 16384) {
+        case Ok(n) -> {
+          if n == 0 { header_done = true } else { buf.append(chunk) }
+        }
+        case Error(_) -> header_done = true
+      }
+      let peek = buf.to_string
+      if peek.contains?('\r\n\r\n') {
+        header_done = true
+        match HttpRequest.parse(peek) {
+          case Some(r) -> expected = r.content_length
+          case None -> expected = 0
+        }
+      }
+    }
+    let mut text = buf.to_string
+    let mut body_len = match text.split_once('\r\n\r\n') {
+      case Some(p) -> p.1.to_byte_array.size
+      case None -> 0
+    }
+    let mut spin = 0
+    while body_len < expected and spin < 512 {
+      spin = spin + 1
+      let chunk = ByteArray.new
+      match client.read(into: mut chunk, size: 16384) {
+        case Ok(n) -> {
+          if n == 0 {
+            spin = 512
+          } else {
+            buf.append(chunk)
+            text = buf.to_string
+            body_len = match text.split_once('\r\n\r\n') {
+              case Some(p) -> p.1.to_byte_array.size
+              case None -> 0
+            }
+          }
+        }
+        case Error(_) -> spin = 512
+      }
+    }
+    let response = match HttpRequest.parse(text) {
+      case Some(req) -> {
+        @logger.info(req.method + ' ' + req.path)
+        @router.handle(req)
+      }
+      case None -> HttpResponse.json(400, '{"error":"malformed HTTP request"}')
+    }
+    let _ = client.write_string(response)
+    let _ = client.flush
+  }
+}
+
+class Cli {
+  fn static usage -> String {
+    let buf = StringBuffer.new
+    buf.push(VERSION + '\n')
+    buf.push('usage:\n')
+    buf.push('  main serve [host] [port]        start the HTTP runtime and frontend host\n')
+    buf.push('  main run "task"                 execute one autonomous session to completion\n')
+    buf.push('  main resume                     resume every interrupted durable checkpoint\n')
+    buf.push('  main skills                     print the active skill library\n')
+    buf.push('  main metrics                    print runtime metrics\n')
+    buf.push('  main playbook                   print the persistent knowledge playbook\n')
+    buf.to_string
+  }
+}
+
+class async Main {
+  fn async main {
+    let logger = Logger.with_file(LogLevel.Info, 'runtime.log')
+    logger.info(VERSION + ' booting')
+    Fs.ensure_dir(WORKSPACE_PATH)
+    Fs.ensure_dir(TRACE_PATH)
+    Fs.ensure_dir(WIKI_PATH)
+    Fs.ensure_dir(SKILL_PATH)
+    let args = env.arguments
+    let runtime = AgentRuntime.new(logger)
+    let command = if args.size > 0 { args.get(0) } else { 'serve' }
+    if command == 'serve' {
+      let host = if args.size > 1 { args.get(1) } else { DEFAULT_HOST }
+      let port = if args.size > 2 { Int.parse(args.get(2), 10).or(DEFAULT_PORT) } else { DEFAULT_PORT }
+      runtime.resume_all
+      let router = Router.new(runtime, logger)
+      let server = Server.new(router, logger, host, port)
+      server.listen
+    } else if command == 'run' {
+      if args.size < 2 {
+        let mut out = std.stdio.Stdout.new
+        let _ = out.write_string(Cli.usage)
+        return
+      }
+      let task = args.get(1)
+      let criteria = Array.new
+      let constraints = Array.new
+      let sid = runtime.create_session('cli', task, criteria, constraints, MAX_STEPS_DEFAULT)
+      let rec = runtime.run_session(sid)
+      let mut out = std.stdio.Stdout.new
+      let _ = out.write_string(rec.to_json + '\n')
+    } else if command == 'resume' {
+      runtime.resume_all
+      let mut out = std.stdio.Stdout.new
+      let _ = out.write_string('{"status":"resume_complete"}\n')
+    } else if command == 'skills' {
+      let mut out = std.stdio.Stdout.new
+      let _ = out.write_string(runtime.skills_json + '\n')
+    } else if command == 'metrics' {
+      let mut out = std.stdio.Stdout.new
+      let _ = out.write_string(runtime.metrics_json + '\n')
+    } else if command == 'playbook' {
+      let mut out = std.stdio.Stdout.new
+      let _ = out.write_string(runtime.wiki.read_playbook + '\n')
+    } else {
+      let mut out = std.stdio.Stdout.new
+      let _ = out.write_string(Cli.usage)
+    }
+  }
+}

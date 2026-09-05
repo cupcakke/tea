@@ -303,6 +303,7 @@ CREATE TABLE IF NOT EXISTS skills (
   domain TEXT NOT NULL,
   trigger_spec TEXT NOT NULL,
   procedure_spec TEXT NOT NULL,
+  skill_code TEXT NOT NULL DEFAULT '',
   preconditions_json TEXT NOT NULL DEFAULT '[]',
   postconditions_json TEXT NOT NULL DEFAULT '[]',
   failure_modes_json TEXT NOT NULL DEFAULT '[]',
@@ -316,26 +317,33 @@ CREATE TABLE IF NOT EXISTS skills (
   updated_at REAL NOT NULL,
   UNIQUE(tenant_id, name)
 );""")
+  try:
+    s.execRaw("ALTER TABLE skills ADD COLUMN skill_code TEXT NOT NULL DEFAULT '';")
+  except CatchableError:
+    discard
   s.execRaw("CREATE INDEX IF NOT EXISTS idx_skills_active ON skills(tenant_id, active, reward DESC);")
   try:
     s.execRaw("CREATE VIRTUAL TABLE IF NOT EXISTS skill_fts USING fts5(skill_id UNINDEXED, tenant_id UNINDEXED, name, domain, trigger_spec, procedure_spec, tokenize='porter ascii');")
+    s.execRaw("DROP TRIGGER IF EXISTS skills_ai;")
+    s.execRaw("DROP TRIGGER IF EXISTS skills_ad;")
+    s.execRaw("DROP TRIGGER IF EXISTS skills_au;")
     s.execRaw("""
-CREATE TRIGGER IF NOT EXISTS skills_ai AFTER INSERT ON skills BEGIN
+CREATE TRIGGER skills_ai AFTER INSERT ON skills BEGIN
   INSERT INTO skill_fts(skill_id, tenant_id, name, domain, trigger_spec, procedure_spec)
-  VALUES (new.skill_id, new.tenant_id, new.name, new.domain, new.trigger_spec, new.procedure_spec);
+  VALUES (new.skill_id, new.tenant_id, new.name, new.domain, new.trigger_spec, new.procedure_spec || ' ' || new.skill_code);
 END;""")
     s.execRaw("""
-CREATE TRIGGER IF NOT EXISTS skills_ad AFTER DELETE ON skills BEGIN
+CREATE TRIGGER skills_ad AFTER DELETE ON skills BEGIN
   DELETE FROM skill_fts WHERE skill_id = old.skill_id;
 END;""")
     s.execRaw("""
-CREATE TRIGGER IF NOT EXISTS skills_au AFTER UPDATE ON skills BEGIN
+CREATE TRIGGER skills_au AFTER UPDATE ON skills BEGIN
   DELETE FROM skill_fts WHERE skill_id = old.skill_id;
   INSERT INTO skill_fts(skill_id, tenant_id, name, domain, trigger_spec, procedure_spec)
-  VALUES (new.skill_id, new.tenant_id, new.name, new.domain, new.trigger_spec, new.procedure_spec);
+  VALUES (new.skill_id, new.tenant_id, new.name, new.domain, new.trigger_spec, new.procedure_spec || ' ' || new.skill_code);
 END;""")
     s.execRaw("DELETE FROM skill_fts;")
-    s.execRaw("INSERT INTO skill_fts(skill_id, tenant_id, name, domain, trigger_spec, procedure_spec) SELECT skill_id, tenant_id, name, domain, trigger_spec, procedure_spec FROM skills;")
+    s.execRaw("INSERT INTO skill_fts(skill_id, tenant_id, name, domain, trigger_spec, procedure_spec) SELECT skill_id, tenant_id, name, domain, trigger_spec, procedure_spec || ' ' || skill_code FROM skills;")
     fts5Available = true
   except CatchableError:
     fts5Available = false
@@ -394,6 +402,20 @@ CREATE TABLE IF NOT EXISTS diagnostics (
   expectation_json TEXT NOT NULL,
   created_at REAL NOT NULL
 );""")
+  s.execRaw("""
+CREATE TABLE IF NOT EXISTS meta_agent_events (
+  event_id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  signature TEXT NOT NULL,
+  occurrences INTEGER NOT NULL,
+  candidate_json TEXT NOT NULL,
+  validation_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL,
+  UNIQUE(tenant_id, signature)
+);""")
+  s.execRaw("CREATE INDEX IF NOT EXISTS idx_meta_events_tenant ON meta_agent_events(tenant_id, status, updated_at DESC);")
 
 var
   store: Store
@@ -537,7 +559,6 @@ proc searchSkills(tenantId, queryText: string, limit: int): seq[Row] =
     dense.add((id, cosineSimilarity(qEmb, e)))
   dense.sort(proc(a, b: (string, float)): int = cmp(b[1], a[1]))
   if dense.len > limit * 4: dense.setLen(limit * 4)
-
   var sparse: seq[(string, float)] = @[]
   if fts5Available:
     let terms = contentTerms(queryText)
@@ -553,17 +574,15 @@ proc searchSkills(tenantId, queryText: string, limit: int): seq[Row] =
     for r in rows:
       let id = getStr(r, "skill_id")
       let docTerms = contentTerms(getStr(r, "name") & " " & getStr(r, "domain") & " " &
-                                  getStr(r, "trigger_spec") & " " & getStr(r, "procedure_spec")).toHashSet()
+                                  getStr(r, "trigger_spec") & " " & getStr(r, "procedure_spec") & " " & getStr(r, "skill_code")).toHashSet()
       let isect = intersection(qTerms, docTerms).len.float
       if isect > 0.0: sparse.add((id, isect))
     sparse.sort(proc(a, b: (string, float)): int = cmp(b[1], a[1]))
     if sparse.len > limit * 4: sparse.setLen(limit * 4)
-
   var policy = initTable[string, float]()
-  let policyRows = store.query("SELECT token, weight FROM policy_weights WHERE tenant_id=? AND ABS(weight) > 0.000001", @[%tenantId])
+  let policyRows = store.query("SELECT token, weight FROM policy_weights WHERE tenant_id=? AND ABS(weight)>0.000001", @[%tenantId])
   for pr in policyRows:
     policy[getStr(pr, "token").toLowerAscii()] = getFloat(pr, "weight", 0.0)
-
   let fused = rrfFuse(dense, sparse, limit * 2)
   var scored: seq[(Row, float)] = @[]
   for item in fused:
@@ -573,17 +592,61 @@ proc searchSkills(tenantId, queryText: string, limit: int): seq[Row] =
     let fail = getInt(r, "failure_count", 0).float
     let prior = (succ + 1.0) / (succ + fail + 2.0)
     let reward = getFloat(r, "reward", 0.0)
-    let corpus = getStr(r, "name") & " " & getStr(r, "domain") & " " & getStr(r, "trigger_spec") & " " & getStr(r, "procedure_spec")
+    let corpus = getStr(r, "name") & " " & getStr(r, "domain") & " " & getStr(r, "trigger_spec") & " " & getStr(r, "procedure_spec") & " " & getStr(r, "skill_code")
+    let corpusTerms = contentTerms(corpus).toHashSet()
     var pw = 0.0
-    var seen = initHashSet[string]()
-    for term in contentTerms(corpus):
-      if term notin seen:
-        seen.incl(term)
-        pw += policy.getOrDefault(term, 0.0)
-    scored.add((r, item[1] * 100.0 + prior * 2.0 + reward * 0.5 + clamp(pw, -8.0, 8.0) * 0.3))
+    for key, weight in policy:
+      let parts = contentTerms(key)
+      if parts.len == 0: continue
+      var matched = true
+      for part in parts:
+        if part notin corpusTerms:
+          matched = false
+          break
+      if matched: pw += weight / sqrt(parts.len.float)
+    scored.add((r, item[1] * 100.0 + prior * 2.0 + reward * 0.5 + clamp(pw, -12.0, 12.0) * 0.35))
   scored.sort(proc(a, b: (Row, float)): int = cmp(b[1], a[1]))
   result = @[]
   for i in 0 ..< min(limit, scored.len): result.add(scored[i][0])
+
+proc learnedPolicySignals(tenantId, context: string, limit: int = 16): string =
+  let rows = store.query("SELECT token, weight, updates FROM policy_weights WHERE tenant_id=? AND ABS(weight)>=0.02 ORDER BY ABS(weight) DESC, updates DESC LIMIT 256", @[%tenantId])
+  if rows.len == 0:
+    return "=== LEARNED POLICY SIGNALS ===\nNo learned policy signals are available yet.\n=== END LEARNED POLICY SIGNALS ==="
+  let ctxTerms = contentTerms(context).toHashSet()
+  var ranked: seq[(string, float, float, int64)] = @[]
+  for r in rows:
+    let key = getStr(r, "token").strip()
+    let weight = getFloat(r, "weight", 0.0)
+    let updates = getInt(r, "updates", 0)
+    if key.len == 0: continue
+    let parts = contentTerms(key)
+    var overlap = 0
+    for part in parts:
+      if part in ctxTerms: inc overlap
+    let relevance = if parts.len == 0: 0.0 else: overlap.float / parts.len.float
+    let score = abs(weight) * (1.0 + relevance * 2.0) * (1.0 + min(20.0, updates.float) / 40.0)
+    ranked.add((key, score, weight, updates))
+  ranked.sort(proc(a, b: (string, float, float, int64)): int = cmp(b[1], a[1]))
+  var lines: seq[string] = @["=== LEARNED POLICY SIGNALS ==="]
+  for i in 0 ..< min(limit, ranked.len):
+    let entry = ranked[i]
+    let directive = if entry[2] >= 0.0: "FAVOR" else: "AVOID"
+    lines.add(directive & ": " & entry[0] & " | weight=" & formatFloat(entry[2], ffDecimal, 4) & " | evidence=" & $entry[3])
+  lines.add("Treat positive signals as learned behavioral priors and negative signals as failure-avoidance priors. Apply them only when compatible with the task specification, tool authorization, deterministic validation, and external verifiers.")
+  lines.add("=== END LEARNED POLICY SIGNALS ===")
+  result = lines.join("\n")
+
+proc policyNgrams(text: string, maxN: int = 3): seq[string] =
+  let terms = contentTerms(text)
+  var seen = initHashSet[string]()
+  for n in 1 .. max(1, maxN):
+    if terms.len < n: break
+    for i in 0 .. terms.len - n:
+      let key = terms[i ..< i + n].join(" ")
+      if key.len >= 2 and key notin seen:
+        seen.incl(key)
+        result.add(key)
 
 proc searchKnowledge(tenantId, queryText: string, limit: int): seq[Row] =
   let rows = store.query("SELECT * FROM knowledge_docs WHERE tenant_id=?", @[%tenantId])
@@ -1297,7 +1360,8 @@ proc initTools() =
       for s in skills:
         sArr.add(%*{"skill_id": getStr(s, "skill_id"), "name": getStr(s, "name"),
                     "domain": getStr(s, "domain"), "trigger": getStr(s, "trigger_spec"),
-                    "procedure": getStr(s, "procedure_spec"), "reward": getFloat(s, "reward", 0.0)})
+                    "procedure": getStr(s, "procedure_spec"), "skill_code": getStr(s, "skill_code"),
+                    "reward": getFloat(s, "reward", 0.0)})
       let docs = searchKnowledge(tenant, q, limit)
       var dArr = newJArray()
       for d in docs:
@@ -1522,20 +1586,19 @@ proc defaultSigma(goal: string): JsonNode =
   }
 
 type
+  TopLogprobItem = object
+    token: string
+    logprob: float
+
   LogprobItem = object
     token: string
     logprob: float
     textOffset: int
+    topLogprobs: seq[TopLogprobItem]
 
   LlmResponse = object
     content: string
-    promptTokens: int
-    completionTokens: int
-    totalTokens: int
-    logprobs: seq[LogprobItem]
-
-  CompletionResponse = object
-    text: string
+    reasoningContent: string
     promptTokens: int
     completionTokens: int
     totalTokens: int
@@ -1551,7 +1614,10 @@ proc enforcePromptBound(messages: JsonNode) =
 proc callChatCompletionsAsync(messages: JsonNode, maxTokens: int = MaxTokens,
                               temperature: float = Temperature,
                               jsonMode: bool = false,
-                              logprobs: bool = false): Future[LlmResponse] {.async.} =
+                              logprobs: bool = false,
+                              topLogprobs: int = 20,
+                              echoPrompt: bool = false,
+                              topP: float = TopP): Future[LlmResponse] {.async.} =
   let key = apiKey()
   if key.len == 0: raise newException(IOError, "MODULAR_API_KEY not configured")
   enforcePromptBound(messages)
@@ -1560,7 +1626,7 @@ proc callChatCompletionsAsync(messages: JsonNode, maxTokens: int = MaxTokens,
     "messages": messages,
     "stream": false,
     "temperature": temperature,
-    "top_p": TopP,
+    "top_p": clamp(topP, 0.0, 1.0),
     "max_tokens": max(1, min(maxTokens, MaxTokens)),
     "frequency_penalty": FrequencyPenalty,
     "presence_penalty": PresencePenalty,
@@ -1569,7 +1635,8 @@ proc callChatCompletionsAsync(messages: JsonNode, maxTokens: int = MaxTokens,
   if jsonMode: body["response_format"] = %*{"type": "json_object"}
   if logprobs:
     body["logprobs"] = %true
-    body["top_logprobs"] = %20
+    body["top_logprobs"] = %max(1, min(topLogprobs, 20))
+  if echoPrompt: body["echo"] = %true
   var client = newAsyncHttpClient(maxRedirects = 0)
   defer: client.close()
   client.headers = newHttpHeaders({
@@ -1579,8 +1646,7 @@ proc callChatCompletionsAsync(messages: JsonNode, maxTokens: int = MaxTokens,
   })
   let requestFuture = client.request(ModularBaseUrl & "/chat/completions", httpMethod = HttpPost, body = $body)
   let resp = await awaitBounded(requestFuture, HttpTimeoutMs, "model request")
-  let bodyFuture = resp.body()
-  let raw = await awaitBounded(bodyFuture, HttpTimeoutMs, "model response body")
+  let raw = await awaitBounded(resp.body(), HttpTimeoutMs, "model response body")
   if resp.code.int < 200 or resp.code.int >= 300:
     raise newException(IOError, "upstream model status " & $resp.code.int & ": " & (if raw.len > 4096: raw[0 ..< 4096] else: raw))
   let parsed = parseJson(raw)
@@ -1588,77 +1654,38 @@ proc callChatCompletionsAsync(messages: JsonNode, maxTokens: int = MaxTokens,
   if parsed.hasKey("choices") and parsed["choices"].kind == JArray and parsed["choices"].elems.len > 0:
     let ch = parsed["choices"][0]
     if ch.hasKey("message") and ch["message"].kind == JObject:
-      outResp.content = ch["message"]{"content"}.getStr("")
+      let msg = ch["message"]
+      if msg.hasKey("content") and msg["content"].kind == JString:
+        outResp.content = msg["content"].getStr("")
+      elif msg.hasKey("content") and msg["content"].kind == JArray:
+        var chunks: seq[string] = @[]
+        for part in msg["content"].elems:
+          if part.kind == JObject:
+            let txt = part{"text"}.getStr("")
+            if txt.len > 0: chunks.add(txt)
+        outResp.content = chunks.join("")
+      if msg.hasKey("reasoning_content") and msg["reasoning_content"].kind == JString:
+        outResp.reasoningContent = msg["reasoning_content"].getStr("")
+      elif msg.hasKey("reasoning") and msg["reasoning"].kind == JString:
+        outResp.reasoningContent = msg["reasoning"].getStr("")
     if ch.hasKey("logprobs") and ch["logprobs"].kind == JObject and ch["logprobs"].hasKey("content"):
-      let lContent = ch["logprobs"]["content"]
-      if lContent.kind == JArray:
-        for it in lContent.elems:
-          outResp.logprobs.add(LogprobItem(token: it{"token"}.getStr(""), logprob: it{"logprob"}.getFloat(-99.0), textOffset: -1))
+      let lp = ch["logprobs"]["content"]
+      if lp.kind == JArray:
+        for it in lp.elems:
+          var tops: seq[TopLogprobItem] = @[]
+          if it.kind == JObject and it.hasKey("top_logprobs") and it["top_logprobs"].kind == JArray:
+            for cand in it["top_logprobs"].elems:
+              if cand.kind == JObject:
+                tops.add(TopLogprobItem(token: cand{"token"}.getStr(""), logprob: cand{"logprob"}.getFloat(-99.0)))
+          outResp.logprobs.add(LogprobItem(token: it{"token"}.getStr(""), logprob: it{"logprob"}.getFloat(-99.0), textOffset: -1, topLogprobs: tops))
   if parsed.hasKey("usage") and parsed["usage"].kind == JObject:
     let u = parsed["usage"]
-    outResp.promptTokens = u{"prompt_tokens"}.getInt(0)
-    outResp.completionTokens = u{"completion_tokens"}.getInt(0)
+    outResp.promptTokens = u{"prompt_tokens"}.getInt(u{"input_tokens"}.getInt(0))
+    outResp.completionTokens = u{"completion_tokens"}.getInt(u{"output_tokens"}.getInt(0))
     outResp.totalTokens = u{"total_tokens"}.getInt(0)
   if outResp.totalTokens == 0:
     outResp.promptTokens = max(1, canonical(messages).len div 4)
     outResp.completionTokens = max(1, outResp.content.len div 4)
-    outResp.totalTokens = outResp.promptTokens + outResp.completionTokens
-  return outResp
-
-proc callTextCompletionsAsync(prompt: string, maxTokens: int, temperature: float,
-                              echo: bool, logprobs: int): Future[CompletionResponse] {.async.} =
-  let key = apiKey()
-  if key.len == 0: raise newException(IOError, "MODULAR_API_KEY not configured")
-  if prompt.len > MaxPromptBytes:
-    raise newException(ValueError, "prompt exceeds byte bound: " & $prompt.len & " > " & $MaxPromptBytes)
-  var body = %*{
-    "model": ModularModel,
-    "prompt": prompt,
-    "max_tokens": max(1, min(maxTokens, MaxTokens)),
-    "temperature": temperature,
-    "top_p": TopP,
-    "frequency_penalty": FrequencyPenalty,
-    "presence_penalty": PresencePenalty,
-    "seed": Seed,
-    "echo": echo,
-    "logprobs": max(0, min(logprobs, 20))
-  }
-  var client = newAsyncHttpClient(maxRedirects = 0)
-  defer: client.close()
-  client.headers = newHttpHeaders({
-    "Authorization": "Bearer " & key,
-    "Content-Type": "application/json",
-    "Accept": "application/json"
-  })
-  let requestFuture = client.request(ModularBaseUrl & "/completions", httpMethod = HttpPost, body = $body)
-  let resp = await awaitBounded(requestFuture, HttpTimeoutMs, "completion request")
-  let bodyFuture = resp.body()
-  let raw = await awaitBounded(bodyFuture, HttpTimeoutMs, "completion response body")
-  if resp.code.int < 200 or resp.code.int >= 300:
-    raise newException(IOError, "upstream completion status " & $resp.code.int & ": " & (if raw.len > 4096: raw[0 ..< 4096] else: raw))
-  let parsed = parseJson(raw)
-  var outResp = CompletionResponse()
-  if parsed.hasKey("choices") and parsed["choices"].kind == JArray and parsed["choices"].elems.len > 0:
-    let ch = parsed["choices"][0]
-    outResp.text = ch{"text"}.getStr("")
-    if ch.hasKey("logprobs") and ch["logprobs"].kind == JObject:
-      let lp = ch["logprobs"]
-      let toks = if lp.hasKey("tokens"): lp["tokens"] else: newJArray()
-      let vals = if lp.hasKey("token_logprobs"): lp["token_logprobs"] else: newJArray()
-      let offs = if lp.hasKey("text_offset"): lp["text_offset"] else: newJArray()
-      if toks.kind == JArray:
-        for i in 0 ..< toks.elems.len:
-          let value = if vals.kind == JArray and i < vals.elems.len and vals[i].kind in {JInt, JFloat}: vals[i].getFloat() else: -99.0
-          let offset = if offs.kind == JArray and i < offs.elems.len and offs[i].kind == JInt: offs[i].getInt(-1) else: -1
-          outResp.logprobs.add(LogprobItem(token: toks[i].getStr(""), logprob: value, textOffset: offset))
-  if parsed.hasKey("usage") and parsed["usage"].kind == JObject:
-    let u = parsed["usage"]
-    outResp.promptTokens = u{"prompt_tokens"}.getInt(0)
-    outResp.completionTokens = u{"completion_tokens"}.getInt(0)
-    outResp.totalTokens = u{"total_tokens"}.getInt(0)
-  if outResp.totalTokens == 0:
-    outResp.promptTokens = max(1, prompt.len div 4)
-    outResp.completionTokens = max(1, outResp.text.len div 4)
     outResp.totalTokens = outResp.promptTokens + outResp.completionTokens
   return outResp
 
@@ -1717,6 +1744,112 @@ proc extractJsonObject(s: string): JsonNode =
     inc i
   return nil
 
+
+proc recursiveReasonCall(tenantId, goal, context: string, depth, maxDepth, branches: int): Future[JsonNode] {.async.} =
+  let d = max(0, depth)
+  let md = max(0, min(maxDepth, 3))
+  let fanout = max(1, min(branches, 3))
+  let policySignals = learnedPolicySignals(tenantId, goal & " " & context, 12)
+  let systemText = "You are an isolated recursive reasoning worker. You cannot mutate global task state and you cannot call external tools. " &
+                   "Return strict JSON with summary, confidence in [0,1], and subtasks as an array of concise independent reasoning objectives. " &
+                   "At the maximum depth, subtasks must be empty.\n\n" & policySignals
+  let userText = "DEPTH: " & $d & "/" & $md & "\nGOAL:\n" & boundUtf8Bytes(goal, 32768) &
+                 "\nCONTEXT:\n" & boundUtf8Bytes(context, 65536) & "\nMAX SUBTASKS: " & $fanout
+  let resp = await callChatCompletionsAsync(%*[{"role": "system", "content": systemText}, {"role": "user", "content": userText}], 2048, 0.2, true, false)
+  if not chargeTokens(tenantId, "", resp.totalTokens):
+    return %*{"ok": false, "error": "budget_exhausted", "depth": d}
+  let node = extractJsonObject(resp.content)
+  if node == nil:
+    return %*{"ok": false, "error": "invalid recursive reasoning JSON", "depth": d}
+  var resultNode = %*{"ok": true, "depth": d, "summary": node{"summary"}.getStr(""),
+                      "confidence": clamp(node{"confidence"}.getFloat(0.5), 0.0, 1.0), "children": newJArray()}
+  if d < md and node.hasKey("subtasks") and node["subtasks"].kind == JArray:
+    var count = 0
+    for sub in node["subtasks"].elems:
+      if count >= fanout: break
+      let childGoal = sub.getStr("").strip()
+      if childGoal.len == 0: continue
+      inc count
+      let child = await recursiveReasonCall(tenantId, childGoal, goal & "\n" & context, d + 1, md, fanout)
+      resultNode["children"].add(child)
+  if resultNode["children"].elems.len > 0:
+    let synthMessages = %*[
+      {"role": "system", "content": "Synthesize isolated recursive reasoning results into one concise conclusion. Return strict JSON with summary and confidence only.\n\n" & policySignals},
+      {"role": "user", "content": "ROOT GOAL:\n" & boundUtf8Bytes(goal, 32768) & "\nCHILD RESULTS:\n" & boundUtf8Bytes(canonical(resultNode["children"]), 98304)}
+    ]
+    let synth = await callChatCompletionsAsync(synthMessages, 1536, 0.1, true, false)
+    if chargeTokens(tenantId, "", synth.totalTokens):
+      let synthNode = extractJsonObject(synth.content)
+      if synthNode != nil:
+        resultNode["summary"] = %synthNode{"summary"}.getStr(resultNode{"summary"}.getStr(""))
+        resultNode["confidence"] = %clamp(synthNode{"confidence"}.getFloat(resultNode{"confidence"}.getFloat(0.5)), 0.0, 1.0)
+  return resultNode
+
+proc registerReasonTool() =
+  registerTool("reason", "Run isolated recursive LLM reasoning over a subproblem without mutating the autonomous task state.",
+    %*{"goal": "string", "context": "string optional", "max_depth": "int optional", "branches": "int optional"},
+    proc(tenant: string, args: JsonNode): Future[ToolResult] {.async.} =
+      let goal = args{"goal"}.getStr("").strip()
+      if goal.len == 0: return ToolResult(ok: false, payload: newJObject(), message: "goal required")
+      let context = args{"context"}.getStr("")
+      let maxDepth = max(0, min(args{"max_depth"}.getInt(2).int, 3))
+      let branches = max(1, min(args{"branches"}.getInt(2).int, 3))
+      try:
+        let payload = await recursiveReasonCall(tenant, goal, context, 0, maxDepth, branches)
+        let ok = payload{"ok"}.getBool(false)
+        return ToolResult(ok: ok, payload: payload, receipt: "reason:" & sha1Hex(goal & context),
+                          message: (if ok: payload{"summary"}.getStr("reasoned") else: payload{"error"}.getStr("reasoning failed")))
+      except CatchableError as e:
+        return ToolResult(ok: false, payload: %*{"error": e.msg}, receipt: "reason:error", message: e.msg))
+
+type
+  OrchestratorState = enum
+    osPerceive, osDeliberate, osAct, osValidate, osReflect, osConsolidate, osTerminal
+
+  OrchestratorGraph = object
+    edges: Table[OrchestratorState, HashSet[OrchestratorState]]
+
+  StateTransitionEngine = ref object
+    maxRetries: int
+
+proc orchestratorStateName(state: OrchestratorState): string =
+  case state
+  of osPerceive: "PERCEIVE"
+  of osDeliberate: "DELIBERATE"
+  of osAct: "ACT"
+  of osValidate: "VALIDATE"
+  of osReflect: "REFLECT"
+  of osConsolidate: "CONSOLIDATE"
+  of osTerminal: "TERMINAL"
+
+proc parseOrchestratorState(s: string): OrchestratorState =
+  case s.toUpperAscii()
+  of "DELIBERATE": osDeliberate
+  of "ACT": osAct
+  of "VALIDATE": osValidate
+  of "REFLECT": osReflect
+  of "CONSOLIDATE": osConsolidate
+  of "TERMINAL": osTerminal
+  else: osPerceive
+
+proc buildOrchestratorGraph(): OrchestratorGraph =
+  result.edges = initTable[OrchestratorState, HashSet[OrchestratorState]]()
+  for state in OrchestratorState: result.edges[state] = initHashSet[OrchestratorState]()
+  result.edges[osPerceive].incl(osDeliberate)
+  result.edges[osDeliberate].incl(osAct)
+  result.edges[osAct].incl(osValidate)
+  result.edges[osValidate].incl(osPerceive)
+  result.edges[osValidate].incl(osAct)
+  result.edges[osValidate].incl(osReflect)
+  result.edges[osValidate].incl(osConsolidate)
+  result.edges[osValidate].incl(osTerminal)
+  result.edges[osReflect].incl(osConsolidate)
+  result.edges[osConsolidate].incl(osPerceive)
+  result.edges[osConsolidate].incl(osTerminal)
+
+var orchestratorGraph = buildOrchestratorGraph()
+var transitionEngine = StateTransitionEngine(maxRetries: MaxRetryPerStep)
+
 type
   TaskHandle = ref object
     taskId: string
@@ -1740,12 +1873,33 @@ type
     verified: bool
     terminalReason: string
     broadcastAttached: bool
+    orchestratorState: OrchestratorState
+
+proc emit(h: TaskHandle, ev: JsonNode)
 
 var
   activeTasks = initTable[string, TaskHandle]()
   tasksLock: Lock
   skillGateLock: Lock
   skillGateBusy = false
+
+proc canOrchestratorTransition(fromState, toState: OrchestratorState): bool =
+  if fromState == toState: return true
+  if not orchestratorGraph.edges.hasKey(fromState): return false
+  toState in orchestratorGraph.edges[fromState]
+
+proc transitionOrchestrator(h: TaskHandle, nextState: OrchestratorState): bool =
+  acquire(h.lock)
+  let current = h.orchestratorState
+  if not canOrchestratorTransition(current, nextState):
+    release(h.lock)
+    return false
+  h.orchestratorState = nextState
+  if h.sigma != nil and h.sigma.kind == JObject:
+    h.sigma["phase"] = %orchestratorStateName(nextState).toLowerAscii()
+  release(h.lock)
+  h.emit(%*{"type": "orchestrator_state", "task_id": h.taskId, "from": orchestratorStateName(current), "to": orchestratorStateName(nextState)})
+  true
 
 proc emit(h: TaskHandle, ev: JsonNode) =
   acquire(h.lock)
@@ -1942,77 +2096,108 @@ proc updatePolicyWeight(tenantId, token: string, delta: float) =
     "weight=MIN(4.0, MAX(-4.0, policy_weights.weight + ?)), updates=policy_weights.updates+1, updated_at=?",
     @[%tenantId, %key, %boundedDelta, %nowF(), %boundedDelta, %nowF()])
 
+proc findAlignedTokenWindow(haystack, needle: seq[LogprobItem]): seq[LogprobItem] =
+  if needle.len == 0 or haystack.len < needle.len: return @[]
+  var start = haystack.len - needle.len
+  while start >= 0:
+    var ok = true
+    for i in 0 ..< needle.len:
+      if haystack[start + i].token != needle[i].token:
+        ok = false
+        break
+    if ok:
+      return haystack[start ..< start + needle.len]
+    dec start
+
+proc topProbMap(item: LogprobItem): Table[string, float] =
+  result = initTable[string, float]()
+  for candidate in item.topLogprobs:
+    let p = exp(clamp(candidate.logprob, -60.0, 0.0))
+    if p > result.getOrDefault(candidate.token, 0.0): result[candidate.token] = p
+  let chosen = exp(clamp(item.logprob, -60.0, 0.0))
+  if chosen > result.getOrDefault(item.token, 0.0): result[item.token] = chosen
+
+proc tokenReverseKl(studentItem, teacherItem: LogprobItem): float =
+  let sMap = topProbMap(studentItem)
+  let tMap = topProbMap(teacherItem)
+  var keys = initHashSet[string]()
+  for k, _ in sMap: keys.incl(k)
+  for k, _ in tMap: keys.incl(k)
+  var sSum = 0.0
+  var tSum = 0.0
+  for _, p in sMap: sSum += p
+  for _, p in tMap: tSum += p
+  let sTail = max(1e-12, 1.0 - min(1.0, sSum))
+  let tTail = max(1e-12, 1.0 - min(1.0, tSum))
+  var rkl = sTail * ln(sTail / tTail)
+  for k in keys:
+    let ps = max(1e-12, sMap.getOrDefault(k, 1e-12))
+    let pt = max(1e-12, tMap.getOrDefault(k, 1e-12))
+    rkl += ps * ln(ps / pt)
+  rkl
+
 proc runTokenLevelDistillation(h: TaskHandle, reflectionPatch: JsonNode) {.async.} =
   acquire(h.lock)
   let specSnapshot = copy(h.spec)
   let stateSnapshot = copy(h.sigma)
   release(h.lock)
-  let cleanContext = "SPEC:\n" & boundUtf8Bytes(canonical(specSnapshot), 49152) & "\nSTATE:\n" & boundUtf8Bytes(canonical(stateSnapshot), 131072)
-  let commonSuffix = "\nOUTPUT EXACTLY ONE JSON OBJECT WITH delta_sigma, action, AND terminal.\nTARGET_JSON:\n"
-  let teacherPrefix = "You are the privileged teacher policy. Use the reflection patch to produce the optimal corrected transition.\n" &
-                      cleanContext & "\nPRIVILEGED_REFLECTION:\n" & boundUtf8Bytes(canonical(reflectionPatch), 32768) & commonSuffix
-  let studentPrefix = "You are the student policy. Produce the optimal transition from the clean task context.\n" & cleanContext & commonSuffix
+  let policySignals = learnedPolicySignals(h.tenantId, canonical(specSnapshot) & " " & canonical(stateSnapshot), 12)
+  let cleanContext = "SPEC:\n" & boundUtf8Bytes(canonical(specSnapshot), 49152) & "\nSTATE:\n" & boundUtf8Bytes(canonical(stateSnapshot), 131072) & "\n" & policySignals
+  let teacherMessages = %*[
+    {"role": "system", "content": "You are the privileged teacher policy. Use the private reflection patch to produce the single optimal corrected transition. Return exactly one JSON object with delta_sigma, action containing tool and args, and terminal."},
+    {"role": "user", "content": cleanContext & "\nPRIVILEGED_REFLECTION:\n" & boundUtf8Bytes(canonical(reflectionPatch), 32768)}
+  ]
   try:
-    let teacher = await callTextCompletionsAsync(teacherPrefix, 2048, 0.2, false, 20)
+    let teacher = await callChatCompletionsAsync(teacherMessages, 2048, 0.2, true, true, 20, false)
     if not chargeTokens(h.tenantId, h.taskId, teacher.totalTokens):
       haltForBudget(h)
       return
-    let targetNode = extractJsonObject(teacher.text)
+    let targetNode = extractJsonObject(teacher.content)
     if targetNode == nil or teacher.logprobs.len == 0:
       h.emit(%*{"type": "distillation_skipped", "task_id": h.taskId, "reason": "teacher_target_invalid"})
       return
-    let targetText = teacher.text
-    if studentPrefix.len + targetText.len > MaxPromptBytes:
-      h.emit(%*{"type": "distillation_skipped", "task_id": h.taskId, "reason": "aligned_target_exceeds_prompt_bound"})
-      return
-    let scoredPrompt = studentPrefix & targetText
-    let student = await callTextCompletionsAsync(scoredPrompt, 1, 0.0, true, 20)
+    let targetText = teacher.content
+    let studentMessages = %*[
+      {"role": "system", "content": "You are the student policy. Score the supplied assistant target under the clean task context. The target is part of the prompt and must not be rewritten."},
+      {"role": "user", "content": cleanContext},
+      {"role": "assistant", "content": targetText}
+    ]
+    let student = await callChatCompletionsAsync(studentMessages, 1, 0.0, false, true, 20, true)
     if not chargeTokens(h.tenantId, h.taskId, student.totalTokens):
       haltForBudget(h)
       return
-    var studentTarget: seq[LogprobItem] = @[]
-    let targetStart = studentPrefix.len
-    let targetEnd = scoredPrompt.len
-    for item in student.logprobs:
-      if item.textOffset >= targetStart and item.textOffset < targetEnd:
-        studentTarget.add(item)
-    if studentTarget.len != teacher.logprobs.len:
-      h.emit(%*{"type": "distillation_skipped", "task_id": h.taskId, "reason": "token_alignment_length_mismatch",
-                "teacher_tokens": teacher.logprobs.len, "student_tokens": studentTarget.len})
+    let aligned = findAlignedTokenWindow(student.logprobs, teacher.logprobs)
+    if aligned.len != teacher.logprobs.len:
+      h.emit(%*{"type": "distillation_skipped", "task_id": h.taskId, "reason": "chat_echo_target_alignment_unavailable",
+                "teacher_tokens": teacher.logprobs.len, "echo_tokens": student.logprobs.len})
       return
-    for i in 0 ..< teacher.logprobs.len:
-      if teacher.logprobs[i].token != studentTarget[i].token:
-        h.emit(%*{"type": "distillation_skipped", "task_id": h.taskId, "reason": "token_alignment_identity_mismatch", "index": i})
-        return
-    var relevant = initHashSet[string]()
-    if targetNode.hasKey("action"):
-      for term in contentTerms(canonical(targetNode["action"])): relevant.incl(term)
-      let toolName = targetNode["action"]{"tool"}.getStr("").toLowerAscii()
-      if toolName.len > 0:
-        relevant.incl(toolName)
-        for part in toolName.split('_'):
-          if part.len >= 2: relevant.incl(part)
     var rkl = 0.0
     var meanAdv = 0.0
-    var matched = 0
+    var directUpdates = 0
     for i in 0 ..< teacher.logprobs.len:
-      let tLog = clamp(teacher.logprobs[i].logprob, -60.0, 0.0)
-      let sLog = clamp(studentTarget[i].logprob, -60.0, 0.0)
-      let tProb = exp(tLog)
-      let sProb = exp(sLog)
+      let tItem = teacher.logprobs[i]
+      let sItem = aligned[i]
+      if tItem.token != sItem.token:
+        h.emit(%*{"type": "distillation_skipped", "task_id": h.taskId, "reason": "chat_echo_token_identity_mismatch", "index": i})
+        return
+      rkl += tokenReverseKl(sItem, tItem)
+      let tProb = exp(clamp(tItem.logprob, -60.0, 0.0))
+      let sProb = exp(clamp(sItem.logprob, -60.0, 0.0))
       let adv = tProb - sProb
-      rkl += sProb * (sLog - tLog)
       meanAdv += adv
-      let tokenTerms = contentTerms(teacher.logprobs[i].token)
-      for term in tokenTerms:
-        if term in relevant:
-          updatePolicyWeight(h.tenantId, term, adv)
-          inc matched
-    if teacher.logprobs.len > 0: meanAdv /= teacher.logprobs.len.float
-    if matched == 0:
-      for term in relevant: updatePolicyWeight(h.tenantId, term, meanAdv)
+      for term in contentTerms(tItem.token):
+        updatePolicyWeight(h.tenantId, term, adv)
+        inc directUpdates
+    meanAdv /= teacher.logprobs.len.float
+    rkl /= teacher.logprobs.len.float
+    var ngramUpdates = 0
+    let actionText = if targetNode.hasKey("action"): canonical(targetNode["action"]) else: canonical(targetNode)
+    for key in policyNgrams(actionText, 3):
+      updatePolicyWeight(h.tenantId, key, meanAdv)
+      inc ngramUpdates
     h.emit(%*{"type": "distillation", "task_id": h.taskId, "aligned_tokens": teacher.logprobs.len,
-              "reverse_kl": rkl, "mean_advantage": meanAdv, "policy_updates": max(matched, relevant.len * (if matched == 0: 1 else: 0))})
+              "reverse_kl": rkl, "mean_advantage": meanAdv, "token_updates": directUpdates,
+              "ngram_updates": ngramUpdates, "transport": "chat_completions_echo_top_logprobs"})
   except CatchableError as e:
     h.emit(%*{"type": "distillation_error", "task_id": h.taskId, "error": e.msg})
 
@@ -2025,10 +2210,11 @@ proc reflectAndDistill(h: TaskHandle, verifierReport: JsonNode) {.async.} =
   acquire(h.lock)
   let stateSnapshot = copy(h.sigma)
   release(h.lock)
+  let reflectionSignals = learnedPolicySignals(h.tenantId, canonical(stateSnapshot) & " " & canonical(verifierReport), 12)
   let prompt = %*[
     {"role": "system", "content":
       "You are a meta-reflection engine. Diagnose failure, attribute memory component, suggest pivot action and skill patch. " &
-      "Output JSON with failure_point, root_cause, pivot_action, attribution, and skill_patch."},
+      "Output JSON with failure_point, root_cause, pivot_action, attribution, and skill_patch.\n\n" & reflectionSignals},
     {"role": "user", "content":
       "TERMINAL STATE:\n" & boundUtf8Bytes(canonical(stateSnapshot), 131072) & "\nVERIFIER REPORT:\n" & boundUtf8Bytes(canonical(verifierReport), 32768) &
       "\nTRACE DIGEST:\n" & boundUtf8Bytes(canonical(digestArr), 49152)}
@@ -2053,7 +2239,255 @@ proc reflectAndDistill(h: TaskHandle, verifierReport: JsonNode) {.async.} =
   h.emit(%*{"type": "reflection", "task_id": h.taskId, "patch": patchNode})
   await runTokenLevelDistillation(h, patchNode)
 
-proc runRegressionGate(tenantId: string): Future[JsonNode] {.async.} =
+proc removeTree(path: string) =
+  if not dirExists(path): return
+  var children: seq[(PathComponent, string)] = @[]
+  for kind, child in walkDir(path): children.add((kind, child))
+  for item in children:
+    case item[0]
+    of pcDir:
+      removeTree(item[1])
+    of pcFile, pcLinkToFile, pcLinkToDir:
+      try: removeFile(item[1])
+      except CatchableError:
+        try: removeDir(item[1])
+        except CatchableError: discard
+  try: removeDir(path)
+  except CatchableError: discard
+
+proc ensureDiagnosticSuite(tenantId: string) =
+  let existing = store.query("SELECT domain FROM diagnostics WHERE tenant_id=?", @[%tenantId])
+  var domains = initHashSet[string]()
+  for r in existing: domains.incl(getStr(r, "domain"))
+  if "arithmetic_rollout" notin domains:
+    discard store.exec(
+      "INSERT INTO diagnostics (diagnostic_id, tenant_id, domain, spec_json, expectation_json, created_at) VALUES (?,?,?,?,?,?)",
+      @[%newId("diag"), %tenantId, %"arithmetic_rollout",
+        %canonical(%*{"goal": "Use math_eval to compute (17 * 6) + 5. After observing the real tool result, store the exact numeric value in facts.answer, set progress to 1.0, and finish.", "max_steps": 6}),
+        %canonical(%*{"verifiers": [{"type": "state_path_equals", "path": "/facts/answer", "expected": 107}, {"type": "state_path_equals", "path": "/progress", "expected": 1.0}]}), %nowF()])
+  if "filesystem_rollout" notin domains:
+    discard store.exec(
+      "INSERT INTO diagnostics (diagnostic_id, tenant_id, domain, spec_json, expectation_json, created_at) VALUES (?,?,?,?,?,?)",
+      @[%newId("diag"), %tenantId, %"filesystem_rollout",
+        %canonical(%*{"goal": "Create the workspace file regression/output.txt containing the exact text validation-gate-ok followed by a newline. Verify the real file, set progress to 1.0, and finish.", "max_steps": 6}),
+        %canonical(%*{"verifiers": [{"type": "file_contains", "path": "regression/output.txt", "needle": "validation-gate-ok"}, {"type": "state_path_equals", "path": "/progress", "expected": 1.0}]}), %nowF()])
+  if "memory_rollout" notin domains:
+    discard store.exec(
+      "INSERT INTO diagnostics (diagnostic_id, tenant_id, domain, spec_json, expectation_json, created_at) VALUES (?,?,?,?,?,?)",
+      @[%newId("diag"), %tenantId, %"memory_rollout",
+        %canonical(%*{"goal": "Use memory_search to retrieve a relevant reusable skill for sandboxed file operations. After observing the real retrieval result, set facts.memory_routed to true, set progress to 1.0, and finish.", "max_steps": 6}),
+        %canonical(%*{"verifiers": [{"type": "state_path_equals", "path": "/facts/memory_routed", "expected": true}, {"type": "state_path_equals", "path": "/progress", "expected": 1.0}]}), %nowF()])
+
+proc verifyDiagnosticSnapshot(sandboxTenant: string, expectation, sigma: JsonNode): (bool, JsonNode) =
+  var report = newJArray()
+  var okAll = true
+  let verifiers = if expectation != nil and expectation.kind == JObject and expectation.hasKey("verifiers") and expectation["verifiers"].kind == JArray:
+                    expectation["verifiers"]
+                  elif expectation != nil and expectation.kind == JArray:
+                    expectation
+                  else:
+                    newJArray()
+  if verifiers.elems.len == 0:
+    return (false, %*[{"verifier": "configuration", "ok": false, "error": "diagnostic has no verifiers"}])
+  for verifier in verifiers.elems:
+    if verifier.kind != JObject:
+      okAll = false
+      report.add(%*{"verifier": "invalid", "ok": false})
+      continue
+    let kind = verifier{"type"}.getStr("")
+    case kind
+    of "state_path_equals":
+      let path = verifier{"path"}.getStr("")
+      let actual = jsonPointerGet(sigma, path)
+      let expected = if verifier.hasKey("expected"): verifier["expected"] else: newJNull()
+      let ok = actual.isSome and canonical(actual.get()) == canonical(expected)
+      if not ok: okAll = false
+      report.add(%*{"verifier": kind, "path": path, "ok": ok, "expected": expected, "actual": (if actual.isSome: actual.get() else: newJNull())})
+    of "file_exists":
+      let rel = verifier{"path"}.getStr("")
+      var ok = false
+      try: ok = rel.len > 0 and fileExists(safeJoin(sandboxTenant, rel))
+      except CatchableError: ok = false
+      if not ok: okAll = false
+      report.add(%*{"verifier": kind, "path": rel, "ok": ok})
+    of "file_contains":
+      let rel = verifier{"path"}.getStr("")
+      let needle = verifier{"needle"}.getStr("")
+      var ok = false
+      try:
+        let full = safeJoin(sandboxTenant, rel)
+        ok = fileExists(full) and needle.len > 0 and needle in readFile(full)
+      except CatchableError:
+        ok = false
+      if not ok: okAll = false
+      report.add(%*{"verifier": kind, "path": rel, "needle": needle, "ok": ok})
+    of "all_subgoals_resolved":
+      var unresolved = 0
+      if sigma.hasKey("subgoals") and sigma["subgoals"].kind == JArray:
+        for it in sigma["subgoals"].elems:
+          if it.kind == JObject and it{"status"}.getStr("open") in ["open", "in_progress"]: inc unresolved
+      let ok = unresolved == 0
+      if not ok: okAll = false
+      report.add(%*{"verifier": kind, "ok": ok, "unresolved": unresolved})
+    of "no_blockers":
+      let n = if sigma.hasKey("blockers") and sigma["blockers"].kind == JArray: sigma["blockers"].elems.len else: 0
+      let ok = n == 0
+      if not ok: okAll = false
+      report.add(%*{"verifier": kind, "ok": ok, "blockers_count": n})
+    else:
+      okAll = false
+      report.add(%*{"verifier": kind, "ok": false, "error": "unsupported diagnostic verifier"})
+  (okAll, report)
+
+proc diagnosticAllowedTools(tenantId: string): HashSet[string] =
+  result = initHashSet[string]()
+  let rows = store.query("SELECT allowed_tools FROM tenants WHERE tenant_id=?", @[%tenantId])
+  if rows.len == 0: return
+  let allowed = getJson(rows[0], "allowed_tools")
+  if allowed.kind != JArray: return
+  let safeNames = ["write_file", "read_file", "append_file", "replace_lines", "check_lines", "search_files", "list_dir", "delete_file", "math_eval", "memory_search", "reason"]
+  for it in allowed.elems:
+    let name = it.getStr("")
+    if name in safeNames and toolRegistry.hasKey(name): result.incl(name)
+
+proc runDiagnosticRolloutCase(tenantId: string, diagnostic: Row, candidateOverride: JsonNode = nil): Future[JsonNode] {.async.} =
+  let spec = getJson(diagnostic, "spec_json")
+  let expectation = getJson(diagnostic, "expectation_json")
+  let goal = spec{"goal"}.getStr("")
+  let maxSteps = max(1, min(spec{"max_steps"}.getInt(6).int, 12))
+  let sandboxTenant = sanitizeKnowledgeName(tenantId) & "_gate_" & newId("rollout")
+  let allowed = diagnosticAllowedTools(tenantId)
+  var sigma = defaultSigma(goal)
+  sigma["phase"] = %"perceive"
+  var obs = %*{"step": 0, "status": "diagnostic_initialized"}
+  var steps = 0
+  var modelCalls = 0
+  var validationFailures = 0
+  var lastFeedback = newJObject()
+  try:
+    while steps < maxSteps:
+      let (alreadyOk, alreadyReport) = verifyDiagnosticSnapshot(sandboxTenant, expectation, sigma)
+      if alreadyOk:
+        return %*{"passed": true, "steps": steps, "model_calls": modelCalls, "validation_failures": validationFailures, "verification": alreadyReport}
+      inc steps
+      let queryText = goal & " " & sigma{"step_summary"}.getStr("") & " " & canonical(obs)
+      let skills = searchSkills(tenantId, queryText, 3)
+      var skillArr = newJArray()
+      if candidateOverride != nil and candidateOverride.kind == JObject:
+        skillArr.add(%*{"name": candidateOverride{"name"}.getStr("validation_candidate"),
+                        "domain": candidateOverride{"domain"}.getStr("general"),
+                        "trigger": candidateOverride{"trigger_spec"}.getStr(candidateOverride{"trigger"}.getStr("")),
+                        "procedure": candidateOverride{"procedure_spec"}.getStr(candidateOverride{"procedure"}.getStr("")),
+                        "skill_code": candidateOverride{"skill_code"}.getStr(""), "validation_candidate": true})
+      for sk in skills:
+        skillArr.add(%*{"name": getStr(sk, "name"), "domain": getStr(sk, "domain"), "trigger": getStr(sk, "trigger_spec"), "procedure": getStr(sk, "procedure_spec"), "skill_code": getStr(sk, "skill_code")})
+      let policySignals = learnedPolicySignals(tenantId, queryText, 16)
+      var committed = false
+      var attempt = 0
+      while attempt < MaxRetryPerStep and not committed:
+        inc attempt
+        var userText = "DIAGNOSTIC TASK:\n" & boundUtf8Bytes(canonical(spec), 32768) &
+                       "\n\nSTATE SIGMA:\n" & boundUtf8Bytes(canonical(sigma), 98304) &
+                       "\n\nOBSERVATION:\n" & boundUtf8Bytes(canonical(obs), 32768) &
+                       "\n\nACTIVE SKILLS:\n" & boundUtf8Bytes(canonical(skillArr), 24576)
+        if attempt > 1: userText.add("\n\nVALIDATION_FEEDBACK:\n" & boundUtf8Bytes(canonical(lastFeedback), 16384))
+        let messages = %*[
+          {"role": "system", "content": "You are the production agent transition controller running a held-out regression task. Use only authorized real tools. Return exactly one JSON object with reasoning, delta_sigma, action with tool and args, and terminal. Reasoning is discarded.\n\n" & policySignals & "\n\nAUTHORIZED TOOLS:\n" & canonical(toolCatalog(allowed))},
+          {"role": "user", "content": userText}
+        ]
+        var resp: LlmResponse
+        try:
+          resp = await callChatCompletionsAsync(messages, 4096, 0.0, true, false)
+          inc modelCalls
+        except CatchableError as e:
+          lastFeedback = %*{"stage": "llm_call", "error": e.msg}
+          inc validationFailures
+          continue
+        if not chargeTokens(tenantId, "", resp.totalTokens): return %*{"passed": false, "steps": steps, "model_calls": modelCalls, "error": "budget_exhausted"}
+        let parsed = extractJsonObject(resp.content)
+        if parsed == nil:
+          lastFeedback = %*{"stage": "json_parse", "error": "no JSON object returned"}
+          inc validationFailures
+          continue
+        let delta = if parsed.hasKey("delta_sigma") and parsed["delta_sigma"].kind == JObject: parsed["delta_sigma"] else: newJObject()
+        let (patchOk, patchErrs) = validatePatch(delta)
+        if not patchOk:
+          lastFeedback = %*{"stage": "patch_validation", "errors": patchErrs}
+          inc validationFailures
+          continue
+        var candidateState = deepMerge(sigma, delta)
+        pruneSigma(candidateState)
+        let (stateOk, stateErrs) = validateSigma(candidateState)
+        if not stateOk:
+          lastFeedback = %*{"stage": "state_validation", "errors": stateErrs}
+          inc validationFailures
+          continue
+        let action = if parsed.hasKey("action") and parsed["action"].kind == JObject: parsed["action"] else: %*{"tool": "none", "args": {}}
+        let toolName = action{"tool"}.getStr("none")
+        var toolRes = ToolResult(ok: true, payload: newJObject(), receipt: "none", message: "no-op")
+        if toolName notin ["none", "finish"]:
+          if toolName notin allowed or not toolRegistry.hasKey(toolName):
+            toolRes = ToolResult(ok: false, payload: newJObject(), receipt: "forbidden", message: "diagnostic tool unauthorized: " & toolName)
+          else:
+            var argsNode = action{"args"}
+            if argsNode == nil or argsNode.kind != JObject: argsNode = newJObject()
+            let toolTenant = if toolName in ["memory_search", "reason"]: tenantId else: sandboxTenant
+            try: toolRes = await toolRegistry[toolName].handler(toolTenant, argsNode)
+            except CatchableError as e: toolRes = ToolResult(ok: false, payload: newJObject(), receipt: "error", message: e.msg)
+        sigma = candidateState
+        obs = %*{"step": steps, "tool": toolName, "ok": toolRes.ok, "message": toolRes.message, "payload": toolRes.payload, "receipt": toolRes.receipt}
+        if not toolRes.ok:
+          var blockers = if sigma.hasKey("blockers") and sigma["blockers"].kind == JArray: sigma["blockers"] else: newJArray()
+          blockers.add(%*{"step": steps, "tool": toolName, "reason": toolRes.message})
+          sigma["blockers"] = blockers
+          pruneSigma(sigma)
+        committed = true
+      if not committed:
+        let (_, finalReport) = verifyDiagnosticSnapshot(sandboxTenant, expectation, sigma)
+        return %*{"passed": false, "steps": steps, "model_calls": modelCalls, "validation_failures": validationFailures, "verification": finalReport, "validation_feedback": lastFeedback}
+      let (stepOk, stepReport) = verifyDiagnosticSnapshot(sandboxTenant, expectation, sigma)
+      if stepOk: return %*{"passed": true, "steps": steps, "model_calls": modelCalls, "validation_failures": validationFailures, "verification": stepReport}
+    let (finalOk, finalReport) = verifyDiagnosticSnapshot(sandboxTenant, expectation, sigma)
+    return %*{"passed": finalOk, "steps": steps, "model_calls": modelCalls, "validation_failures": validationFailures, "verification": finalReport}
+  finally:
+    try: removeTree(absolutePath(WorkspaceRoot / sandboxTenant))
+    except CatchableError: discard
+
+proc validateSkillDsl(code: string): (bool, seq[string]) =
+  var errs: seq[string] = @[]
+  let trimmed = code.strip()
+  if trimmed.len < 20: errs.add("skill_code is too short")
+  if trimmed.len > 16384: errs.add("skill_code exceeds 16384 bytes")
+  let lowered = trimmed.toLowerAscii()
+  for forbidden in ["todo", "fixme", "placeholder", "dummy", "fake", "simulate", "simulated"]:
+    if forbidden in lowered: errs.add("skill_code contains forbidden non-production marker: " & forbidden)
+  var sawWhen = false
+  var sawRequire = false
+  var sawStep = false
+  var sawVerify = false
+  var sawRecover = false
+  var executableLines = 0
+  for rawLine in trimmed.splitLines():
+    let line = rawLine.strip()
+    if line.len == 0: continue
+    inc executableLines
+    if line.startsWith("SKILL "): discard
+    elif line.startsWith("WHEN "): sawWhen = true
+    elif line.startsWith("REQUIRE "): sawRequire = true
+    elif line.startsWith("STEP "): sawStep = true
+    elif line.startsWith("VERIFY "): sawVerify = true
+    elif line.startsWith("RECOVER "): sawRecover = true
+    else: errs.add("unsupported skill DSL clause: " & line)
+  if executableLines < 5: errs.add("skill_code requires at least five executable clauses")
+  if not sawWhen: errs.add("skill_code missing WHEN clause")
+  if not sawRequire: errs.add("skill_code missing REQUIRE clause")
+  if not sawStep: errs.add("skill_code missing STEP clause")
+  if not sawVerify: errs.add("skill_code missing VERIFY clause")
+  if not sawRecover: errs.add("skill_code missing RECOVER clause")
+  (errs.len == 0, errs)
+
+proc runRegressionGate(tenantId: string, candidateOverride: JsonNode = nil): Future[JsonNode] {.async.} =
+  ensureDiagnosticSuite(tenantId)
   var tests = newJArray()
   var passed = 0
   var total = 0
@@ -2068,28 +2502,20 @@ proc runRegressionGate(tenantId: string): Future[JsonNode] {.async.} =
     var traversalBlocked = false
     try: discard safeJoin(tenantId, "../tenant_escape_probe")
     except ValueError: traversalBlocked = true
-    fPass = writeRes.ok and appRes.ok and appRes.payload{"added_count"}.getInt(0) == 1 and
-            repRes.ok and chkRes.ok and chkRes.payload{"missing_count"}.getInt(1) == 0 and traversalBlocked
-  except CatchableError:
-    fPass = false
+    fPass = writeRes.ok and appRes.ok and appRes.payload{"added_count"}.getInt(0) == 1 and repRes.ok and chkRes.ok and chkRes.payload{"missing_count"}.getInt(1) == 0 and traversalBlocked
+  except CatchableError: fPass = false
   inc total
   if fPass: inc passed
-  tests.add(%*{"name": "filesystem_sandbox", "passed": fPass})
-  try:
-    let full = safeJoin(tenantId, testPath)
-    if fileExists(full): removeFile(full)
-    let dirFull = safeJoin(tenantId, testDir)
-    if dirExists(dirFull): removeDir(dirFull)
+  tests.add(%*{"name": "filesystem_sandbox", "passed": fPass, "executed": true})
+  try: removeTree(safeJoin(tenantId, testDir))
   except CatchableError: discard
-
   let (mOk1, mVal1, _) = evalMathExpression("((17 * 23 + sqrt(144)) / 5) - ln(exp(2))")
   let (mOk2, _, _) = evalMathExpression("100 / 0")
   let (mOk3, mVal3, _) = evalMathExpression("-2^2 + 2^3^2")
   let mPass = mOk1 and abs(mVal1 - 78.6) < 1e-9 and (not mOk2) and mOk3 and abs(mVal3 - 508.0) < 1e-9
   inc total
   if mPass: inc passed
-  tests.add(%*{"name": "math_eval_boundary", "passed": mPass})
-
+  tests.add(%*{"name": "math_eval_boundary", "passed": mPass, "executed": true})
   let baseS = defaultSigma("test")
   for i in 0 ..< 180: baseS["facts"]["f" & $i] = %i
   baseS["facts"]["delete_me"] = %"x"
@@ -2099,31 +2525,193 @@ proc runRegressionGate(tenantId: string): Future[JsonNode] {.async.} =
   pruneSigma(mergedS)
   let (stateOk, _) = validateSigma(mergedS)
   let (forbiddenOk, _) = validatePatch(%*{"nested": {"messages": []}})
-  let sHits = searchSkills(tenantId, "filesystem write lines", 3)
-  let activeSkills = store.query("SELECT COUNT(*) AS n FROM skills WHERE tenant_id=? AND active=1", @[%tenantId])
-  let retrievalOk = activeSkills.len == 0 or getInt(activeSkills[0], "n", 0) == 0 or sHits.len > 0
-  let sPass = patchOk and stateOk and mergedS{"progress"}.getFloat(0.0) == 0.5 and
-              (not mergedS{"facts"}.hasKey("delete_me")) and mergedS{"facts"}.fields.len <= 128 and
-              (not forbiddenOk) and countNodes(mergedS) <= 4000 and canonical(mergedS).len <= MaxStateBytes and retrievalOk
+  let retrievalProbe = "retrievalprobe" & newId("probe").replace("_", "")
+  let retrievalSkillId = newId("skillprobe")
+  var retrievalOk = false
+  try:
+    let ts = nowF()
+    let probeProcedure = "When the exact retrieval probe appears, return this diagnostic skill as the highest relevance memory candidate."
+    let probeCode = "WHEN " & retrievalProbe & "\nREQUIRE exact_query_match\nSTEP return_diagnostic_skill\nVERIFY retrieved_skill_id\nRECOVER fail_closed"
+    discard store.exec(
+      "INSERT INTO skills (skill_id, tenant_id, name, domain, trigger_spec, procedure_spec, skill_code, preconditions_json, postconditions_json, failure_modes_json, version, active, success_count, failure_count, reward, embedding_json, created_at, updated_at) VALUES (?,?,?,?,?,?,?,'[]','[]','[]',1,1,0,0,0.0,?,?,?)",
+      @[%retrievalSkillId, %tenantId, %("diagnostic_" & retrievalProbe), %"diagnostic", %retrievalProbe, %probeProcedure, %probeCode, %embToJson(textEmbedding(retrievalProbe & " " & probeProcedure & " " & probeCode)), %ts, %ts])
+    let hits = searchSkills(tenantId, retrievalProbe, 5)
+    for hit in hits:
+      if getStr(hit, "skill_id") == retrievalSkillId:
+        retrievalOk = true
+        break
+  finally:
+    try: discard store.exec("DELETE FROM skills WHERE skill_id=? AND tenant_id=?", @[%retrievalSkillId, %tenantId])
+    except CatchableError: discard
+  let sPass = patchOk and stateOk and mergedS{"progress"}.getFloat(0.0) == 0.5 and (not mergedS{"facts"}.hasKey("delete_me")) and mergedS{"facts"}.fields.len <= 128 and (not forbiddenOk) and countNodes(mergedS) <= 4000 and canonical(mergedS).len <= MaxStateBytes and retrievalOk
   inc total
   if sPass: inc passed
-  tests.add(%*{"name": "memory_routing_state_pruning", "passed": sPass})
+  tests.add(%*{"name": "memory_routing_state_pruning", "passed": sPass, "executed": true})
+  let diagnosticRows = store.query("SELECT * FROM diagnostics WHERE tenant_id=? ORDER BY created_at ASC LIMIT 6", @[%tenantId])
+  var rolloutPassed = 0
+  for diagnostic in diagnosticRows:
+    let resultNode = await runDiagnosticRolloutCase(tenantId, diagnostic, candidateOverride)
+    let ok = resultNode{"passed"}.getBool(false)
+    inc total
+    if ok:
+      inc passed
+      inc rolloutPassed
+    tests.add(%*{"name": "micro_rollout:" & getStr(diagnostic, "domain"), "passed": ok, "executed": true, "result": resultNode})
+  let score = if total > 0: passed.float / total.float else: 0.0
+  let rolloutScore = if diagnosticRows.len > 0: rolloutPassed.float / diagnosticRows.len.float else: 0.0
+  return %*{"total": total, "passed": passed, "score": score, "rollout_total": diagnosticRows.len, "rollout_passed": rolloutPassed, "rollout_score": rolloutScore, "tests": tests, "all_passed": passed == total and diagnosticRows.len > 0}
 
-  let diagnosticRows = store.query("SELECT COUNT(*) AS n FROM diagnostics WHERE tenant_id=?", @[%tenantId])
-  let rolloutAvailable = diagnosticRows.len > 0 and getInt(diagnosticRows[0], "n", 0) > 0
-  tests.add(%*{"name": "optional_micro_rollout", "passed": true, "executed": false, "available": rolloutAvailable})
-  let score = if total > 0: passed.float / total.float else: 1.0
-  return %*{"total": total, "passed": passed, "score": score, "tests": tests, "all_passed": passed == total}
+type
+  ValidationGate = ref object
+    epsilon: float
+
+  MetaAgent = ref object
+    minOccurrences: int
+    lookback: int
+    maxCandidates: int
+    gate: ValidationGate
+
+proc coreRegressionPassed(report: JsonNode): bool =
+  if report == nil or report.kind != JObject or not report.hasKey("tests") or report["tests"].kind != JArray: return false
+  var sawCore = false
+  for test in report["tests"].elems:
+    if test.kind != JObject: continue
+    let name = test{"name"}.getStr("")
+    if name.startsWith("micro_rollout:"): continue
+    sawCore = true
+    if not test{"passed"}.getBool(false): return false
+  sawCore
+
+proc validateAndActivate(gate: ValidationGate, tenantId: string, candidate: JsonNode): Future[JsonNode] {.async.} =
+  if candidate == nil or candidate.kind != JObject: return %*{"accepted": false, "error": "candidate must be an object"}
+  let name = candidate{"name"}.getStr("").strip()
+  let domain = candidate{"domain"}.getStr("general").strip()
+  let trigger = candidate{"trigger_spec"}.getStr(candidate{"trigger"}.getStr("")).strip()
+  let procedure = candidate{"procedure_spec"}.getStr(candidate{"procedure"}.getStr("")).strip()
+  let skillCode = candidate{"skill_code"}.getStr("").strip()
+  if name.len < 3 or procedure.len < 20 or trigger.len < 5 or skillCode.len < 20:
+    return %*{"accepted": false, "error": "candidate requires nontrivial name, trigger_spec, procedure_spec, and skill_code"}
+  let (dslOk, dslErrs) = validateSkillDsl(skillCode)
+  if not dslOk: return %*{"accepted": false, "error": "invalid skill DSL", "validation_errors": dslErrs}
+  acquire(skillGateLock)
+  if skillGateBusy:
+    release(skillGateLock)
+    return %*{"accepted": false, "error": "validation gate busy"}
+  skillGateBusy = true
+  release(skillGateLock)
+  try:
+    let beforeReport = await runRegressionGate(tenantId)
+    let afterReport = await runRegressionGate(tenantId, candidate)
+    let beforeScore = beforeReport{"score"}.getFloat(0.0)
+    let afterScore = afterReport{"score"}.getFloat(0.0)
+    let beforeRollout = beforeReport{"rollout_score"}.getFloat(0.0)
+    let afterRollout = afterReport{"rollout_score"}.getFloat(0.0)
+    let accepted = coreRegressionPassed(afterReport) and afterReport{"rollout_total"}.getInt(0) > 0 and afterScore + gate.epsilon >= beforeScore and afterRollout + gate.epsilon >= beforeRollout
+    if not accepted: return %*{"accepted": false, "before": beforeReport, "after": afterReport, "reason": "candidate failed non-regression validation"}
+    let preconditions = if candidate.hasKey("preconditions") and candidate["preconditions"].kind == JArray: canonical(candidate["preconditions"]) else: "[]"
+    let postconditions = if candidate.hasKey("postconditions") and candidate["postconditions"].kind == JArray: canonical(candidate["postconditions"]) else: "[]"
+    let failureModes = if candidate.hasKey("failure_modes") and candidate["failure_modes"].kind == JArray: canonical(candidate["failure_modes"]) else: "[]"
+    let emb = embToJson(textEmbedding(name & " " & domain & " " & trigger & " " & procedure & " " & skillCode))
+    let ts = nowF()
+    let oldRows = store.query("SELECT * FROM skills WHERE tenant_id=? AND name=?", @[%tenantId, %name])
+    var sid = ""
+    if oldRows.len > 0:
+      sid = getStr(oldRows[0], "skill_id")
+      discard store.exec("UPDATE skills SET domain=?, trigger_spec=?, procedure_spec=?, skill_code=?, preconditions_json=?, postconditions_json=?, failure_modes_json=?, version=version+1, active=1, embedding_json=?, updated_at=? WHERE skill_id=? AND tenant_id=?", @[%domain, %trigger, %procedure, %skillCode, %preconditions, %postconditions, %failureModes, %emb, %ts, %sid, %tenantId])
+    else:
+      sid = newId("skill")
+      discard store.exec("INSERT INTO skills (skill_id, tenant_id, name, domain, trigger_spec, procedure_spec, skill_code, preconditions_json, postconditions_json, failure_modes_json, version, active, success_count, failure_count, reward, embedding_json, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,1,1,0,0,0.0,?,?,?)", @[%sid, %tenantId, %name, %domain, %trigger, %procedure, %skillCode, %preconditions, %postconditions, %failureModes, %emb, %ts, %ts])
+    let versionRows = store.query("SELECT version FROM skills WHERE skill_id=? AND tenant_id=?", @[%sid, %tenantId])
+    let version = if versionRows.len > 0: getInt(versionRows[0], "version", 1) else: 1
+    return %*{"accepted": true, "skill_id": sid, "version": version, "before": beforeReport, "after": afterReport}
+  except CatchableError as e:
+    return %*{"accepted": false, "error": e.msg}
+  finally:
+    acquire(skillGateLock)
+    skillGateBusy = false
+    release(skillGateLock)
+
+proc consider(agent: MetaAgent, tenantId: string, sourceTaskId: string = ""): Future[JsonNode] {.async.} =
+  let groups = store.query("SELECT failure_point, attribution, COUNT(*) AS occurrences, MAX(created_at) AS latest FROM reflections WHERE tenant_id=? GROUP BY failure_point, attribution HAVING COUNT(*)>=? ORDER BY latest DESC LIMIT ?", @[%tenantId, %agent.minOccurrences, %agent.maxCandidates])
+  var decisions = newJArray()
+  for group in groups:
+    let failurePoint = getStr(group, "failure_point").strip()
+    let attribution = getStr(group, "attribution").strip()
+    let occurrences = getInt(group, "occurrences", 0)
+    if failurePoint.len == 0: continue
+    let signature = sha1Hex(failurePoint.toLowerAscii() & "|" & attribution.toLowerAscii())
+    let priorEvents = store.query("SELECT * FROM meta_agent_events WHERE tenant_id=? AND signature=?", @[%tenantId, %signature])
+    if priorEvents.len > 0:
+      let priorStatus = getStr(priorEvents[0], "status")
+      let priorOccurrences = getInt(priorEvents[0], "occurrences", 0)
+      if occurrences <= priorOccurrences: continue
+      if priorStatus == "accepted" and occurrences < priorOccurrences + agent.minOccurrences: continue
+    let evidenceRows = store.query("SELECT task_id, patch_json, failure_point, pivot_action, attribution, verifier_report_json FROM reflections WHERE tenant_id=? AND failure_point=? AND attribution=? ORDER BY created_at DESC LIMIT ?", @[%tenantId, %failurePoint, %attribution, %agent.lookback])
+    var evidence = newJArray()
+    for r in evidenceRows:
+      evidence.add(%*{"task_id": getStr(r, "task_id"), "failure_point": getStr(r, "failure_point"), "pivot_action": getStr(r, "pivot_action"), "attribution": getStr(r, "attribution"), "patch": getJson(r, "patch_json"), "verifier_report": getJson(r, "verifier_report_json")})
+    let activeRows = store.query("SELECT name, domain, trigger_spec, procedure_spec, skill_code, reward, success_count, failure_count FROM skills WHERE tenant_id=? AND active=1 ORDER BY reward DESC LIMIT 24", @[%tenantId])
+    var active = newJArray()
+    for r in activeRows:
+      active.add(%*{"name": getStr(r, "name"), "domain": getStr(r, "domain"), "trigger_spec": getStr(r, "trigger_spec"), "procedure_spec": getStr(r, "procedure_spec"), "skill_code": getStr(r, "skill_code"), "reward": getFloat(r, "reward"), "success_count": getInt(r, "success_count"), "failure_count": getInt(r, "failure_count")})
+    let policySignals = learnedPolicySignals(tenantId, failurePoint & " " & attribution & " " & canonical(evidence), 20)
+    let messages = %*[
+      {"role": "system", "content": "You are MetaAgent.consider, an autonomous skill-evolution agent. A failure pattern has repeated enough times to justify a concrete reusable skill. Synthesize exactly one production skill candidate. Return strict JSON with action='propose', name, domain, trigger_spec, procedure_spec, skill_code, preconditions, postconditions, failure_modes, and rationale. skill_code must be a concrete deterministic SKILL DSL program using WHEN, REQUIRE, STEP, VERIFY, RECOVER clauses and no non-production markers.\n\n" & policySignals},
+      {"role": "user", "content": "SOURCE TASK: " & sourceTaskId & "\nFAILURE SIGNATURE: " & failurePoint & " | " & attribution & "\nOCCURRENCES: " & $occurrences & "\nEVIDENCE:\n" & boundUtf8Bytes(canonical(evidence), 98304) & "\nACTIVE SKILLS:\n" & boundUtf8Bytes(canonical(active), 65536)}
+    ]
+    var candidate = newJObject()
+    var generationError = ""
+    try:
+      let resp = await callChatCompletionsAsync(messages, 4096, 0.2, true, false)
+      if not chargeTokens(tenantId, "", resp.totalTokens): generationError = "budget_exhausted"
+      else:
+        let parsed = extractJsonObject(resp.content)
+        if parsed != nil: candidate = parsed else: generationError = "meta agent returned invalid JSON"
+    except CatchableError as e: generationError = e.msg
+    if generationError.len > 0:
+      decisions.add(%*{"signature": signature, "occurrences": occurrences, "status": "deferred", "error": generationError})
+      continue
+    var validation = %*{"accepted": false, "error": "candidate declined proposal"}
+    if candidate{"action"}.getStr("propose") != "none": validation = await agent.gate.validateAndActivate(tenantId, candidate)
+    if validation{"error"}.getStr("") == "validation gate busy":
+      decisions.add(%*{"signature": signature, "occurrences": occurrences, "status": "deferred", "candidate": candidate, "validation": validation})
+      continue
+    let status = if validation{"accepted"}.getBool(false): "accepted" else: "rejected"
+    let eventId = if priorEvents.len > 0: getStr(priorEvents[0], "event_id") else: newId("meta")
+    discard store.exec("INSERT INTO meta_agent_events (event_id, tenant_id, signature, occurrences, candidate_json, validation_json, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(tenant_id, signature) DO UPDATE SET occurrences=excluded.occurrences, candidate_json=excluded.candidate_json, validation_json=excluded.validation_json, status=excluded.status, updated_at=excluded.updated_at", @[%eventId, %tenantId, %signature, %occurrences, %canonical(candidate), %canonical(validation), %status, %nowF(), %nowF()])
+    if status == "accepted":
+      try:
+        let body = "Failure pattern: " & failurePoint & "\nAttribution: " & attribution & "\nOccurrences: " & $occurrences & "\n\nTrigger:\n" & candidate{"trigger_spec"}.getStr("") & "\n\nProcedure:\n" & candidate{"procedure_spec"}.getStr("") & "\n\nSkill code:\n```\n" & candidate{"skill_code"}.getStr("") & "\n```\n\nValidation:\n" & canonical(validation)
+        discard commitKnowledgeDoc(tenantId, "meta-skill-" & sanitizeKnowledgeName(candidate{"name"}.getStr("skill")), "skills", body)
+      except CatchableError: discard
+    decisions.add(%*{"signature": signature, "occurrences": occurrences, "status": status, "candidate": candidate, "validation": validation})
+  return %*{"tenant_id": tenantId, "decisions": decisions, "considered": groups.len}
+
+var validationGate = ValidationGate(epsilon: 1e-9)
+var metaAgent = MetaAgent(minOccurrences: 3, lookback: 12, maxCandidates: 3, gate: validationGate)
 
 proc finalizeTask(h: TaskHandle) {.async.} =
+  acquire(h.lock)
+  let preFinalState = h.orchestratorState
+  release(h.lock)
+  case preFinalState
+  of osPerceive:
+    discard transitionOrchestrator(h, osDeliberate)
+    discard transitionOrchestrator(h, osAct)
+    discard transitionOrchestrator(h, osValidate)
+  of osDeliberate:
+    discard transitionOrchestrator(h, osAct)
+    discard transitionOrchestrator(h, osValidate)
+  of osAct:
+    discard transitionOrchestrator(h, osValidate)
+  else:
+    discard
   let (ok, report) = verifyTerminal(h)
   acquire(h.lock)
   h.verified = ok
   let previousStatus = h.status
-  if previousStatus notin ["halted"]:
-    h.status = if ok: "succeeded" else: "failed"
-  if h.terminalReason.len == 0:
-    h.terminalReason = if ok: "all external verifiers satisfied" else: "external verifiers failed"
+  if previousStatus != "halted": h.status = if ok: "succeeded" else: "failed"
+  if h.terminalReason.len == 0: h.terminalReason = if ok: "all external verifiers satisfied" else: "external verifiers failed"
   var obs = copy(h.obs)
   obs["verification_report"] = report
   h.obs = obs
@@ -2131,10 +2719,26 @@ proc finalizeTask(h: TaskHandle) {.async.} =
   release(h.lock)
   h.checkpoint(newJObject(), newJObject(), report)
   h.emit(%*{"type": "verification", "task_id": h.taskId, "verified": ok, "report": report, "status": h.status})
-  if shouldReflect:
-    await reflectAndDistill(h, report)
-  discard store.exec("UPDATE tasks SET status=?, verified=?, terminal_reason=?, updated_at=? WHERE task_id=?",
-                     @[%h.status, %(if h.verified: 1 else: 0), %h.terminalReason, %nowF(), %h.taskId])
+  if previousStatus != "halted":
+    if shouldReflect:
+      discard transitionOrchestrator(h, osReflect)
+      await reflectAndDistill(h, report)
+      discard transitionOrchestrator(h, osConsolidate)
+    else:
+      discard transitionOrchestrator(h, osConsolidate)
+    try:
+      let metaResult = await metaAgent.consider(h.tenantId, h.taskId)
+      h.emit(%*{"type": "meta_agent", "task_id": h.taskId, "result": metaResult})
+    except CatchableError as e:
+      h.emit(%*{"type": "meta_agent_error", "task_id": h.taskId, "error": e.msg})
+    discard transitionOrchestrator(h, osTerminal)
+  else:
+    acquire(h.lock)
+    h.orchestratorState = osTerminal
+    if h.sigma != nil and h.sigma.kind == JObject: h.sigma["phase"] = %"terminal"
+    release(h.lock)
+  discard store.exec("UPDATE tasks SET status=?, verified=?, terminal_reason=?, state_json=?, latest_obs_json=?, updated_at=? WHERE task_id=?",
+                     @[%h.status, %(if h.verified: 1 else: 0), %h.terminalReason, %($h.sigma), %($h.obs), %nowF(), %h.taskId])
   h.emit(%*{"type": "done", "task_id": h.taskId, "status": h.status, "verified": h.verified, "reason": h.terminalReason})
 
 proc system2Think(h: TaskHandle) {.async.} =
@@ -2152,11 +2756,12 @@ proc system2Think(h: TaskHandle) {.async.} =
   let skills = searchSkills(h.tenantId, queryText, 3)
   var skillArr = newJArray()
   for sk in skills:
-    skillArr.add(%*{"name": getStr(sk, "name"), "trigger": getStr(sk, "trigger_spec"), "procedure": getStr(sk, "procedure_spec")})
+    skillArr.add(%*{"name": getStr(sk, "name"), "trigger": getStr(sk, "trigger_spec"), "procedure": getStr(sk, "procedure_spec"), "skill_code": getStr(sk, "skill_code")})
+  let policySignals = learnedPolicySignals(h.tenantId, queryText & " " & canonical(sigmaSnapshot) & " " & canonical(obsSnapshot), 16)
   let messages = %*[
     {"role": "system", "content":
       "You are System 2, the deliberative planning engine. Output strict JSON with subgoal, strategy, gate in [0,1], " &
-      "cognition as exactly 16 numbers in [-1,1], and queued_micro_actions as immediate authorized tool calls."},
+      "cognition as exactly 16 numbers in [-1,1], and queued_micro_actions as immediate authorized tool calls.\n\n" & policySignals},
     {"role": "user", "content":
       "SPEC:\n" & boundUtf8Bytes(canonical(specSnapshot), 49152) & "\nSTATE:\n" & boundUtf8Bytes(canonical(sigmaSnapshot), 131072) &
       "\nOBS:\n" & boundUtf8Bytes(canonical(obsSnapshot), 49152) & "\nACTIVE SKILLS:\n" & boundUtf8Bytes(canonical(skillArr), 16384)}
@@ -2227,7 +2832,7 @@ proc endTransition(h: TaskHandle) =
   h.transitionBusy = false
   release(h.lock)
 
-proc executeStep(h: TaskHandle) {.async.} =
+proc execute(engine: StateTransitionEngine, h: TaskHandle) {.async.} =
   acquire(h.lock)
   let preSigma = copy(h.sigma)
   let baseObs = copy(h.obs)
@@ -2235,10 +2840,22 @@ proc executeStep(h: TaskHandle) {.async.} =
   let step = h.stepIndex
   let cogBase = if h.cognition != nil: copy(h.cognition) else: newJObject()
   let cogAge = if h.cognitionAt > 0.0: max(0.0, nowF() - h.cognitionAt) else: 0.0
+  let startState = h.orchestratorState
   release(h.lock)
+  case startState
+  of osPerceive:
+    discard transitionOrchestrator(h, osDeliberate)
+    discard transitionOrchestrator(h, osAct)
+  of osDeliberate:
+    discard transitionOrchestrator(h, osAct)
+  of osValidate:
+    discard transitionOrchestrator(h, osAct)
+  else:
+    discard
   let qText = preSigma{"goal"}.getStr("") & " " & preSigma{"step_summary"}.getStr("")
-  let skills = searchSkills(h.tenantId, qText, 2)
-  let wiki = searchKnowledge(h.tenantId, qText, 2)
+  let skills = searchSkills(h.tenantId, qText, 4)
+  let wiki = searchKnowledge(h.tenantId, qText, 3)
+  let policySignals = learnedPolicySignals(h.tenantId, qText & " " & canonical(preSigma) & " " & canonical(baseObs), 20)
   var cog = cogBase
   if cog.kind == JObject and cog.len > 0:
     cog["staleness_encoding"] = stalenessEncoding(cogAge)
@@ -2246,21 +2863,31 @@ proc executeStep(h: TaskHandle) {.async.} =
   var attempt = 0
   var committed = false
   var lastErrReport = newJObject()
-  while attempt < MaxRetryPerStep and not committed:
+  while attempt < engine.maxRetries and not committed:
     inc attempt
+    if attempt > 1:
+      acquire(h.lock)
+      let retryState = h.orchestratorState
+      release(h.lock)
+      if retryState == osValidate: discard transitionOrchestrator(h, osAct)
     var curObs = copy(baseObs)
     if attempt > 1:
       curObs["retry_attempt"] = %attempt
-      curObs["validation_error"] = lastErrReport
-    let pText = "IMMUTABLE TASK SPECIFICATION:\n" & boundUtf8Bytes(canonical(specSnapshot), 49152) &
-                "\n\nALLOWED TOOLS:\n" & boundUtf8Bytes(canonical(toolCatalog(h.allowedTools)), 24576) &
+      curObs["validation_feedback"] = copy(lastErrReport)
+    let pText = "IMMUTABLE TASK SPECIFICATION:\n" & boundUtf8Bytes(canonical(specSnapshot), 43008) &
+                "\n\nALLOWED TOOLS:\n" & boundUtf8Bytes(canonical(toolCatalog(h.allowedTools)), 20480) &
+                "\n\n" & boundUtf8Bytes(policySignals, 16384) &
                 "\n\nOUTPUT CONTRACT: Emit exactly one JSON object with reasoning, delta_sigma, action containing tool and args, and terminal boolean. " &
-                "Reasoning is discarded. Never include history, transcript, messages, chain_of_thought, or scratchpad in delta_sigma."
-    var uText = "STATE SIGMA:\n" & boundUtf8Bytes(canonical(preSigma), 131072) & "\n\nOBSERVATION:\n" & boundUtf8Bytes(canonical(curObs), 32768)
+                "Reasoning is discarded after validation. Never include history, transcript, messages, chain_of_thought, or scratchpad in delta_sigma. " &
+                "When VALIDATION_FEEDBACK is present, correct every listed validation failure before producing the next delta."
+    var uText = "STATE SIGMA:\n" & boundUtf8Bytes(canonical(preSigma), 114688) & "\n\nOBSERVATION:\n" & boundUtf8Bytes(canonical(curObs), 28672)
+    if attempt > 1:
+      uText.add("\n\nVALIDATION_FEEDBACK:\n" & boundUtf8Bytes(canonical(lastErrReport), 24576))
     if skills.len > 0:
       var sArr = newJArray()
-      for sk in skills: sArr.add(%*{"name": getStr(sk, "name"), "trigger": getStr(sk, "trigger_spec"), "procedure": getStr(sk, "procedure_spec")})
-      uText.add("\n\nEXPERIENTIAL SKILLS:\n" & boundUtf8Bytes(canonical(sArr), 16384))
+      for sk in skills:
+        sArr.add(%*{"name": getStr(sk, "name"), "trigger": getStr(sk, "trigger_spec"), "procedure": getStr(sk, "procedure_spec"), "skill_code": getStr(sk, "skill_code"), "reward": getFloat(sk, "reward", 0.0)})
+      uText.add("\n\nEXPERIENTIAL SKILLS:\n" & boundUtf8Bytes(canonical(sArr), 24576))
     if wiki.len > 0:
       var wArr = newJArray()
       for w in wiki: wArr.add(%*{"slug": getStr(w, "slug"), "category": getStr(w, "category"), "excerpt": getStr(w, "excerpt")})
@@ -2268,24 +2895,31 @@ proc executeStep(h: TaskHandle) {.async.} =
     if cog.kind == JObject and cog.len > 0:
       uText.add("\n\nSYSTEM 2 COGNITION:\n" & boundUtf8Bytes(canonical(cog), 8192))
     let messages = %*[{"role": "system", "content": pText}, {"role": "user", "content": uText}]
+    if canonical(messages).len > MaxPromptBytes:
+      lastErrReport = %*{"stage": "prompt_validation", "errors": ["prompt exceeds hard byte bound"], "attempt": attempt}
+      discard transitionOrchestrator(h, osValidate)
+      continue
     var resp: LlmResponse
     try:
       resp = await callChatCompletionsAsync(messages, 8192, Temperature, true, false)
     except CatchableError as e:
-      lastErrReport = %*{"error": e.msg, "stage": "llm_call"}
-      if attempt < MaxRetryPerStep: await sleepAsync(250)
+      lastErrReport = %*{"stage": "llm_call", "errors": [e.msg], "attempt": attempt}
+      discard transitionOrchestrator(h, osValidate)
+      if attempt < engine.maxRetries: await sleepAsync(250)
       continue
     if not chargeTokens(h.tenantId, h.taskId, resp.totalTokens):
       haltForBudget(h)
       return
     let parsed = extractJsonObject(resp.content)
     if parsed == nil:
-      lastErrReport = %*{"error": "no json object returned", "stage": "json_parse"}
+      lastErrReport = %*{"stage": "json_parse", "errors": ["no JSON object returned"], "attempt": attempt}
+      discard transitionOrchestrator(h, osValidate)
       continue
     let delta = if parsed.hasKey("delta_sigma") and parsed["delta_sigma"].kind == JObject: parsed["delta_sigma"] else: newJObject()
     let (patchOk, patchErrs) = validatePatch(delta)
     if not patchOk:
-      lastErrReport = %*{"error": patchErrs.join("; "), "stage": "patch_validation"}
+      lastErrReport = %*{"stage": "patch_validation", "errors": patchErrs, "attempt": attempt, "delta_sigma": delta}
+      discard transitionOrchestrator(h, osValidate)
       continue
     let action = if parsed.hasKey("action") and parsed["action"].kind == JObject: parsed["action"] else: %*{"tool": "none", "args": {}}
     let termReq = parsed{"terminal"}.getBool(false)
@@ -2293,7 +2927,8 @@ proc executeStep(h: TaskHandle) {.async.} =
     pruneSigma(candSigma)
     let (vOk, vErrs) = validateSigma(candSigma)
     if not vOk:
-      lastErrReport = %*{"error": vErrs.join("; "), "stage": "state_validation"}
+      lastErrReport = %*{"stage": "state_validation", "errors": vErrs, "attempt": attempt, "delta_sigma": delta}
+      discard transitionOrchestrator(h, osValidate)
       continue
     let tName = action{"tool"}.getStr("none")
     var toolRes = ToolResult(ok: true, payload: newJObject(), receipt: "none", message: "no-op")
@@ -2318,8 +2953,10 @@ proc executeStep(h: TaskHandle) {.async.} =
       pruneSigma(candSigma)
     let (postOk, postErrs) = validateSigma(candSigma)
     if not postOk:
-      lastErrReport = %*{"error": postErrs.join("; "), "stage": "post_tool_state_validation"}
+      lastErrReport = %*{"stage": "post_tool_state_validation", "errors": postErrs, "attempt": attempt}
+      discard transitionOrchestrator(h, osValidate)
       continue
+    discard transitionOrchestrator(h, osValidate)
     var nextObs = %*{"step": step, "tool": tName, "ok": toolRes.ok, "message": toolRes.message,
                      "payload": toolRes.payload, "receipt": toolRes.receipt, "latency_ms": latency}
     acquire(h.lock)
@@ -2328,20 +2965,30 @@ proc executeStep(h: TaskHandle) {.async.} =
     h.sigma = candSigma
     h.obs = nextObs
     if (termReq or tName == "finish") and h.status == "running": h.status = "verifying"
+    let statusAfter = h.status
     release(h.lock)
     committed = true
     let skillUsed = if skills.len > 0: getStr(skills[0], "skill_id") else: ""
     h.logRawTrace(skillUsed, preSigma, action, nextObs, delta, candSigma, %*{"receipt": toolRes.receipt}, toolRes.ok, latency)
-    h.checkpoint(action, delta, %*{"receipt": toolRes.receipt, "ok": toolRes.ok})
-    h.emit(%*{"type": "step", "task_id": h.taskId, "step": step, "sigma": candSigma, "obs": nextObs, "action": action})
+    h.checkpoint(action, delta, %*{"receipt": toolRes.receipt, "ok": toolRes.ok, "attempt": attempt})
+    h.emit(%*{"type": "step", "task_id": h.taskId, "step": step, "sigma": candSigma, "obs": nextObs, "action": action, "validation_attempt": attempt})
+    if statusAfter == "running": discard transitionOrchestrator(h, osPerceive)
   if not committed:
     acquire(h.lock)
     h.status = "failed"
     h.terminalReason = "max retry attempts exhausted on validation error"
     h.stopRequested = true
-    h.obs = lastErrReport
+    h.obs = %*{"step": step, "status": "validation_failed", "validation_feedback": lastErrReport}
     release(h.lock)
-    h.checkpoint(newJObject(), newJObject(), lastErrReport)
+    acquire(h.lock)
+    let failState = h.orchestratorState
+    release(h.lock)
+    if failState == osAct: discard transitionOrchestrator(h, osValidate)
+    discard transitionOrchestrator(h, osReflect)
+    h.emit(%*{"type": "validation_failed", "task_id": h.taskId, "step": step, "validation_feedback": lastErrReport})
+
+proc executeStep(h: TaskHandle) {.async.} =
+  await transitionEngine.execute(h)
 
 proc executeMicroAction(h: TaskHandle): Future[bool] {.async.} =
   if not tryBeginTransition(h): return false
@@ -2357,7 +3004,18 @@ proc executeMicroAction(h: TaskHandle): Future[bool] {.async.} =
     h.sigma["system1"]["queued_actions"].delete(0)
     inc h.stepIndex
     let step = h.stepIndex
+    let stateAtStart = h.orchestratorState
     release(h.lock)
+    case stateAtStart
+    of osPerceive:
+      discard transitionOrchestrator(h, osDeliberate)
+      discard transitionOrchestrator(h, osAct)
+    of osDeliberate:
+      discard transitionOrchestrator(h, osAct)
+    of osValidate:
+      discard transitionOrchestrator(h, osAct)
+    else:
+      discard
     let tName = microAction{"tool"}.getStr("none")
     var tArgs = microAction{"args"}
     if tArgs == nil or tArgs.kind != JObject: tArgs = newJObject()
@@ -2372,9 +3030,11 @@ proc executeMicroAction(h: TaskHandle): Future[bool] {.async.} =
         try: toolRes = await toolRegistry[tName].handler(h.tenantId, tArgs)
         except CatchableError as e: toolRes = ToolResult(ok: false, payload: newJObject(), receipt: "error", message: e.msg)
     let latency = int((getMonoTime() - startTime).inMilliseconds)
+    discard transitionOrchestrator(h, osValidate)
     var obs = %*{"step": step, "tool": tName, "ok": toolRes.ok, "message": toolRes.message,
                  "payload": toolRes.payload, "receipt": toolRes.receipt, "latency_ms": latency, "micro": true}
     acquire(h.lock)
+    if h.obs.hasKey("operator_message"): obs["operator_message"] = copy(h.obs["operator_message"])
     if not toolRes.ok:
       var blockers = if h.sigma.hasKey("blockers") and h.sigma["blockers"].kind == JArray: h.sigma["blockers"] else: newJArray()
       blockers.add(%*{"step": step, "reason": toolRes.message, "tool": tName, "at": nowF()})
@@ -2382,10 +3042,12 @@ proc executeMicroAction(h: TaskHandle): Future[bool] {.async.} =
       pruneSigma(h.sigma)
     h.obs = obs
     let postSigma = copy(h.sigma)
+    let statusAfter = h.status
     release(h.lock)
     h.logRawTrace("", preSigma, microAction, obs, newJObject(), postSigma, %*{"receipt": toolRes.receipt}, toolRes.ok, latency)
     h.checkpoint(microAction, newJObject(), %*{"receipt": toolRes.receipt, "micro": true, "ok": toolRes.ok})
     h.emit(%*{"type": "step", "task_id": h.taskId, "step": step, "sigma": postSigma, "obs": obs, "micro": true})
+    if statusAfter == "running": discard transitionOrchestrator(h, osPerceive)
     return true
   finally:
     endTransition(h)
@@ -2482,6 +3144,7 @@ proc createTask(tenantRow: Row, title: string, spec: JsonNode, maxSteps: int): T
   pruneSigma(sigma)
   let (stateOk, stateErrs) = validateSigma(sigma)
   if not stateOk: raise newException(ValueError, "invalid initial state: " & stateErrs.join("; "))
+  sigma["phase"] = %"perceive"
   let obs = %*{"step": 0, "status": "initialized", "message": "agent task launched"}
   let ts = nowF()
   let boundedMaxSteps = max(1, maxSteps)
@@ -2499,7 +3162,7 @@ proc createTask(tenantRow: Row, title: string, spec: JsonNode, maxSteps: int): T
   result = TaskHandle(taskId: taskId, tenantId: tid, title: title, spec: nSpec, sigma: sigma, obs: obs,
     stepIndex: 0, maxSteps: boundedMaxSteps, status: "queued", stopRequested: false, paused: false,
     transitionBusy: false, subscribers: @[], cognition: newJObject(), cognitionAt: 0.0,
-    allowedTools: allowedSet, verified: false, terminalReason: "", broadcastAttached: false)
+    allowedTools: allowedSet, verified: false, terminalReason: "", broadcastAttached: false, orchestratorState: osPerceive)
   initLock(result.lock)
   result.loopActive.store(false, moRelaxed)
   acquire(tasksLock)
@@ -2536,12 +3199,15 @@ proc restoreTask(taskId: string): TaskHandle =
     cogAt = getFloat(cogRows[0], "created_at", 0.0)
     cog = %*{"vector": vec, "gate": getFloat(cogRows[0], "gate", 0.5), "subgoal": getStr(cogRows[0], "subgoal"),
              "strategy": getStr(cogRows[0], "strategy"), "generated_at": cogAt}
+  let restoredSigma = getJson(r, "state_json")
+  let restoredOrchestratorState = parseOrchestratorState(restoredSigma{"phase"}.getStr("perceive"))
   result = TaskHandle(taskId: taskId, tenantId: tid, title: getStr(r, "title"), spec: getJson(r, "spec_json"),
-    sigma: getJson(r, "state_json"), obs: getJson(r, "latest_obs_json"),
+    sigma: restoredSigma, obs: getJson(r, "latest_obs_json"),
     stepIndex: getInt(r, "step_index").int, maxSteps: max(1, getInt(r, "max_steps", 1000).int),
     status: getStr(r, "status"), stopRequested: false, paused: false, transitionBusy: false, subscribers: @[],
     cognition: cog, cognitionAt: cogAt, allowedTools: allowedSet,
-    verified: getInt(r, "verified") == 1, terminalReason: getStr(r, "terminal_reason"), broadcastAttached: false)
+    verified: getInt(r, "verified") == 1, terminalReason: getStr(r, "terminal_reason"), broadcastAttached: false,
+    orchestratorState: restoredOrchestratorState)
   initLock(result.lock)
   result.loopActive.store(false, moRelaxed)
   acquire(tasksLock)
@@ -2616,66 +3282,76 @@ proc ensureDefaultTenant(): Row =
   for k, _ in toolRegistry: tArr.add(%k)
   let rows = store.query("SELECT * FROM tenants WHERE name='default'", @[])
   if rows.len > 0:
-    let existingTools = getJson(rows[0], "allowed_tools")
-    if existingTools.kind != JArray or existingTools.len == 0:
-      discard store.exec("UPDATE tenants SET allowed_tools=?, api_key_hash=? WHERE tenant_id=?",
-        @[%($tArr), %kh, %getStr(rows[0], "tenant_id")])
-      let refreshed = store.query("SELECT * FROM tenants WHERE tenant_id=?", @[%getStr(rows[0], "tenant_id")])
-      return refreshed[0]
-    if getStr(rows[0], "api_key_hash") != kh:
-      discard store.exec("UPDATE tenants SET api_key_hash=? WHERE tenant_id=?", @[%kh, %getStr(rows[0], "tenant_id")])
-      let refreshed = store.query("SELECT * FROM tenants WHERE tenant_id=?", @[%getStr(rows[0], "tenant_id")])
-      return refreshed[0]
-    return rows[0]
+    let tid = getStr(rows[0], "tenant_id")
+    discard store.exec("UPDATE tenants SET allowed_tools=?, api_key_hash=? WHERE tenant_id=?", @[%($tArr), %kh, %tid])
+    let refreshed = store.query("SELECT * FROM tenants WHERE tenant_id=?", @[%tid])
+    return refreshed[0]
   let tid = newId("tenant")
   discard store.exec(
-    "INSERT INTO tenants (tenant_id, name, api_key_hash, token_budget, tokens_used, allowed_tools, created_at) " &
-    "VALUES (?,?,?,?,0,?,?)",
+    "INSERT INTO tenants (tenant_id, name, api_key_hash, token_budget, tokens_used, allowed_tools, created_at) VALUES (?,?,?,?,0,?,?)",
     @[%tid, %"default", %kh, %TokenBudgetDefault, %($tArr), %nowF()])
   let fresh = store.query("SELECT * FROM tenants WHERE tenant_id=?", @[%tid])
   return fresh[0]
 
 proc seedDefaultSkills(tenantId: string) =
-  let rows = store.query("SELECT COUNT(*) AS n FROM skills WHERE tenant_id=?", @[%tenantId])
-  if rows.len > 0 and getInt(rows[0], "n") > 0: return
-  proc addSkill(name, domain, trigger, procedure: string) =
+  proc upsertSeed(name, domain, trigger, procedure, skillCode: string) =
+    let emb = embToJson(textEmbedding(name & " " & domain & " " & trigger & " " & procedure & " " & skillCode))
+    let existing = store.query("SELECT skill_id, skill_code FROM skills WHERE tenant_id=? AND name=?", @[%tenantId, %name])
+    if existing.len > 0:
+      if getStr(existing[0], "skill_code").strip().len == 0:
+        discard store.exec("UPDATE skills SET skill_code=?, embedding_json=?, updated_at=? WHERE skill_id=? AND tenant_id=?", @[%skillCode, %emb, %nowF(), %getStr(existing[0], "skill_id"), %tenantId])
+      return
     let sid = newId("skill")
-    let emb = embToJson(textEmbedding(name & " " & domain & " " & trigger & " " & procedure))
     discard store.exec(
-      "INSERT INTO skills (skill_id, tenant_id, name, domain, trigger_spec, procedure_spec, " &
-      "preconditions_json, postconditions_json, failure_modes_json, version, active, success_count, " &
-      "failure_count, reward, embedding_json, created_at, updated_at) " &
-      "VALUES (?,?,?,?,?,?,'[]','[]','[]',1,1,0,0,0.0,?,?,?)",
-      @[%sid, %tenantId, %name, %domain, %trigger, %procedure, %emb, %nowF(), %nowF()])
-  addSkill("filesystem_operations", "filesystem",
-           "task modifies or verifies files in workspace",
-           "1) list_dir to inspect workspace. 2) read_file or check_lines to establish ground truth. 3) write_file or append_file. 4) check_lines to confirm changes. 5) record paths into artifacts.")
-  addSkill("arithmetic_verification", "computation",
-           "numerical calculations or formula evaluation",
-           "Use math_eval to evaluate mathematical expressions deterministically without hallucination. Save answers to facts.")
-  addSkill("knowledge_retrieval", "memory",
-           "facts or patterns not present in working memory",
-           "1) memory_search wiki and skills. 2) Record atomic discoveries to facts. 3) If reusable workaround found, call memory_write to update playbook.")
+      "INSERT INTO skills (skill_id, tenant_id, name, domain, trigger_spec, procedure_spec, skill_code, preconditions_json, postconditions_json, failure_modes_json, version, active, success_count, failure_count, reward, embedding_json, created_at, updated_at) VALUES (?,?,?,?,?,?,?,'[]','[]','[]',1,1,0,0,0.0,?,?,?)",
+      @[%sid, %tenantId, %name, %domain, %trigger, %procedure, %skillCode, %emb, %nowF(), %nowF()])
+  upsertSeed(
+    "filesystem_operations", "filesystem", "task modifies or verifies files in workspace",
+    "Inspect the workspace, establish file ground truth, perform the smallest sandboxed mutation, then verify exact resulting content before declaring completion.",
+    "SKILL filesystem_operations\nWHEN workspace_file_change\nREQUIRE sandbox_path_valid\nSTEP inspect_before_mutation\nSTEP apply_atomic_file_operation\nVERIFY exact_file_postcondition\nRECOVER report_tool_failure_and_reinspect")
+  upsertSeed(
+    "arithmetic_verification", "computation", "numerical calculations or formula evaluation",
+    "Use the deterministic arithmetic parser for calculations and only persist a numerical fact after the parser succeeds.",
+    "SKILL arithmetic_verification\nWHEN numerical_expression_present\nREQUIRE expression_is_supported\nSTEP evaluate_with_math_eval\nVERIFY parser_result_is_successful\nRECOVER preserve_original_expression_and_report_error")
+  upsertSeed(
+    "knowledge_retrieval", "memory", "facts or reusable patterns are absent from working memory",
+    "Search experiential and Git-backed knowledge, record only relevant atomic discoveries, and consolidate a reusable procedure only after verification.",
+    "SKILL knowledge_retrieval\nWHEN required_fact_missing\nREQUIRE bounded_memory_query\nSTEP retrieve_ranked_memory\nSTEP validate_retrieved_evidence\nVERIFY fact_or_procedure_is_grounded\nRECOVER continue_without_unverified_memory")
 
 
-proc consolidateKnowledgeOnce() =
+proc consolidateKnowledgeOnce() {.async.} =
   let tenants = store.query("SELECT tenant_id FROM tenants", @[])
   for tr in tenants:
     let tenantId = getStr(tr, "tenant_id")
-    let refs = store.query("SELECT failure_point, pivot_action, attribution, patch_json, created_at FROM reflections WHERE tenant_id=? ORDER BY created_at DESC LIMIT 20", @[%tenantId])
-    if refs.len == 0: continue
-    var bodyParts: seq[string] = @[]
-    for r in refs:
-      bodyParts.add("Failure: " & getStr(r, "failure_point") & "\nAttribution: " & getStr(r, "attribution") & "\nPivot: " & getStr(r, "pivot_action") & "\nPatch: " & getStr(r, "patch_json"))
+    let refs = store.query("SELECT task_id, failure_point, pivot_action, attribution, patch_json, verifier_report_json, created_at FROM reflections WHERE tenant_id=? ORDER BY created_at DESC LIMIT 40", @[%tenantId])
+    let skills = store.query("SELECT name, domain, trigger_spec, procedure_spec, skill_code, reward, success_count, failure_count FROM skills WHERE tenant_id=? AND active=1 ORDER BY reward DESC LIMIT 32", @[%tenantId])
+    if refs.len > 0:
+      var evidence = newJArray()
+      for r in refs:
+        evidence.add(%*{"task_id": getStr(r, "task_id"), "failure_point": getStr(r, "failure_point"), "pivot_action": getStr(r, "pivot_action"), "attribution": getStr(r, "attribution"), "patch": getJson(r, "patch_json"), "verifier_report": getJson(r, "verifier_report_json")})
+      var active = newJArray()
+      for sk in skills:
+        active.add(%*{"name": getStr(sk, "name"), "domain": getStr(sk, "domain"), "trigger_spec": getStr(sk, "trigger_spec"), "procedure_spec": getStr(sk, "procedure_spec"), "skill_code": getStr(sk, "skill_code"), "reward": getFloat(sk, "reward"), "success_count": getInt(sk, "success_count"), "failure_count": getInt(sk, "failure_count")})
+      let policySignals = learnedPolicySignals(tenantId, canonical(evidence), 20)
+      let messages = %*[
+        {"role": "system", "content": "You are the knowledge-consolidation component of an autonomous agent. Synthesize causal failure patterns into a concise operational playbook. Do not concatenate logs. Identify recurring failure signatures, verified causes, reliable recovery procedures, caveats, deterministic verification steps, and anti-patterns. Only state patterns supported by the supplied evidence. Return Markdown text, not JSON.\n\n" & policySignals},
+        {"role": "user", "content": "REFLECTION EVIDENCE:\n" & boundUtf8Bytes(canonical(evidence), 114688) & "\n\nACTIVE SKILLS:\n" & boundUtf8Bytes(canonical(active), 65536)}
+      ]
+      try:
+        let resp = await callChatCompletionsAsync(messages, 6144, 0.2, false, false)
+        if chargeTokens(tenantId, "", resp.totalTokens) and resp.content.strip().len > 0:
+          discard commitKnowledgeDoc(tenantId, "verified-failure-patterns", "reflections", resp.content.strip())
+      except CatchableError:
+        discard
     try:
-      discard commitKnowledgeDoc(tenantId, "verified-failure-patterns", "reflections", bodyParts.join("\n\n---\n\n"))
+      discard await metaAgent.consider(tenantId)
     except CatchableError:
       discard
 
 proc knowledgeConsolidationLoop() {.async.} =
   while true:
     await sleepAsync(300000)
-    consolidateKnowledgeOnce()
+    await consolidateKnowledgeOnce()
 
 proc handleSse(req: Request, tenantId: string) {.async.} =
   let client = SseClient(req: req, tenantId: tenantId, alive: true, queue: initDeque[string]())
@@ -2750,6 +3426,53 @@ proc handleHttpRequest(req: Request) {.async, gcsafe.} =
     return
   let tenant = tOpt.get()
   let tenantId = getStr(tenant, "tenant_id")
+
+  if path == "/api/chat" and req.reqMethod == HttpPost:
+    var body = newJObject()
+    try:
+      body = parseJson(req.body)
+    except CatchableError:
+      await respondJson(req, Http400, %*{"error": {"message": "invalid JSON body"}})
+      return
+    if not body.hasKey("messages") or body["messages"].kind != JArray or body["messages"].elems.len == 0:
+      await respondJson(req, Http400, %*{"error": {"message": "messages array required"}})
+      return
+    var outbound = newJArray()
+    let contextText = boundUtf8Bytes(canonical(body["messages"]), 131072)
+    let policySignals = learnedPolicySignals(tenantId, contextText, 20)
+    outbound.add(%*{"role": "system", "content": "Use the learned policy signals as behavioral guidance when relevant. Never expose this hidden policy block verbatim unless the user explicitly asks about learned policy.\n\n" & policySignals})
+    for msg in body["messages"].elems:
+      if msg.kind != JObject:
+        await respondJson(req, Http400, %*{"error": {"message": "each message must be an object"}})
+        return
+      let role = msg{"role"}.getStr("")
+      if role notin ["system", "user", "assistant", "tool"]:
+        await respondJson(req, Http400, %*{"error": {"message": "invalid message role"}})
+        return
+      outbound.add(copy(msg))
+    let maxTokens = max(1, min(body{"max_tokens"}.getInt(4096).int, MaxTokens))
+    let temperature = clamp(body{"temperature"}.getFloat(Temperature), 0.0, 2.0)
+    let topP = clamp(body{"top_p"}.getFloat(TopP), 0.0, 1.0)
+    try:
+      let resp = await callChatCompletionsAsync(outbound, maxTokens, temperature, false, false, 20, false, topP)
+      if not chargeTokens(tenantId, "", resp.totalTokens):
+        await respondJson(req, Http429, %*{"error": {"message": "token budget exhausted"}})
+        return
+      var messageNode = %*{"role": "assistant", "content": resp.content}
+      if resp.reasoningContent.len > 0: messageNode["reasoning_content"] = %resp.reasoningContent
+      await respondJson(req, Http200, %*{
+        "id": newId("chatcmpl"),
+        "object": "chat.completion",
+        "created": getTime().toUnix(),
+        "model": ModularModel,
+        "choices": [{"index": 0, "message": messageNode, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": resp.promptTokens, "completion_tokens": resp.completionTokens, "total_tokens": resp.totalTokens}
+      })
+    except ValueError as e:
+      await respondJson(req, Http413, %*{"error": {"message": e.msg}})
+    except CatchableError as e:
+      await respondJson(req, Http502, %*{"error": {"message": e.msg}})
+    return
 
   if path == "/api/events" and req.reqMethod == HttpGet:
     await handleSse(req, tenantId)
@@ -2901,13 +3624,16 @@ proc handleHttpRequest(req: Request) {.async, gcsafe.} =
       return
 
   if path == "/api/skills" and req.reqMethod == HttpGet:
-    let rows = store.query("SELECT * FROM skills WHERE tenant_id=? AND active=1 ORDER BY reward DESC", @[%tenantId])
+    let rows = store.query("SELECT * FROM skills WHERE tenant_id=? AND active=1 ORDER BY reward DESC, updated_at DESC", @[%tenantId])
     var arr = newJArray()
     for r in rows:
       arr.add(%*{
         "skill_id": getStr(r, "skill_id"), "name": getStr(r, "name"), "domain": getStr(r, "domain"),
-        "trigger": getStr(r, "trigger_spec"), "procedure": getStr(r, "procedure_spec"),
-        "success_count": getInt(r, "success_count"), "reward": getFloat(r, "reward")
+        "trigger": getStr(r, "trigger_spec"), "trigger_spec": getStr(r, "trigger_spec"),
+        "procedure": getStr(r, "procedure_spec"), "procedure_spec": getStr(r, "procedure_spec"),
+        "skill_code": getStr(r, "skill_code"), "version": getInt(r, "version", 1),
+        "success_count": getInt(r, "success_count"), "failure_count": getInt(r, "failure_count"),
+        "reward": getFloat(r, "reward")
       })
     await respondJson(req, Http200, %*{"skills": arr})
     return
@@ -2919,95 +3645,27 @@ proc handleHttpRequest(req: Request) {.async, gcsafe.} =
     except CatchableError:
       await respondJson(req, Http400, %*{"error": "invalid JSON body"})
       return
-    let name = body{"name"}.getStr("")
-    let domain = body{"domain"}.getStr("general")
-    let trigger = body{"trigger"}.getStr("")
-    let procedure = body{"procedure"}.getStr("")
-    if name.len == 0 or procedure.len == 0:
-      await respondJson(req, Http400, %*{"error": "name and procedure required"})
+    var candidate = newJObject()
+    candidate["name"] = %body{"name"}.getStr("")
+    candidate["domain"] = %body{"domain"}.getStr("general")
+    candidate["trigger_spec"] = %body{"trigger_spec"}.getStr(body{"trigger"}.getStr(""))
+    candidate["procedure_spec"] = %body{"procedure_spec"}.getStr(body{"procedure"}.getStr(""))
+    candidate["skill_code"] = %body{"skill_code"}.getStr("")
+    candidate["preconditions"] = if body.hasKey("preconditions") and body["preconditions"].kind == JArray: copy(body["preconditions"]) else: newJArray()
+    candidate["postconditions"] = if body.hasKey("postconditions") and body["postconditions"].kind == JArray: copy(body["postconditions"]) else: newJArray()
+    candidate["failure_modes"] = if body.hasKey("failure_modes") and body["failure_modes"].kind == JArray: copy(body["failure_modes"]) else: newJArray()
+    if candidate{"name"}.getStr("").strip().len == 0 or candidate{"trigger_spec"}.getStr("").strip().len == 0 or
+       candidate{"procedure_spec"}.getStr("").strip().len == 0 or candidate{"skill_code"}.getStr("").strip().len == 0:
+      await respondJson(req, Http400, %*{"error": "name, trigger_spec, procedure_spec and skill_code are required"})
       return
-    acquire(skillGateLock)
-    if skillGateBusy:
-      release(skillGateLock)
-      await respondJson(req, Http409, %*{"error": "skill regression gate already running"})
-      return
-    skillGateBusy = true
-    release(skillGateLock)
-    var oldRows: seq[Row] = @[]
-    var mutationApplied = false
-    try:
-      let beforeReport = await runRegressionGate(tenantId)
-      oldRows = store.query("SELECT * FROM skills WHERE tenant_id=? AND name=?", @[%tenantId, %name])
-      let emb = embToJson(textEmbedding(name & " " & domain & " " & trigger & " " & procedure))
-      let preconditions = if body.hasKey("preconditions") and body["preconditions"].kind == JArray: canonical(body["preconditions"]) else: "[]"
-      let postconditions = if body.hasKey("postconditions") and body["postconditions"].kind == JArray: canonical(body["postconditions"]) else: "[]"
-      let failureModes = if body.hasKey("failure_modes") and body["failure_modes"].kind == JArray: canonical(body["failure_modes"]) else: "[]"
-      let ts = nowF()
-      var sid = ""
-      if oldRows.len > 0:
-        sid = getStr(oldRows[0], "skill_id")
-        discard store.exec(
-          "UPDATE skills SET domain=?, trigger_spec=?, procedure_spec=?, preconditions_json=?, postconditions_json=?, " &
-          "failure_modes_json=?, version=version+1, active=1, embedding_json=?, updated_at=? WHERE skill_id=? AND tenant_id=?",
-          @[%domain, %trigger, %procedure, %preconditions, %postconditions, %failureModes, %emb, %ts, %sid, %tenantId])
-      else:
-        sid = newId("skill")
-        discard store.exec(
-          "INSERT INTO skills (skill_id, tenant_id, name, domain, trigger_spec, procedure_spec, preconditions_json, " &
-          "postconditions_json, failure_modes_json, version, active, success_count, failure_count, reward, embedding_json, created_at, updated_at) " &
-          "VALUES (?,?,?,?,?,?,?,?,?,1,1,0,0,0.0,?,?,?)",
-          @[%sid, %tenantId, %name, %domain, %trigger, %procedure, %preconditions, %postconditions, %failureModes, %emb, %ts, %ts])
-      mutationApplied = true
-      let afterReport = await runRegressionGate(tenantId)
-      let beforeScore = beforeReport{"score"}.getFloat(0.0)
-      let afterScore = afterReport{"score"}.getFloat(0.0)
-      if afterScore + 1e-12 < beforeScore:
-        if oldRows.len > 0:
-          let old = oldRows[0]
-          discard store.exec(
-            "UPDATE skills SET name=?, domain=?, trigger_spec=?, procedure_spec=?, preconditions_json=?, postconditions_json=?, " &
-            "failure_modes_json=?, version=?, active=?, success_count=?, failure_count=?, reward=?, embedding_json=?, created_at=?, updated_at=? " &
-            "WHERE skill_id=? AND tenant_id=?",
-            @[%getStr(old, "name"), %getStr(old, "domain"), %getStr(old, "trigger_spec"), %getStr(old, "procedure_spec"),
-              %getStr(old, "preconditions_json", "[]"), %getStr(old, "postconditions_json", "[]"), %getStr(old, "failure_modes_json", "[]"),
-              %getInt(old, "version", 1), %getInt(old, "active", 1), %getInt(old, "success_count", 0), %getInt(old, "failure_count", 0),
-              %getFloat(old, "reward", 0.0), %getStr(old, "embedding_json", "[]"), %getFloat(old, "created_at", ts), %getFloat(old, "updated_at", ts),
-              %getStr(old, "skill_id"), %tenantId])
-        else:
-          discard store.exec("DELETE FROM skills WHERE skill_id=? AND tenant_id=?", @[%sid, %tenantId])
-        mutationApplied = false
-        await respondJson(req, Http409, %*{"error": "regression gate rejected skill patch", "before": beforeReport, "after": afterReport})
-        return
-      let activeRows = store.query("SELECT skill_id, version FROM skills WHERE tenant_id=? AND name=?", @[%tenantId, %name])
-      let finalSid = if activeRows.len > 0: getStr(activeRows[0], "skill_id", sid) else: sid
-      let finalVersion = if activeRows.len > 0: getInt(activeRows[0], "version", 1) else: 1
-      await respondJson(req, Http201, %*{"skill_id": finalSid, "version": finalVersion, "before": beforeReport, "after": afterReport})
-      return
-    except CatchableError as e:
-      if mutationApplied:
-        try:
-          let current = store.query("SELECT skill_id FROM skills WHERE tenant_id=? AND name=?", @[%tenantId, %name])
-          if oldRows.len > 0:
-            let old = oldRows[0]
-            discard store.exec(
-              "UPDATE skills SET name=?, domain=?, trigger_spec=?, procedure_spec=?, preconditions_json=?, postconditions_json=?, " &
-              "failure_modes_json=?, version=?, active=?, success_count=?, failure_count=?, reward=?, embedding_json=?, created_at=?, updated_at=? " &
-              "WHERE skill_id=? AND tenant_id=?",
-              @[%getStr(old, "name"), %getStr(old, "domain"), %getStr(old, "trigger_spec"), %getStr(old, "procedure_spec"),
-                %getStr(old, "preconditions_json", "[]"), %getStr(old, "postconditions_json", "[]"), %getStr(old, "failure_modes_json", "[]"),
-                %getInt(old, "version", 1), %getInt(old, "active", 1), %getInt(old, "success_count", 0), %getInt(old, "failure_count", 0),
-                %getFloat(old, "reward", 0.0), %getStr(old, "embedding_json", "[]"), %getFloat(old, "created_at", nowF()), %getFloat(old, "updated_at", nowF()),
-                %getStr(old, "skill_id"), %tenantId])
-          elif current.len > 0:
-            discard store.exec("DELETE FROM skills WHERE skill_id=? AND tenant_id=?", @[%getStr(current[0], "skill_id"), %tenantId])
-        except CatchableError:
-          discard
-      await respondJson(req, Http500, %*{"error": "skill regression gate failed", "detail": e.msg})
-      return
-    finally:
-      acquire(skillGateLock)
-      skillGateBusy = false
-      release(skillGateLock)
+    let validation = await validationGate.validateAndActivate(tenantId, candidate)
+    if validation{"accepted"}.getBool(false):
+      await respondJson(req, Http201, validation)
+    elif validation{"error"}.getStr("") == "validation gate busy":
+      await respondJson(req, Http409, validation)
+    else:
+      await respondJson(req, Http422, validation)
+    return
 
   if path == "/api/diagnostics/run" and req.reqMethod == HttpGet:
     let rep = await runRegressionGate(tenantId)
@@ -3036,8 +3694,11 @@ proc main() =
   store = openStore(DbFile)
   migrate(store)
   initTools()
+  registerReasonTool()
   let defaultTenant = ensureDefaultTenant()
-  seedDefaultSkills(getStr(defaultTenant, "tenant_id"))
+  let defaultTenantId = getStr(defaultTenant, "tenant_id")
+  seedDefaultSkills(defaultTenantId)
+  ensureDiagnosticSuite(defaultTenantId)
   resumePendingTasks()
   asyncCheck knowledgeConsolidationLoop()
   let server = newAsyncHttpServer(maxBody = 33_554_432)

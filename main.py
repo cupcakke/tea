@@ -1,110 +1,80 @@
-from __future__ import annotations
-
-import asyncio
-import base64
-import contextlib
-import hashlib
-import json
-import logging
-import math
 import os
-import re
-import secrets
-import shutil
-import signal
-import sqlite3
-import subprocess
 import sys
-import tempfile
-import threading
+import json
 import time
-import traceback
-import unicodedata
+import math
 import uuid
-from collections import defaultdict, deque
+import hmac
+import hashlib
+import base64
+import sqlite3
+import asyncio
+import logging
+import threading
+import subprocess
+import shutil
+import tempfile
+import re
+import struct
+import traceback
+import contextlib
 from dataclasses import dataclass, field, asdict
+from typing import Any, Dict, List, Optional, Tuple, Callable, Iterable, Set, Union
+from collections import defaultdict, OrderedDict
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import (
-    Any,
-    AsyncGenerator,
-    Awaitable,
-    Callable,
-    Dict,
-    Iterable,
-    List,
-    Optional,
-    Sequence,
-    Set,
-    Tuple,
-    Union,
-)
 
-from fastapi import (
-    Depends,
-    FastAPI,
-    Header,
-    HTTPException,
-    Query,
-    Request,
-    Response,
-    WebSocket,
-    WebSocketDisconnect,
-    status,
-)
+from fastapi import FastAPI, HTTPException, Depends, Request, Header, WebSocket, WebSocketDisconnect, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import (
-    FileResponse,
-    HTMLResponse,
-    JSONResponse,
-    PlainTextResponse,
-    StreamingResponse,
-)
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
+import uvicorn
+
 from openai import OpenAI
+
 
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)-28s | %(message)s"
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format=LOG_FORMAT, stream=sys.stdout)
-LOG = logging.getLogger("agent.runtime")
+log = logging.getLogger("agent.runtime")
 
-ROOT_DIR = Path(os.environ.get("AGENT_ROOT", Path(__file__).resolve().parent)).resolve()
-DATA_DIR = Path(os.environ.get("AGENT_DATA_DIR", ROOT_DIR / "agent_data")).resolve()
-WORKSPACE_ROOT = Path(os.environ.get("AGENT_WORKSPACE", DATA_DIR / "workspaces")).resolve()
-WIKI_ROOT = Path(os.environ.get("AGENT_WIKI", DATA_DIR / "wiki")).resolve()
-SKILL_ROOT = Path(os.environ.get("AGENT_SKILLS", DATA_DIR / "skills")).resolve()
-DB_PATH = Path(os.environ.get("AGENT_DB", DATA_DIR / "runtime.sqlite3")).resolve()
-STATIC_INDEX = Path(os.environ.get("AGENT_INDEX_HTML", ROOT_DIR / "index.html")).resolve()
 
-for _d in (DATA_DIR, WORKSPACE_ROOT, WIKI_ROOT, SKILL_ROOT):
-    _d.mkdir(parents=True, exist_ok=True)
+BASE_DIR = Path(os.environ.get("AGENT_HOME", Path.cwd() / ".agent_runtime")).resolve()
+DB_PATH = BASE_DIR / "runtime.db"
+WORKSPACE_ROOT = BASE_DIR / "workspaces"
+WIKI_ROOT = BASE_DIR / "wiki"
+SKILL_ROOT = BASE_DIR / "skills"
+TRACE_ROOT = BASE_DIR / "traces"
+DISTILL_ROOT = BASE_DIR / "distill"
+STATIC_ROOT = Path(os.environ.get("AGENT_STATIC", Path.cwd())).resolve()
 
+for _p in (BASE_DIR, WORKSPACE_ROOT, WIKI_ROOT, SKILL_ROOT, TRACE_ROOT, DISTILL_ROOT):
+    _p.mkdir(parents=True, exist_ok=True)
+
+
+MODEL_NAME = os.environ.get("AGENT_MODEL", "zai-org/glm-5.3")
 MODEL_BASE_URL = os.environ.get("MODULAR_BASE_URL", "https://api.modular.com/v1")
-MODEL_NAME = os.environ.get("MODULAR_MODEL", "zai-org/glm-5.3")
 MODEL_API_KEY = os.environ.get("MODULAR_API_KEY", "")
-MODEL_TEMPERATURE = float(os.environ.get("MODEL_TEMPERATURE", "0.96"))
-MODEL_TOP_P = float(os.environ.get("MODEL_TOP_P", "1"))
-MODEL_MAX_TOKENS = int(os.environ.get("MODEL_MAX_TOKENS", "100000"))
-MODEL_FREQUENCY_PENALTY = float(os.environ.get("MODEL_FREQUENCY_PENALTY", "0.8"))
-MODEL_PRESENCE_PENALTY = float(os.environ.get("MODEL_PRESENCE_PENALTY", "0.5"))
-MODEL_SEED = int(os.environ.get("MODEL_SEED", "1234"))
+MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "100000"))
+TEMPERATURE = float(os.environ.get("AGENT_TEMPERATURE", "0.96"))
+TOP_P = float(os.environ.get("AGENT_TOP_P", "1"))
+FREQUENCY_PENALTY = float(os.environ.get("AGENT_FREQ_PENALTY", "0.8"))
+PRESENCE_PENALTY = float(os.environ.get("AGENT_PRES_PENALTY", "0.5"))
+SEED = int(os.environ.get("AGENT_SEED", "1234"))
 
-SYSTEM2_HZ = float(os.environ.get("SYSTEM2_HZ", "1.0"))
-SYSTEM1_HZ = float(os.environ.get("SYSTEM1_HZ", "20.0"))
-COGNITION_K = int(os.environ.get("COGNITION_K", "8"))
-COGNITION_H = int(os.environ.get("COGNITION_H", "32"))
-MAX_STEP_RETRIES = int(os.environ.get("MAX_STEP_RETRIES", "3"))
-DEFAULT_TOKEN_BUDGET = int(os.environ.get("DEFAULT_TOKEN_BUDGET", "2000000"))
-DEFAULT_MAX_STEPS = int(os.environ.get("DEFAULT_MAX_STEPS", "160"))
-CHECKPOINT_EVERY = int(os.environ.get("CHECKPOINT_EVERY", "1"))
-ADMIN_TOKEN = os.environ.get("AGENT_ADMIN_TOKEN", "")
-ALLOW_SHELL = os.environ.get("AGENT_ALLOW_SHELL", "1") not in ("0", "false", "False")
-SHELL_TIMEOUT = int(os.environ.get("AGENT_SHELL_TIMEOUT", "60"))
-MAX_FILE_BYTES = int(os.environ.get("AGENT_MAX_FILE_BYTES", str(8 * 1024 * 1024)))
+SYSTEM1_HZ = float(os.environ.get("AGENT_SYSTEM1_HZ", "20"))
+SYSTEM2_HZ = float(os.environ.get("AGENT_SYSTEM2_HZ", "1"))
+COGNITION_K = int(os.environ.get("AGENT_COGNITION_K", "8"))
+COGNITION_H = int(os.environ.get("AGENT_COGNITION_H", "64"))
 EMBED_DIM = int(os.environ.get("AGENT_EMBED_DIM", "512"))
-RRF_K = int(os.environ.get("AGENT_RRF_K", "60"))
-GIT_ENABLED = shutil.which("git") is not None
+
+DEFAULT_STEP_BUDGET = int(os.environ.get("AGENT_STEP_BUDGET", "512"))
+DEFAULT_TOKEN_BUDGET = int(os.environ.get("AGENT_TOKEN_BUDGET", "4000000"))
+DEFAULT_WALL_BUDGET_S = int(os.environ.get("AGENT_WALL_BUDGET", "86400"))
+
+SIGNING_SECRET = os.environ.get("AGENT_SIGNING_SECRET", "modular-agent-runtime-signing-key")
+ADMIN_TOKEN = os.environ.get("AGENT_ADMIN_TOKEN", "admin-local-token")
 
 
 def utcnow() -> datetime:
@@ -116,24 +86,33 @@ def iso(dt: Optional[datetime] = None) -> str:
 
 
 def new_id(prefix: str) -> str:
-    return f"{prefix}_{uuid.uuid4().hex}"
+    return f"{prefix}_{uuid.uuid4().hex[:20]}"
 
 
 def stable_hash(payload: Any) -> str:
-    raw = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    raw = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
-def jdump(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+def sign_payload(payload: Any) -> str:
+    raw = json.dumps(payload, sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")
+    return hmac.new(SIGNING_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
 
 
-def jload(raw: Optional[str], default: Any = None) -> Any:
-    if raw is None or raw == "":
+def verify_signature(payload: Any, signature: str) -> bool:
+    return hmac.compare_digest(sign_payload(payload), signature or "")
+
+
+def jdump(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def jload(text: Optional[str], default: Any = None) -> Any:
+    if text is None or text == "":
         return default
     try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+        return json.loads(text)
+    except Exception:
         return default
 
 
@@ -147,804 +126,476 @@ def approx_tokens(text: str) -> int:
     return max(1, int(len(text) / 3.6))
 
 
+class SQLiteStore:
+    def __init__(self, path: Path):
+        self.path = path
+        self._local = threading.local()
+        self._write_lock = threading.RLock()
+        self._init_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.path), timeout=60.0, isolation_level=None, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=60000")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        return conn
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        c = getattr(self._local, "conn", None)
+        if c is None:
+            c = self._connect()
+            self._local.conn = c
+        return c
+
+    @contextlib.contextmanager
+    def tx(self):
+        with self._write_lock:
+            c = self.conn
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                yield c
+                c.execute("COMMIT")
+            except Exception:
+                try:
+                    c.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+
+    def query(self, sql: str, params: Iterable[Any] = ()) -> List[sqlite3.Row]:
+        cur = self.conn.execute(sql, tuple(params))
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+
+    def one(self, sql: str, params: Iterable[Any] = ()) -> Optional[sqlite3.Row]:
+        rows = self.query(sql, params)
+        return rows[0] if rows else None
+
+    def execute(self, sql: str, params: Iterable[Any] = ()) -> None:
+        with self.tx() as c:
+            c.execute(sql, tuple(params))
+
+    def executemany(self, sql: str, seq: Iterable[Iterable[Any]]) -> None:
+        with self.tx() as c:
+            c.executemany(sql, [tuple(x) for x in seq])
+
+    def _init_schema(self) -> None:
+        ddl = """
+        CREATE TABLE IF NOT EXISTS tenants (
+            tenant_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            api_key_hash TEXT NOT NULL,
+            token_budget INTEGER NOT NULL DEFAULT 4000000,
+            tokens_used INTEGER NOT NULL DEFAULT 0,
+            allowed_tools TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS conversations (
+            conversation_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(tenant_id) REFERENCES tenants(tenant_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_conv_tenant ON conversations(tenant_id, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS messages (
+            message_id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            tenant_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            meta TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conversation_id, seq ASC);
+
+        CREATE TABLE IF NOT EXISTS runs (
+            run_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            conversation_id TEXT,
+            spec TEXT NOT NULL,
+            status TEXT NOT NULL,
+            step INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finished_at TEXT,
+            terminal_state TEXT,
+            verdict TEXT,
+            tokens_used INTEGER NOT NULL DEFAULT 0,
+            wall_ms INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            lease_owner TEXT,
+            lease_expires_at TEXT,
+            resume_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_runs_tenant ON runs(tenant_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS checkpoints (
+            checkpoint_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            tenant_id TEXT NOT NULL,
+            step INTEGER NOT NULL,
+            node TEXT NOT NULL,
+            sigma TEXT NOT NULL,
+            observation TEXT NOT NULL DEFAULT '{}',
+            pending TEXT NOT NULL DEFAULT '{}',
+            digest TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_ckpt_run_step ON checkpoints(run_id, step, node);
+        CREATE INDEX IF NOT EXISTS idx_ckpt_run ON checkpoints(run_id, step DESC);
+
+        CREATE TABLE IF NOT EXISTS raw_traces (
+            trace_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            tenant_id TEXT NOT NULL,
+            step INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            skill_id TEXT,
+            pre_state TEXT NOT NULL DEFAULT '{}',
+            action TEXT NOT NULL DEFAULT '{}',
+            outcome TEXT NOT NULL DEFAULT '{}',
+            state_delta TEXT NOT NULL DEFAULT '{}',
+            receipt TEXT NOT NULL DEFAULT '{}',
+            success INTEGER NOT NULL DEFAULT 0,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            digest TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_trace_run ON raw_traces(run_id, step ASC);
+        CREATE INDEX IF NOT EXISTS idx_trace_skill ON raw_traces(skill_id, success);
+
+        CREATE TABLE IF NOT EXISTS working_memory (
+            wm_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            tenant_id TEXT NOT NULL,
+            progress TEXT NOT NULL DEFAULT '[]',
+            open_goals TEXT NOT NULL DEFAULT '[]',
+            dependencies TEXT NOT NULL DEFAULT '[]',
+            constraints TEXT NOT NULL DEFAULT '[]',
+            facts TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_wm_run ON working_memory(run_id);
+
+        CREATE TABLE IF NOT EXISTS skills (
+            skill_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1,
+            category TEXT NOT NULL DEFAULT 'general',
+            summary TEXT NOT NULL,
+            preconditions TEXT NOT NULL DEFAULT '[]',
+            procedure TEXT NOT NULL DEFAULT '[]',
+            failure_modes TEXT NOT NULL DEFAULT '[]',
+            tags TEXT NOT NULL DEFAULT '[]',
+            embedding BLOB,
+            uses INTEGER NOT NULL DEFAULT 0,
+            successes INTEGER NOT NULL DEFAULT 0,
+            failures INTEGER NOT NULL DEFAULT 0,
+            score REAL NOT NULL DEFAULT 0.5,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_skill_tenant ON skills(tenant_id, status);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(
+            skill_id UNINDEXED,
+            tenant_id UNINDEXED,
+            name,
+            summary,
+            procedure,
+            tags,
+            tokenize='porter unicode61'
+        );
+
+        CREATE TABLE IF NOT EXISTS skill_patches (
+            patch_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            target_skill_id TEXT,
+            component TEXT NOT NULL,
+            diagnosis TEXT NOT NULL,
+            proposal TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'proposed',
+            gate_report TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            decided_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_patch_status ON skill_patches(status, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS wiki_pages (
+            page_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            title TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'general',
+            body TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1,
+            embedding BLOB,
+            updated_at TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_wiki_slug ON wiki_pages(tenant_id, slug);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS wiki_fts USING fts5(
+            page_id UNINDEXED,
+            tenant_id UNINDEXED,
+            title,
+            body,
+            category,
+            tokenize='porter unicode61'
+        );
+
+        CREATE TABLE IF NOT EXISTS wiki_revisions (
+            revision_id TEXT PRIMARY KEY,
+            page_id TEXT NOT NULL,
+            tenant_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            diff TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_wikirev_page ON wiki_revisions(page_id, version DESC);
+
+        CREATE TABLE IF NOT EXISTS reflection_patches (
+            reflection_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            tenant_id TEXT NOT NULL,
+            verdict TEXT NOT NULL,
+            failure_points TEXT NOT NULL DEFAULT '[]',
+            pivot_actions TEXT NOT NULL DEFAULT '[]',
+            patch_text TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_refl_run ON reflection_patches(run_id);
+
+        CREATE TABLE IF NOT EXISTS distill_samples (
+            sample_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            tenant_id TEXT NOT NULL,
+            step INTEGER NOT NULL,
+            student_prompt TEXT NOT NULL,
+            teacher_prompt TEXT NOT NULL,
+            action_text TEXT NOT NULL,
+            student_logprobs TEXT NOT NULL DEFAULT '[]',
+            teacher_logprobs TEXT NOT NULL DEFAULT '[]',
+            tokens TEXT NOT NULL DEFAULT '[]',
+            reverse_kl REAL NOT NULL DEFAULT 0.0,
+            advantage REAL NOT NULL DEFAULT 0.0,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_distill_run ON distill_samples(run_id, step ASC);
+
+        CREATE TABLE IF NOT EXISTS policy_weights (
+            weight_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            feature TEXT NOT NULL,
+            weight REAL NOT NULL DEFAULT 0.0,
+            updates INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pw ON policy_weights(tenant_id, feature);
+
+        CREATE TABLE IF NOT EXISTS cognition_tokens (
+            cog_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            tenant_id TEXT NOT NULL,
+            step INTEGER NOT NULL,
+            vector BLOB NOT NULL,
+            gate REAL NOT NULL DEFAULT 1.0,
+            subgoal TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            created_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_cog_run ON cognition_tokens(run_id, step DESC);
+
+        CREATE TABLE IF NOT EXISTS diagnostic_tasks (
+            task_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            spec TEXT NOT NULL,
+            verifier TEXT NOT NULL,
+            baseline_score REAL NOT NULL DEFAULT 0.0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS audit_log (
+            audit_id TEXT PRIMARY KEY,
+            tenant_id TEXT,
+            run_id TEXT,
+            actor TEXT NOT NULL,
+            action TEXT NOT NULL,
+            detail TEXT NOT NULL DEFAULT '{}',
+            allowed INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_log(tenant_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS events (
+            event_id TEXT PRIMARY KEY,
+            run_id TEXT,
+            tenant_id TEXT,
+            conversation_id TEXT,
+            kind TEXT NOT NULL,
+            payload TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            seq INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, seq ASC);
+        CREATE INDEX IF NOT EXISTS idx_events_conv ON events(conversation_id, seq ASC);
+
+        CREATE TABLE IF NOT EXISTS counters (
+            name TEXT PRIMARY KEY,
+            value INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS file_index (
+            file_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            run_id TEXT,
+            rel_path TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            bytes INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_file_path ON file_index(tenant_id, rel_path);
+        """
+        with self._write_lock:
+            c = self.conn
+            c.executescript(ddl)
+
+    def next_seq(self, name: str) -> int:
+        with self.tx() as c:
+            c.execute("INSERT INTO counters(name, value) VALUES(?, 0) ON CONFLICT(name) DO NOTHING", (name,))
+            c.execute("UPDATE counters SET value = value + 1 WHERE name = ?", (name,))
+            row = c.execute("SELECT value FROM counters WHERE name = ?", (name,)).fetchone()
+            return int(row[0])
+
+    def list_policy_hints(self, tenant_id: str, limit: int = 24) -> List[Dict[str, Any]]:
+        rows = self.query(
+            "SELECT feature, weight, updates, updated_at FROM policy_weights WHERE tenant_id = ? AND weight > 0 ORDER BY weight DESC, updates DESC LIMIT ?",
+            (tenant_id, int(limit)),
+        )
+        return [dict(row) for row in rows]
+
+
+STORE = SQLiteStore(DB_PATH)
+
+
+def pack_vector(vec: List[float]) -> bytes:
+    return struct.pack(f"<{len(vec)}f", *vec)
+
+
+def unpack_vector(blob: Optional[bytes]) -> List[float]:
+    if not blob:
+        return []
+    n = len(blob) // 4
+    return list(struct.unpack(f"<{n}f", blob[: n * 4]))
+
+
 TOKEN_RE = re.compile(r"[a-z0-9_]+")
-_STOPWORDS = {
-    "the", "a", "an", "and", "or", "of", "to", "in", "is", "it", "for", "on", "with",
-    "that", "this", "be", "as", "are", "was", "were", "by", "at", "from", "but", "not",
-    "we", "you", "i", "he", "she", "they", "if", "then", "than", "so", "do", "does",
-}
 
 
 def tokenize(text: str) -> List[str]:
-    normalized = unicodedata.normalize("NFKD", (text or "").lower())
-    return [t for t in TOKEN_RE.findall(normalized) if t not in _STOPWORDS and len(t) > 1]
+    return TOKEN_RE.findall((text or "").lower())
 
 
-def hashed_embedding(text: str, dim: int = EMBED_DIM) -> List[float]:
-    vec = [0.0] * dim
-    toks = tokenize(text)
-    if not toks:
+class HashingEmbedder:
+    def __init__(self, dim: int = EMBED_DIM):
+        self.dim = dim
+
+    def _hash(self, token: str, salt: int) -> int:
+        h = hashlib.blake2b(token.encode("utf-8"), digest_size=8, key=struct.pack("<I", salt)).digest()
+        return struct.unpack("<Q", h)[0]
+
+    def embed(self, text: str) -> List[float]:
+        vec = [0.0] * self.dim
+        toks = tokenize(text)
+        if not toks:
+            return vec
+        counts: Dict[str, int] = defaultdict(int)
+        for t in toks:
+            counts[t] += 1
+        for i in range(len(toks) - 1):
+            counts[toks[i] + "_" + toks[i + 1]] += 1
+        for tok, cnt in counts.items():
+            for salt in (11, 29):
+                hv = self._hash(tok, salt)
+                idx = hv % self.dim
+                sign = 1.0 if ((hv >> 33) & 1) == 0 else -1.0
+                vec[idx] += sign * (1.0 + math.log(cnt))
+        norm = math.sqrt(sum(v * v for v in vec))
+        if norm > 0:
+            vec = [v / norm for v in vec]
         return vec
-    counts: Dict[str, int] = defaultdict(int)
-    for t in toks:
-        counts[t] += 1
-    for tok, cnt in counts.items():
-        digest = hashlib.blake2b(tok.encode("utf-8"), digest_size=8).digest()
-        idx = int.from_bytes(digest[:4], "little") % dim
-        sign = 1.0 if digest[4] & 1 else -1.0
-        vec[idx] += sign * (1.0 + math.log(cnt))
-    norm = math.sqrt(sum(v * v for v in vec))
-    if norm > 0:
-        vec = [v / norm for v in vec]
-    return vec
+
+    @staticmethod
+    def cosine(a: List[float], b: List[float]) -> float:
+        if not a or not b:
+            return 0.0
+        n = min(len(a), len(b))
+        dot = 0.0
+        na = 0.0
+        nb = 0.0
+        for i in range(n):
+            dot += a[i] * b[i]
+            na += a[i] * a[i]
+            nb += b[i] * b[i]
+        if na <= 0 or nb <= 0:
+            return 0.0
+        return dot / (math.sqrt(na) * math.sqrt(nb))
 
 
-def cosine(a: Sequence[float], b: Sequence[float]) -> float:
-    if not a or not b:
-        return 0.0
-    n = min(len(a), len(b))
-    dot = 0.0
-    na = 0.0
-    nb = 0.0
-    for i in range(n):
-        dot += a[i] * b[i]
-        na += a[i] * a[i]
-        nb += b[i] * b[i]
-    if na <= 0 or nb <= 0:
-        return 0.0
-    return dot / math.sqrt(na * nb)
+EMBEDDER = HashingEmbedder(EMBED_DIM)
 
 
-def encode_vector(vec: Sequence[float]) -> str:
-    return base64.b64encode(json.dumps([round(float(v), 6) for v in vec]).encode("utf-8")).decode("ascii")
+def fts_escape(query: str) -> str:
+    toks = tokenize(query)
+    toks = [t for t in toks if len(t) > 1][:24]
+    if not toks:
+        return ""
+    return " OR ".join(f'"{t}"' for t in toks)
 
 
-def decode_vector(raw: Optional[str]) -> List[float]:
-    if not raw:
-        return []
-    try:
-        return list(json.loads(base64.b64decode(raw.encode("ascii")).decode("utf-8")))
-    except Exception:
-        return []
-
-
-def reciprocal_rank_fusion(rankings: Sequence[Sequence[str]], k: int = RRF_K) -> List[Tuple[str, float]]:
+def reciprocal_rank_fusion(rankings: List[List[str]], k: float = 60.0, weights: Optional[List[float]] = None) -> List[Tuple[str, float]]:
     scores: Dict[str, float] = defaultdict(float)
-    for ranking in rankings:
-        for rank, ident in enumerate(ranking):
-            scores[ident] += 1.0 / (k + rank + 1)
+    for i, ranking in enumerate(rankings):
+        w = weights[i] if weights and i < len(weights) else 1.0
+        for rank, key in enumerate(ranking):
+            scores[key] += w * (1.0 / (k + rank + 1.0))
     return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
 
 
-def sinusoidal_staleness(seconds: float, dims: int = 8) -> List[float]:
-    out: List[float] = []
-    value = max(0.0, float(seconds))
-    for i in range(dims // 2):
-        freq = 1.0 / (10000.0 ** (2 * i / max(1, dims)))
-        out.append(math.sin(value * freq))
-        out.append(math.cos(value * freq))
-    return [round(v, 6) for v in out[:dims]]
-
-
-class RunState(str, Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    PAUSED = "paused"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-    RECOVERING = "recovering"
-
-
-class NodeKind(str, Enum):
-    PERCEIVE = "perceive"
-    DELIBERATE = "deliberate"
-    ACT = "act"
-    VALIDATE = "validate"
-    REFLECT = "reflect"
-    CONSOLIDATE = "consolidate"
-    TERMINAL = "terminal"
-
-
-class ToolRisk(str, Enum):
-    SAFE = "safe"
-    GUARDED = "guarded"
-    PRIVILEGED = "privileged"
-
-
-DELETE_SENTINEL = "__DELETE__"
-
-
-class SchemaError(ValueError):
+class SecurityError(Exception):
     pass
 
 
-class ValidationRejected(Exception):
-    def __init__(self, reasons: List[str]) -> None:
-        super().__init__("; ".join(reasons))
-        self.reasons = reasons
+class ValidationError(Exception):
+    pass
 
 
 class BudgetExceeded(Exception):
     pass
 
 
-class AuthorizationDenied(Exception):
+class ToolDenied(Exception):
     pass
-
-
-@dataclass
-class ProcedureSpec:
-    spec_id: str
-    tenant_id: str
-    title: str
-    objective: str
-    constraints: List[str] = field(default_factory=list)
-    success_criteria: List[str] = field(default_factory=list)
-    allowed_tools: List[str] = field(default_factory=list)
-    max_steps: int = DEFAULT_MAX_STEPS
-    token_budget: int = DEFAULT_TOKEN_BUDGET
-    verifier_program: Optional[str] = None
-    created_at: str = field(default_factory=iso)
-
-    def frozen_view(self) -> Dict[str, Any]:
-        return {
-            "spec_id": self.spec_id,
-            "title": self.title,
-            "objective": self.objective,
-            "constraints": list(self.constraints),
-            "success_criteria": list(self.success_criteria),
-            "allowed_tools": sorted(set(self.allowed_tools)),
-            "max_steps": self.max_steps,
-        }
-
-    def to_row(self) -> Dict[str, Any]:
-        return {
-            "spec_id": self.spec_id,
-            "tenant_id": self.tenant_id,
-            "title": self.title,
-            "objective": self.objective,
-            "constraints": jdump(self.constraints),
-            "success_criteria": jdump(self.success_criteria),
-            "allowed_tools": jdump(self.allowed_tools),
-            "max_steps": self.max_steps,
-            "token_budget": self.token_budget,
-            "verifier_program": self.verifier_program or "",
-            "created_at": self.created_at,
-        }
-
-    @staticmethod
-    def from_row(row: sqlite3.Row) -> "ProcedureSpec":
-        return ProcedureSpec(
-            spec_id=row["spec_id"],
-            tenant_id=row["tenant_id"],
-            title=row["title"],
-            objective=row["objective"],
-            constraints=jload(row["constraints"], []) or [],
-            success_criteria=jload(row["success_criteria"], []) or [],
-            allowed_tools=jload(row["allowed_tools"], []) or [],
-            max_steps=int(row["max_steps"]),
-            token_budget=int(row["token_budget"]),
-            verifier_program=row["verifier_program"] or None,
-            created_at=row["created_at"],
-        )
-
-
-STATE_TOP_KEYS = {
-    "phase",
-    "progress",
-    "subgoals",
-    "facts",
-    "artifacts",
-    "blockers",
-    "constraints_observed",
-    "next_intent",
-    "scratch",
-    "metrics",
-    "skill_hints",
-}
-
-
-@dataclass
-class ExecutionState:
-    phase: str = "bootstrap"
-    progress: float = 0.0
-    subgoals: List[Dict[str, Any]] = field(default_factory=list)
-    facts: Dict[str, Any] = field(default_factory=dict)
-    artifacts: Dict[str, Any] = field(default_factory=dict)
-    blockers: List[str] = field(default_factory=list)
-    constraints_observed: List[str] = field(default_factory=list)
-    next_intent: str = ""
-    scratch: Dict[str, Any] = field(default_factory=dict)
-    metrics: Dict[str, Any] = field(default_factory=dict)
-    skill_hints: List[str] = field(default_factory=list)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "phase": self.phase,
-            "progress": round(float(self.progress), 4),
-            "subgoals": self.subgoals,
-            "facts": self.facts,
-            "artifacts": self.artifacts,
-            "blockers": self.blockers,
-            "constraints_observed": self.constraints_observed,
-            "next_intent": self.next_intent,
-            "scratch": self.scratch,
-            "metrics": self.metrics,
-            "skill_hints": self.skill_hints,
-        }
-
-    @staticmethod
-    def from_dict(payload: Dict[str, Any]) -> "ExecutionState":
-        base = ExecutionState()
-        if not isinstance(payload, dict):
-            return base
-        base.phase = str(payload.get("phase", base.phase))
-        try:
-            base.progress = clamp(float(payload.get("progress", 0.0)), 0.0, 1.0)
-        except (TypeError, ValueError):
-            base.progress = 0.0
-        base.subgoals = payload.get("subgoals") if isinstance(payload.get("subgoals"), list) else []
-        base.facts = payload.get("facts") if isinstance(payload.get("facts"), dict) else {}
-        base.artifacts = payload.get("artifacts") if isinstance(payload.get("artifacts"), dict) else {}
-        base.blockers = [str(b) for b in payload.get("blockers", []) if isinstance(payload.get("blockers"), list)]
-        co = payload.get("constraints_observed")
-        base.constraints_observed = [str(c) for c in co] if isinstance(co, list) else []
-        base.next_intent = str(payload.get("next_intent", ""))
-        base.scratch = payload.get("scratch") if isinstance(payload.get("scratch"), dict) else {}
-        base.metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
-        sh = payload.get("skill_hints")
-        base.skill_hints = [str(s) for s in sh] if isinstance(sh, list) else []
-        return base
-
-    def compact(self, max_chars: int = 6000) -> Dict[str, Any]:
-        data = self.to_dict()
-        data["subgoals"] = data["subgoals"][:24]
-        data["blockers"] = data["blockers"][:12]
-        data["skill_hints"] = data["skill_hints"][:8]
-        text = jdump(data)
-        if len(text) <= max_chars:
-            return data
-        data["facts"] = _truncate_mapping(data["facts"], max_chars // 3)
-        data["artifacts"] = _truncate_mapping(data["artifacts"], max_chars // 4)
-        data["scratch"] = _truncate_mapping(data["scratch"], max_chars // 6)
-        return data
-
-
-def _truncate_mapping(mapping: Dict[str, Any], budget: int) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    used = 0
-    for key in sorted(mapping.keys()):
-        chunk = jdump({key: mapping[key]})
-        if used + len(chunk) > budget:
-            out["__truncated__"] = True
-            break
-        out[key] = mapping[key]
-        used += len(chunk)
-    return out
-
-
-@dataclass
-class Observation:
-    step: int
-    source: str
-    ok: bool
-    payload: Dict[str, Any] = field(default_factory=dict)
-    error: Optional[str] = None
-    latency_ms: int = 0
-    created_at: str = field(default_factory=iso)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "step": self.step,
-            "source": self.source,
-            "ok": self.ok,
-            "payload": self.payload,
-            "error": self.error,
-            "latency_ms": self.latency_ms,
-        }
-
-
-@dataclass
-class ActionCommand:
-    tool: str
-    arguments: Dict[str, Any] = field(default_factory=dict)
-    rationale_digest: str = ""
-    terminal: bool = False
-    final_answer: Optional[str] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "tool": self.tool,
-            "arguments": self.arguments,
-            "rationale_digest": self.rationale_digest,
-            "terminal": self.terminal,
-            "final_answer": self.final_answer,
-        }
-
-
-@dataclass
-class StepDecision:
-    delta: Dict[str, Any]
-    action: ActionCommand
-    reasoning_tokens: int
-    raw_len: int
-
-
-@dataclass
-class Skill:
-    skill_id: str
-    tenant_id: str
-    name: str
-    description: str
-    trigger_signature: str
-    procedure: List[str]
-    tools: List[str]
-    version: int = 1
-    success_count: int = 0
-    failure_count: int = 0
-    quarantined: int = 0
-    embedding: List[float] = field(default_factory=list)
-    updated_at: str = field(default_factory=iso)
-
-    @property
-    def reliability(self) -> float:
-        total = self.success_count + self.failure_count
-        if total == 0:
-            return 0.5
-        return (self.success_count + 1.0) / (total + 2.0)
-
-    def prompt_view(self) -> Dict[str, Any]:
-        return {
-            "skill_id": self.skill_id,
-            "name": self.name,
-            "when_to_use": self.trigger_signature,
-            "procedure": self.procedure[:12],
-            "tools": self.tools[:12],
-            "reliability": round(self.reliability, 3),
-            "version": self.version,
-        }
-
-    @staticmethod
-    def from_row(row: sqlite3.Row) -> "Skill":
-        return Skill(
-            skill_id=row["skill_id"],
-            tenant_id=row["tenant_id"],
-            name=row["name"],
-            description=row["description"],
-            trigger_signature=row["trigger_signature"],
-            procedure=jload(row["procedure"], []) or [],
-            tools=jload(row["tools"], []) or [],
-            version=int(row["version"]),
-            success_count=int(row["success_count"]),
-            failure_count=int(row["failure_count"]),
-            quarantined=int(row["quarantined"]),
-            embedding=decode_vector(row["embedding"]),
-            updated_at=row["updated_at"],
-        )
-
-
-@dataclass
-class ExecutionTrace:
-    trace_id: str
-    run_id: str
-    step: int
-    pre_state_digest: str
-    selected_skill: Optional[str]
-    tool: str
-    outcome: str
-    delta_digest: str
-    post_state_digest: str
-    receipt: Dict[str, Any]
-    created_at: str = field(default_factory=iso)
-
-
-@dataclass
-class ReflectionPatch:
-    patch_id: str
-    run_id: str
-    verdict: bool
-    failure_point: str
-    root_cause: str
-    pivot_actions: List[str]
-    memory_target: str
-    guidance: str
-    created_at: str = field(default_factory=iso)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "patch_id": self.patch_id,
-            "run_id": self.run_id,
-            "verdict": self.verdict,
-            "failure_point": self.failure_point,
-            "root_cause": self.root_cause,
-            "pivot_actions": self.pivot_actions,
-            "memory_target": self.memory_target,
-            "guidance": self.guidance,
-        }
-
-
-@dataclass
-class CognitionFrame:
-    frame_id: str
-    run_id: str
-    generated_at: float
-    tokens: List[List[float]]
-    gates: Dict[str, float]
-    subgoal: str
-    directive: str
-    horizon: int
-
-    def staleness(self, now: Optional[float] = None) -> float:
-        return max(0.0, (now if now is not None else time.time()) - self.generated_at)
-
-    def prompt_view(self, now: Optional[float] = None) -> Dict[str, Any]:
-        return {
-            "frame_id": self.frame_id,
-            "subgoal": self.subgoal,
-            "directive": self.directive,
-            "gates": {k: round(v, 4) for k, v in self.gates.items()},
-            "horizon": self.horizon,
-            "staleness_s": round(self.staleness(now), 3),
-            "staleness_encoding": sinusoidal_staleness(self.staleness(now)),
-            "cognition_digest": [round(sum(t) / max(1, len(t)), 5) for t in self.tokens[:COGNITION_K]],
-        }
-
-
-SCHEMA_SQL = """
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
-PRAGMA foreign_keys=ON;
-PRAGMA busy_timeout=15000;
-
-CREATE TABLE IF NOT EXISTS tenants (
-    tenant_id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    api_key_hash TEXT NOT NULL UNIQUE,
-    token_budget INTEGER NOT NULL DEFAULT 2000000,
-    tokens_used INTEGER NOT NULL DEFAULT 0,
-    allowed_risk TEXT NOT NULL DEFAULT 'guarded',
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS specs (
-    spec_id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    objective TEXT NOT NULL,
-    constraints TEXT NOT NULL,
-    success_criteria TEXT NOT NULL,
-    allowed_tools TEXT NOT NULL,
-    max_steps INTEGER NOT NULL,
-    token_budget INTEGER NOT NULL,
-    verifier_program TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_specs_tenant ON specs(tenant_id);
-
-CREATE TABLE IF NOT EXISTS runs (
-    run_id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
-    spec_id TEXT NOT NULL REFERENCES specs(spec_id) ON DELETE CASCADE,
-    conversation_id TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL,
-    node TEXT NOT NULL,
-    step INTEGER NOT NULL DEFAULT 0,
-    tokens_used INTEGER NOT NULL DEFAULT 0,
-    retries INTEGER NOT NULL DEFAULT 0,
-    state TEXT NOT NULL,
-    last_observation TEXT NOT NULL DEFAULT '{}',
-    final_answer TEXT NOT NULL DEFAULT '',
-    error TEXT NOT NULL DEFAULT '',
-    lease_owner TEXT NOT NULL DEFAULT '',
-    lease_expires_at REAL NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_runs_tenant ON runs(tenant_id, status);
-CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
-CREATE INDEX IF NOT EXISTS idx_runs_conv ON runs(conversation_id);
-
-CREATE TABLE IF NOT EXISTS checkpoints (
-    checkpoint_id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-    step INTEGER NOT NULL,
-    node TEXT NOT NULL,
-    state TEXT NOT NULL,
-    observation TEXT NOT NULL,
-    status TEXT NOT NULL,
-    tokens_used INTEGER NOT NULL,
-    digest TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_ckpt_run ON checkpoints(run_id, step);
-
-CREATE TABLE IF NOT EXISTS traces (
-    trace_id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
-    step INTEGER NOT NULL,
-    pre_state_digest TEXT NOT NULL,
-    selected_skill TEXT,
-    tool TEXT NOT NULL,
-    outcome TEXT NOT NULL,
-    delta_digest TEXT NOT NULL,
-    post_state_digest TEXT NOT NULL,
-    receipt TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_traces_run ON traces(run_id, step);
-CREATE INDEX IF NOT EXISTS idx_traces_outcome ON traces(outcome);
-
-CREATE TABLE IF NOT EXISTS skills (
-    skill_id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    description TEXT NOT NULL,
-    trigger_signature TEXT NOT NULL,
-    procedure TEXT NOT NULL,
-    tools TEXT NOT NULL,
-    version INTEGER NOT NULL DEFAULT 1,
-    success_count INTEGER NOT NULL DEFAULT 0,
-    failure_count INTEGER NOT NULL DEFAULT 0,
-    quarantined INTEGER NOT NULL DEFAULT 0,
-    embedding TEXT NOT NULL DEFAULT '',
-    updated_at TEXT NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_skills_unique ON skills(tenant_id, name);
-CREATE INDEX IF NOT EXISTS idx_skills_tenant ON skills(tenant_id, quarantined);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(
-    skill_id UNINDEXED,
-    tenant_id UNINDEXED,
-    text,
-    tokenize='porter unicode61'
-);
-
-CREATE TABLE IF NOT EXISTS skill_versions (
-    version_id TEXT PRIMARY KEY,
-    skill_id TEXT NOT NULL,
-    tenant_id TEXT NOT NULL,
-    version INTEGER NOT NULL,
-    snapshot TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    accepted INTEGER NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_skillver ON skill_versions(skill_id, version);
-
-CREATE TABLE IF NOT EXISTS reflections (
-    patch_id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL,
-    tenant_id TEXT NOT NULL,
-    verdict INTEGER NOT NULL,
-    failure_point TEXT NOT NULL,
-    root_cause TEXT NOT NULL,
-    pivot_actions TEXT NOT NULL,
-    memory_target TEXT NOT NULL,
-    guidance TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_reflections_run ON reflections(run_id);
-
-CREATE TABLE IF NOT EXISTS distillation_samples (
-    sample_id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL,
-    tenant_id TEXT NOT NULL,
-    step INTEGER NOT NULL,
-    student_prompt_digest TEXT NOT NULL,
-    teacher_prompt_digest TEXT NOT NULL,
-    tokens TEXT NOT NULL,
-    student_logprobs TEXT NOT NULL,
-    teacher_logprobs TEXT NOT NULL,
-    reverse_kl REAL NOT NULL,
-    weight REAL NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_distill_run ON distillation_samples(run_id);
-
-CREATE TABLE IF NOT EXISTS policy_priors (
-    prior_id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    signature TEXT NOT NULL,
-    directive TEXT NOT NULL,
-    logit REAL NOT NULL,
-    updates INTEGER NOT NULL DEFAULT 0,
-    updated_at TEXT NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_prior_unique ON policy_priors(tenant_id, signature);
-
-CREATE TABLE IF NOT EXISTS wiki_pages (
-    page_id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    slug TEXT NOT NULL,
-    title TEXT NOT NULL,
-    body TEXT NOT NULL,
-    revision INTEGER NOT NULL DEFAULT 1,
-    embedding TEXT NOT NULL DEFAULT '',
-    updated_at TEXT NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_wiki_unique ON wiki_pages(tenant_id, slug);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS wiki_fts USING fts5(
-    page_id UNINDEXED,
-    tenant_id UNINDEXED,
-    text,
-    tokenize='porter unicode61'
-);
-
-CREATE TABLE IF NOT EXISTS raw_events (
-    event_id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    run_id TEXT NOT NULL DEFAULT '',
-    kind TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    prev_hash TEXT NOT NULL,
-    hash TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_events_run ON raw_events(run_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_events_kind ON raw_events(kind);
-
-CREATE TABLE IF NOT EXISTS conversations (
-    conversation_id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_conv_tenant ON conversations(tenant_id, updated_at);
-
-CREATE TABLE IF NOT EXISTS messages (
-    message_id TEXT PRIMARY KEY,
-    conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
-    tenant_id TEXT NOT NULL,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    meta TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conversation_id, created_at);
-
-CREATE TABLE IF NOT EXISTS diagnostic_tasks (
-    task_id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    expectation TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_diag_tenant ON diagnostic_tasks(tenant_id);
-
-CREATE TABLE IF NOT EXISTS audit_log (
-    audit_id TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    actor TEXT NOT NULL,
-    action TEXT NOT NULL,
-    resource TEXT NOT NULL,
-    allowed INTEGER NOT NULL,
-    detail TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_log(tenant_id, created_at);
-"""
-
-
-class Database:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._local = threading.local()
-        self._write_lock = threading.RLock()
-        with self.connect() as conn:
-            conn.executescript(SCHEMA_SQL)
-            conn.commit()
-
-    def _conn(self) -> sqlite3.Connection:
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
-            conn = sqlite3.connect(str(self.path), timeout=30.0, isolation_level=None, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA busy_timeout=15000")
-            self._local.conn = conn
-        return conn
-
-    @contextlib.contextmanager
-    def connect(self) -> Iterable[sqlite3.Connection]:
-        conn = self._conn()
-        yield conn
-
-    @contextlib.contextmanager
-    def tx(self) -> Iterable[sqlite3.Connection]:
-        with self._write_lock:
-            conn = self._conn()
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                yield conn
-            except Exception:
-                conn.execute("ROLLBACK")
-                raise
-            else:
-                conn.execute("COMMIT")
-
-    def query(self, sql: str, params: Sequence[Any] = ()) -> List[sqlite3.Row]:
-        conn = self._conn()
-        cur = conn.execute(sql, tuple(params))
-        rows = cur.fetchall()
-        cur.close()
-        return rows
-
-    def query_one(self, sql: str, params: Sequence[Any] = ()) -> Optional[sqlite3.Row]:
-        rows = self.query(sql, params)
-        return rows[0] if rows else None
-
-    def execute(self, sql: str, params: Sequence[Any] = ()) -> None:
-        with self.tx() as conn:
-            conn.execute(sql, tuple(params))
-
-    def executemany(self, sql: str, seq: Sequence[Sequence[Any]]) -> None:
-        with self.tx() as conn:
-            conn.executemany(sql, [tuple(s) for s in seq])
-
-
-DB = Database(DB_PATH)
-
-
-class Ledger:
-    def __init__(self, db: Database) -> None:
-        self.db = db
-        self._lock = threading.RLock()
-
-    def append(self, tenant_id: str, kind: str, payload: Dict[str, Any], run_id: str = "") -> str:
-        with self._lock:
-            last = self.db.query_one("SELECT hash FROM raw_events ORDER BY rowid DESC LIMIT 1")
-            prev_hash = last["hash"] if last else "0" * 64
-            event_id = new_id("evt")
-            created = iso()
-            body = {
-                "event_id": event_id,
-                "tenant_id": tenant_id,
-                "run_id": run_id,
-                "kind": kind,
-                "payload": payload,
-                "prev_hash": prev_hash,
-                "created_at": created,
-            }
-            digest = stable_hash(body)
-            self.db.execute(
-                "INSERT INTO raw_events(event_id, tenant_id, run_id, kind, payload, prev_hash, hash, created_at)"
-                " VALUES(?,?,?,?,?,?,?,?)",
-                (event_id, tenant_id, run_id, kind, jdump(payload), prev_hash, digest, created),
-            )
-            return event_id
-
-    def verify_chain(self, limit: int = 5000) -> Dict[str, Any]:
-        rows = self.db.query("SELECT * FROM raw_events ORDER BY rowid ASC LIMIT ?", (limit,))
-        prev = "0" * 64
-        broken: List[str] = []
-        for row in rows:
-            body = {
-                "event_id": row["event_id"],
-                "tenant_id": row["tenant_id"],
-                "run_id": row["run_id"],
-                "kind": row["kind"],
-                "payload": jload(row["payload"], {}),
-                "prev_hash": row["prev_hash"],
-                "created_at": row["created_at"],
-            }
-            if row["prev_hash"] != prev or stable_hash(body) != row["hash"]:
-                broken.append(row["event_id"])
-            prev = row["hash"]
-        return {"checked": len(rows), "broken": broken, "intact": not broken}
-
-
-LEDGER = Ledger(DB)
-
-
-def hash_key(raw: str) -> str:
-    return hashlib.sha256(("agent-runtime-v1:" + raw).encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -953,3108 +604,4337 @@ class Tenant:
     name: str
     token_budget: int
     tokens_used: int
-    allowed_risk: ToolRisk
+    allowed_tools: List[str]
+    active: bool
 
     @staticmethod
     def from_row(row: sqlite3.Row) -> "Tenant":
-        try:
-            risk = ToolRisk(row["allowed_risk"])
-        except ValueError:
-            risk = ToolRisk.GUARDED
         return Tenant(
             tenant_id=row["tenant_id"],
             name=row["name"],
             token_budget=int(row["token_budget"]),
             tokens_used=int(row["tokens_used"]),
-            allowed_risk=risk,
+            allowed_tools=jload(row["allowed_tools"], []) or [],
+            active=bool(row["active"]),
         )
 
 
 class TenantRegistry:
-    def __init__(self, db: Database) -> None:
-        self.db = db
+    DEFAULT_TOOLS = [
+        "workspace.write_file",
+        "workspace.read_file",
+        "workspace.append_file",
+        "workspace.replace_lines",
+        "workspace.check_lines",
+        "workspace.list_dir",
+        "workspace.delete_file",
+        "memory.wiki_search",
+        "memory.wiki_write",
+        "memory.skill_search",
+        "memory.skill_upsert",
+        "memory.trace_query",
+        "compute.python",
+        "compute.shell",
+        "compute.http_get",
+        "reason.think",
+        "control.finish",
+        "control.fail",
+    ]
+
+    def __init__(self, store: SQLiteStore):
+        self.store = store
+        self._cache: Dict[str, Tenant] = {}
         self._lock = threading.RLock()
-        self._ensure_default()
+        self.ensure_tenant("public", "Public", os.environ.get("AGENT_PUBLIC_KEY", "public-key"))
 
-    def _ensure_default(self) -> None:
-        row = self.db.query_one("SELECT COUNT(*) AS c FROM tenants")
-        if row and int(row["c"]) > 0:
+    @staticmethod
+    def hash_key(key: str) -> str:
+        return hashlib.sha256(("agentsalt::" + key).encode("utf-8")).hexdigest()
+
+    def ensure_tenant(self, tenant_id: str, name: str, api_key: str, token_budget: int = DEFAULT_TOKEN_BUDGET) -> Tenant:
+        with self._lock:
+            row = self.store.one("SELECT * FROM tenants WHERE tenant_id = ?", (tenant_id,))
+            if row is None:
+                self.store.execute(
+                    "INSERT INTO tenants(tenant_id, name, api_key_hash, token_budget, tokens_used, allowed_tools, created_at, active) "
+                    "VALUES(?,?,?,?,?,?,?,1)",
+                    (tenant_id, name, self.hash_key(api_key), token_budget, 0, jdump(self.DEFAULT_TOOLS), iso()),
+                )
+                row = self.store.one("SELECT * FROM tenants WHERE tenant_id = ?", (tenant_id,))
+            t = Tenant.from_row(row)
+            self._cache[tenant_id] = t
+            return t
+
+    def get(self, tenant_id: str) -> Tenant:
+        row = self.store.one("SELECT * FROM tenants WHERE tenant_id = ?", (tenant_id,))
+        if row is None:
+            raise SecurityError(f"unknown tenant {tenant_id}")
+        t = Tenant.from_row(row)
+        if not t.active:
+            raise SecurityError(f"tenant {tenant_id} disabled")
+        return t
+
+    def authenticate(self, tenant_id: Optional[str], api_key: Optional[str]) -> Tenant:
+        tid = tenant_id or "public"
+        row = self.store.one("SELECT * FROM tenants WHERE tenant_id = ?", (tid,))
+        if row is None:
+            raise SecurityError("invalid tenant")
+        t = Tenant.from_row(row)
+        if not t.active:
+            raise SecurityError("tenant disabled")
+        if tid != "public":
+            if not api_key or not hmac.compare_digest(self.hash_key(api_key), row["api_key_hash"]):
+                raise SecurityError("invalid credentials")
+        return t
+
+    def charge_tokens(self, tenant_id: str, tokens: int) -> None:
+        with self.store.tx() as c:
+            row = c.execute("SELECT token_budget, tokens_used FROM tenants WHERE tenant_id = ?", (tenant_id,)).fetchone()
+            if row is None:
+                raise SecurityError("unknown tenant")
+            budget = int(row[0])
+            used = int(row[1]) + max(0, tokens)
+            c.execute("UPDATE tenants SET tokens_used = ? WHERE tenant_id = ?", (used, tenant_id))
+            if used > budget:
+                raise BudgetExceeded(f"tenant {tenant_id} token budget exhausted ({used}/{budget})")
+
+    def authorize_tool(self, tenant_id: str, tool: str) -> None:
+        t = self.get(tenant_id)
+        if tool not in t.allowed_tools:
+            raise ToolDenied(f"tool {tool} not authorized for tenant {tenant_id}")
+
+
+TENANTS = TenantRegistry(STORE)
+
+
+def audit(tenant_id: Optional[str], run_id: Optional[str], actor: str, action: str, detail: Any, allowed: bool = True) -> None:
+    try:
+        STORE.execute(
+            "INSERT INTO audit_log(audit_id, tenant_id, run_id, actor, action, detail, allowed, created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (new_id("aud"), tenant_id, run_id, actor, action, jdump(detail), 1 if allowed else 0, iso()),
+        )
+    except Exception as exc:
+        log.warning("audit failure: %s", exc)
+
+
+class EventBus:
+    def __init__(self):
+        self._subs: Dict[str, Set[asyncio.Queue]] = defaultdict(set)
+        self._lock = threading.RLock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+
+    def subscribe(self, topic: str) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=4096)
+        with self._lock:
+            self._subs[topic].add(q)
+        return q
+
+    def unsubscribe(self, topic: str, q: asyncio.Queue) -> None:
+        with self._lock:
+            self._subs[topic].discard(q)
+            if not self._subs[topic]:
+                self._subs.pop(topic, None)
+
+    def _deliver(self, topic: str, payload: Dict[str, Any]) -> None:
+        with self._lock:
+            queues = list(self._subs.get(topic, ()))
+        for q in queues:
+            try:
+                q.put_nowait(payload)
+            except asyncio.QueueFull:
+                try:
+                    q.get_nowait()
+                    q.put_nowait(payload)
+                except Exception:
+                    pass
+
+    def publish(self, topic: str, payload: Dict[str, Any]) -> None:
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            self._deliver(topic, payload)
             return
-        key = os.environ.get("AGENT_DEFAULT_API_KEY", "local-dev-key")
-        self.create("default", key, DEFAULT_TOKEN_BUDGET, ToolRisk.PRIVILEGED)
-        LOG.info("Bootstrapped default tenant with api key: %s", key)
-
-    def create(self, name: str, api_key: str, budget: int, risk: ToolRisk) -> Tenant:
-        with self._lock:
-            tenant_id = new_id("tnt")
-            self.db.execute(
-                "INSERT INTO tenants(tenant_id, name, api_key_hash, token_budget, tokens_used, allowed_risk, created_at)"
-                " VALUES(?,?,?,?,?,?,?)",
-                (tenant_id, name, hash_key(api_key), budget, 0, risk.value, iso()),
-            )
-            WORKSPACE_ROOT.joinpath(tenant_id).mkdir(parents=True, exist_ok=True)
-            WIKI_ROOT.joinpath(tenant_id).mkdir(parents=True, exist_ok=True)
-            SKILL_ROOT.joinpath(tenant_id).mkdir(parents=True, exist_ok=True)
-            return Tenant(tenant_id, name, budget, 0, risk)
-
-    def by_api_key(self, api_key: str) -> Optional[Tenant]:
-        row = self.db.query_one("SELECT * FROM tenants WHERE api_key_hash = ?", (hash_key(api_key),))
-        return Tenant.from_row(row) if row else None
-
-    def by_id(self, tenant_id: str) -> Optional[Tenant]:
-        row = self.db.query_one("SELECT * FROM tenants WHERE tenant_id = ?", (tenant_id,))
-        return Tenant.from_row(row) if row else None
-
-    def charge(self, tenant_id: str, tokens: int) -> None:
-        with self._lock:
-            row = self.db.query_one("SELECT token_budget, tokens_used FROM tenants WHERE tenant_id=?", (tenant_id,))
-            if not row:
-                raise AuthorizationDenied("unknown tenant")
-            used = int(row["tokens_used"]) + max(0, tokens)
-            if used > int(row["token_budget"]):
-                self.db.execute("UPDATE tenants SET tokens_used=? WHERE tenant_id=?", (used, tenant_id))
-                raise BudgetExceeded(f"tenant token budget exhausted ({used}/{row['token_budget']})")
-            self.db.execute("UPDATE tenants SET tokens_used=? WHERE tenant_id=?", (used, tenant_id))
-
-    def list_all(self) -> List[Tenant]:
-        return [Tenant.from_row(r) for r in self.db.query("SELECT * FROM tenants ORDER BY created_at")]
+        try:
+            loop.call_soon_threadsafe(self._deliver, topic, payload)
+        except RuntimeError:
+            self._deliver(topic, payload)
 
 
-TENANTS = TenantRegistry(DB)
+BUS = EventBus()
+
+
+def emit_event(kind: str, run_id: Optional[str], tenant_id: Optional[str], payload: Dict[str, Any], conversation_id: Optional[str] = None) -> Dict[str, Any]:
+    seq = STORE.next_seq("events")
+    evt = {
+        "event_id": new_id("evt"),
+        "kind": kind,
+        "run_id": run_id,
+        "tenant_id": tenant_id,
+        "conversation_id": conversation_id,
+        "payload": payload,
+        "created_at": iso(),
+        "seq": seq,
+    }
+    try:
+        STORE.execute(
+            "INSERT INTO events(event_id, run_id, tenant_id, conversation_id, kind, payload, created_at, seq) VALUES(?,?,?,?,?,?,?,?)",
+            (evt["event_id"], run_id, tenant_id, conversation_id, kind, jdump(payload), evt["created_at"], seq),
+        )
+    except Exception as exc:
+        log.warning("event persist failed: %s", exc)
+    if run_id:
+        BUS.publish(f"run:{run_id}", evt)
+    if conversation_id:
+        BUS.publish(f"conv:{conversation_id}", evt)
+    BUS.publish("global", evt)
+    return evt
 
 
 class ModelClient:
-    def __init__(self) -> None:
+    def __init__(self):
+        self.model = MODEL_NAME
         self._client: Optional[OpenAI] = None
         self._lock = threading.RLock()
-        self.available = bool(MODEL_API_KEY)
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+
+    @property
+    def available(self) -> bool:
+        return bool(MODEL_API_KEY)
 
     def client(self) -> OpenAI:
         with self._lock:
             if self._client is None:
                 if not MODEL_API_KEY:
                     raise RuntimeError("MODULAR_API_KEY is not configured")
-                self._client = OpenAI(base_url=MODEL_BASE_URL, api_key=MODEL_API_KEY)
+                self._client = OpenAI(base_url=MODEL_BASE_URL, api_key=MODEL_API_KEY, timeout=600.0, max_retries=0)
             return self._client
 
-    def _params(self, overrides: Dict[str, Any]) -> Dict[str, Any]:
+    def _params(self, override: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         params: Dict[str, Any] = {
-            "model": MODEL_NAME,
-            "temperature": MODEL_TEMPERATURE,
-            "top_p": MODEL_TOP_P,
-            "max_tokens": MODEL_MAX_TOKENS,
-            "frequency_penalty": MODEL_FREQUENCY_PENALTY,
-            "presence_penalty": MODEL_PRESENCE_PENALTY,
-            "seed": MODEL_SEED,
+            "temperature": TEMPERATURE,
+            "top_p": TOP_P,
+            "max_tokens": MAX_TOKENS,
+            "frequency_penalty": FREQUENCY_PENALTY,
+            "presence_penalty": PRESENCE_PENALTY,
+            "seed": SEED,
         }
-        params.update({k: v for k, v in overrides.items() if v is not None})
+        if override:
+            params.update({k: v for k, v in override.items() if v is not None})
         return params
 
-    def complete(self, messages: List[Dict[str, str]], **overrides: Any) -> Tuple[str, int]:
-        params = self._params(overrides)
-        client = self.client()
-        text_parts: List[str] = []
-        usage_tokens = 0
-        stream = client.chat.completions.create(
-            messages=messages,
-            stream=True,
-            stream_options={"include_usage": True},
-            **params,
-        )
-        for chunk in stream:
-            usage = getattr(chunk, "usage", None)
-            if usage is not None:
-                total = getattr(usage, "total_tokens", None)
-                if isinstance(total, int):
-                    usage_tokens = total
-            if not getattr(chunk, "choices", None):
-                continue
-            delta = chunk.choices[0].delta
-            piece = getattr(delta, "content", None)
-            if piece:
-                text_parts.append(piece)
-        text = "".join(text_parts)
-        if usage_tokens <= 0:
-            usage_tokens = approx_tokens(" ".join(m.get("content", "") for m in messages)) + approx_tokens(text)
-        return text, usage_tokens
+    def stream(
+        self,
+        messages: List[Dict[str, str]],
+        on_delta: Optional[Callable[[str], None]] = None,
+        override: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        params = self._params(override)
+        attempts = 0
+        last_exc: Optional[Exception] = None
+        while attempts < 4:
+            attempts += 1
+            buf: List[str] = []
+            usage: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            try:
+                response = self.client().chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    stream=True,
+                    stream_options={"include_usage": True},
+                    **params,
+                )
+                for chunk in response:
+                    if getattr(chunk, "usage", None):
+                        u = chunk.usage
+                        usage["prompt_tokens"] = int(getattr(u, "prompt_tokens", 0) or 0)
+                        usage["completion_tokens"] = int(getattr(u, "completion_tokens", 0) or 0)
+                        usage["total_tokens"] = int(getattr(u, "total_tokens", 0) or 0)
+                    if not getattr(chunk, "choices", None):
+                        continue
+                    delta = chunk.choices[0].delta
+                    content = getattr(delta, "content", None)
+                    if content:
+                        buf.append(content)
+                        if on_delta is not None:
+                            on_delta(content)
+                text = "".join(buf)
+                if usage["total_tokens"] == 0:
+                    prompt_text = "\n".join(m.get("content", "") for m in messages)
+                    usage["prompt_tokens"] = approx_tokens(prompt_text)
+                    usage["completion_tokens"] = approx_tokens(text)
+                    usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+                with self._lock:
+                    self.total_prompt_tokens += usage["prompt_tokens"]
+                    self.total_completion_tokens += usage["completion_tokens"]
+                return {"text": text, "usage": usage, "attempts": attempts}
+            except Exception as exc:
+                last_exc = exc
+                log.warning("model stream attempt %d failed: %s", attempts, exc)
+                time.sleep(min(20.0, 1.5 * (2 ** (attempts - 1))))
+        raise RuntimeError(f"model invocation failed after {attempts} attempts: {last_exc}")
 
-    def stream(self, messages: List[Dict[str, str]], **overrides: Any) -> Iterable[Tuple[str, Optional[int]]]:
-        params = self._params(overrides)
-        client = self.client()
-        stream = client.chat.completions.create(
-            messages=messages,
-            stream=True,
-            stream_options={"include_usage": True},
-            **params,
-        )
-        for chunk in stream:
-            usage = getattr(chunk, "usage", None)
-            total: Optional[int] = None
-            if usage is not None:
-                candidate = getattr(usage, "total_tokens", None)
-                if isinstance(candidate, int):
-                    total = candidate
-            if not getattr(chunk, "choices", None):
-                if total is not None:
-                    yield "", total
-                continue
-            delta = chunk.choices[0].delta
-            piece = getattr(delta, "content", None)
-            if piece:
-                yield piece, total
-            elif total is not None:
-                yield "", total
+    def complete(self, messages: List[Dict[str, str]], override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self.stream(messages, on_delta=None, override=override)
 
 
 MODEL = ModelClient()
 
 
-class GrammarDecoder:
-    OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
-    FENCE_RE = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.DOTALL)
+class LocalGrammarDecoder:
+    OBJ_START = re.compile(r"\{")
 
-    @classmethod
-    def extract_json(cls, raw: str) -> Dict[str, Any]:
-        if not raw or not raw.strip():
-            raise SchemaError("empty model response")
-        candidates: List[str] = []
-        for match in cls.FENCE_RE.finditer(raw):
-            candidates.append(match.group(1))
-        candidates.append(raw)
-        obj_match = cls.OBJECT_RE.search(raw)
-        if obj_match:
-            candidates.append(obj_match.group(0))
-        for cand in candidates:
-            cand = cand.strip()
-            if not cand:
+    @staticmethod
+    def extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+        if not text:
+            return None
+        fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+        candidates: List[str] = list(fenced)
+        depth = 0
+        start = -1
+        in_str = False
+        esc = False
+        for i, ch in enumerate(text):
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
                 continue
-            for attempt in (cand, cls._repair(cand)):
-                try:
-                    parsed = json.loads(attempt)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(parsed, dict):
-                    return parsed
-        balanced = cls._balanced_scan(raw)
-        if balanced is not None:
-            return balanced
-        raise SchemaError("model response did not contain a decodable JSON object")
-
-    @staticmethod
-    def _repair(text: str) -> str:
-        cleaned = re.sub(r",\s*(\}|\])", r"\1", text)
-        cleaned = cleaned.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
-        cleaned = re.sub(r"//[^\n\r]*", "", cleaned)
-        opens = cleaned.count("{") - cleaned.count("}")
-        if opens > 0:
-            cleaned = cleaned + ("}" * opens)
-        brackets = cleaned.count("[") - cleaned.count("]")
-        if brackets > 0:
-            cleaned = cleaned + ("]" * brackets)
-        return cleaned
-
-    @staticmethod
-    def _balanced_scan(raw: str) -> Optional[Dict[str, Any]]:
-        start = raw.find("{")
-        while start != -1:
-            depth = 0
-            in_str = False
-            escape = False
-            for idx in range(start, len(raw)):
-                ch = raw[idx]
-                if in_str:
-                    if escape:
-                        escape = False
-                    elif ch == "\\":
-                        escape = True
-                    elif ch == '"':
-                        in_str = False
-                    continue
-                if ch == '"':
-                    in_str = True
-                elif ch == "{":
-                    depth += 1
-                elif ch == "}":
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                if depth > 0:
                     depth -= 1
-                    if depth == 0:
-                        blob = raw[start : idx + 1]
-                        try:
-                            parsed = json.loads(blob)
-                        except json.JSONDecodeError:
-                            try:
-                                parsed = json.loads(GrammarDecoder._repair(blob))
-                            except json.JSONDecodeError:
-                                break
-                        if isinstance(parsed, dict):
-                            return parsed
-                        break
-            start = raw.find("{", start + 1)
-        return None
-
-
-class DeltaValidator
-    MAX_DELTA_BYTES = 120_000
-    MAX_LIST_LEN = 256
-    MAX_DEPTH = 8
-
-    @classmethod
-    def validate(cls, delta: Any, allowed_tools: Set[str]) -> Dict[str, Any]:
-        reasons: List[str] = []
-        if not isinstance(delta, dict):
-            raise ValidationRejected(["state delta must be a JSON object"])
-        blob = jdump(delta)
-        if len(blob) > cls.MAX_DELTA_BYTES:
-            reasons.append(f"delta too large ({len(blob)} bytes)")
-        unknown = [k for k in delta.keys() if k not in STATE_TOP_KEYS]
-        if unknown:
-            reasons.append(f"unknown state keys: {sorted(unknown)}")
-        if "progress" in delta and delta["progress"] is not None:
-            try:
-                float(delta["progress"])
-            except (TypeError, ValueError):
-                reasons.append("progress must be numeric or null")
-        for list_key in ("subgoals", "blockers", "constraints_observed", "skill_hints"):
-            if list_key in delta and delta[list_key] is not None and not isinstance(delta[list_key], list):
-                reasons.append(f"{list_key} must be a list or null")
-            elif isinstance(delta.get(list_key), list) and len(delta[list_key]) > cls.MAX_LIST_LEN:
-                reasons.append(f"{list_key} exceeds {cls.MAX_LIST_LEN} entries")
-        for dict_key in ("facts", "artifacts", "scratch", "metrics"):
-            if dict_key in delta and delta[dict_key] is not None and not isinstance(delta[dict_key], dict):
-                reasons.append(f"{dict_key} must be an object or null")
-        if cls._depth(delta) > cls.MAX_DEPTH:
-            reasons.append("delta nesting too deep")
-        if reasons:
-            raise ValidationRejected(reasons)
-        return delta
-
-    @classmethod
-    def _depth(cls, node: Any, level: int = 0) -> int:
-        if level > cls.MAX_DEPTH + 2:
-            return level
-        if isinstance(node, dict):
-            if not node:
-                return level
-            return max(cls._depth(v, level + 1) for v in node.values())
-        if isinstance(node, list):
-            if not node:
-                return level
-            return max(cls._depth(v, level + 1) for v in node)
-        return level
-
-    @staticmethod
-    def merge(state: ExecutionState, delta: Dict[str, Any]) -> ExecutionState:
-        current = state.to_dict()
-        merged = DeltaValidator._merge_dict(current, delta)
-        return ExecutionState.from_dict(merged)
-
-    @staticmethod
-    def _merge_dict(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
-        out = dict(base)
-        for key, value in patch.items():
-            if value is None or value == DELETE_SENTINEL:
-                out.pop(key, None)
+                    if depth == 0 and start >= 0:
+                        candidates.append(text[start : i + 1])
+        best: Optional[Dict[str, Any]] = None
+        best_score = -1
+        for cand in candidates:
+            parsed = LocalGrammarDecoder._loose_parse(cand)
+            if not isinstance(parsed, dict):
                 continue
-            if isinstance(value, dict) and isinstance(out.get(key), dict):
-                out[key] = DeltaValidator._merge_dict(out[key], value)
-            else:
-                out[key] = value
-        return out
+            score = 0
+            for key in ("action", "state_patch", "reasoning", "tool", "arguments", "thought"):
+                if key in parsed:
+                    score += 2
+            score += min(10, len(parsed))
+            if score > best_score:
+                best_score = score
+                best = parsed
+        return best
 
     @staticmethod
-    def validate_action(payload: Any, allowed_tools: Set[str]) -> ActionCommand:
-        reasons: List[str] = []
-        if not isinstance(payload, dict):
-            raise ValidationRejected(["action must be a JSON object"])
-        tool = payload.get("tool")
-        terminal = bool(payload.get("terminal", False))
-        final_answer = payload.get("final_answer")
-        if terminal:
-            tool = tool or "finish"
-        if not isinstance(tool, str) or not tool.strip():
-            reasons.append("action.tool must be a non-empty string")
-            tool = "noop"
-        tool = tool.strip()
-        if tool not in allowed_tools and tool not in ("finish", "noop"):
-            reasons.append(f"tool '{tool}' is not authorized for this run")
-        args = payload.get("arguments", {})
-        if args is None:
-            args = {}
-        if not isinstance(args, dict):
-            reasons.append("action.arguments must be an object")
-            args = {}
-        if terminal and not isinstance(final_answer, str):
-            final_answer = jdump(final_answer) if final_answer is not None else ""
-        digest = payload.get("rationale_digest", "")
-        if not isinstance(digest, str):
-            digest = str(digest)
-        if reasons:
-            raise ValidationRejected(reasons)
-        return ActionCommand(
-            tool=tool,
-            arguments=args,
-            rationale_digest=digest[:400],
-            terminal=terminal,
-            final_answer=final_answer if isinstance(final_answer, str) else None,
+    def _loose_parse(text: str) -> Any:
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        cleaned = text
+        cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
+        cleaned = re.sub(r"//[^\n\r]*", "", cleaned)
+        cleaned = cleaned.replace("\t", " ")
+        try:
+            return json.loads(cleaned)
+        except Exception:
+            pass
+        repaired = cleaned
+        open_braces = repaired.count("{") - repaired.count("}")
+        if open_braces > 0:
+            repaired = repaired + ("}" * open_braces)
+        open_brackets = repaired.count("[") - repaired.count("]")
+        if open_brackets > 0:
+            repaired = repaired + ("]" * open_brackets)
+        try:
+            return json.loads(repaired)
+        except Exception:
+            return None
+
+
+DECODER = LocalGrammarDecoder()
+
+
+@dataclass
+class ProceduralSpec:
+    spec_id: str
+    tenant_id: str
+    objective: str
+    success_criteria: List[str]
+    constraints: List[str]
+    allowed_tools: List[str]
+    max_steps: int
+    verifiers: List[Dict[str, Any]]
+    metadata: Dict[str, Any]
+    created_at: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @staticmethod
+    def build(
+        tenant_id: str,
+        objective: str,
+        success_criteria: Optional[List[str]] = None,
+        constraints: Optional[List[str]] = None,
+        allowed_tools: Optional[List[str]] = None,
+        max_steps: int = DEFAULT_STEP_BUDGET,
+        verifiers: Optional[List[Dict[str, Any]]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> "ProceduralSpec":
+        tools = allowed_tools or TenantRegistry.DEFAULT_TOOLS
+        return ProceduralSpec(
+            spec_id=new_id("spec"),
+            tenant_id=tenant_id,
+            objective=objective.strip(),
+            success_criteria=[s.strip() for s in (success_criteria or []) if s and s.strip()],
+            constraints=[c.strip() for c in (constraints or []) if c and c.strip()],
+            allowed_tools=list(tools),
+            max_steps=max(1, min(int(max_steps), 5000)),
+            verifiers=verifiers or [],
+            metadata=metadata or {},
+            created_at=iso(),
+        )
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "ProceduralSpec":
+        return ProceduralSpec(
+            spec_id=d.get("spec_id") or new_id("spec"),
+            tenant_id=d.get("tenant_id") or "public",
+            objective=d.get("objective") or "",
+            success_criteria=list(d.get("success_criteria") or []),
+            constraints=list(d.get("constraints") or []),
+            allowed_tools=list(d.get("allowed_tools") or TenantRegistry.DEFAULT_TOOLS),
+            max_steps=int(d.get("max_steps") or DEFAULT_STEP_BUDGET),
+            verifiers=list(d.get("verifiers") or []),
+            metadata=dict(d.get("metadata") or {}),
+            created_at=d.get("created_at") or iso(),
         )
 
 
-class OutputClassifier
-    INJECTION_PATTERNS = [
-        re.compile(r"ignore\s+(all\s+)?previous\s+instructions", re.I),
-        re.compile(r"disregard\s+the\s+system\s+prompt", re.I),
-        re.compile(r"reveal\s+your\s+(system\s+)?prompt", re.I),
-        re.compile(r"\bBEGIN\s+RSA\s+PRIVATE\s+KEY\b", re.I),
-    ]
-    SECRET_PATTERNS = [
-        re.compile(r"sk-[A-Za-z0-9]{16,}"),
-        re.compile(r"AKIA[0-9A-Z]{16}"),
-        re.compile(r"ghp_[A-Za-z0-9]{20,}"),
-        re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    ]
+SIGMA_ALLOWED_KEYS = {
+    "phase",
+    "progress",
+    "open_goals",
+    "dependencies",
+    "constraints",
+    "facts",
+    "artifacts",
+    "errors",
+    "metrics",
+    "plan",
+    "current_subgoal",
+    "skill_notes",
+    "verification",
+    "cursor",
+    "scratch",
+}
+
+SIGMA_LIST_KEYS = {"progress", "open_goals", "dependencies", "constraints", "errors", "plan", "skill_notes"}
+SIGMA_DICT_KEYS = {"facts", "artifacts", "metrics", "verification", "cursor", "scratch"}
+SIGMA_STR_KEYS = {"phase", "current_subgoal"}
+
+SIGMA_LIST_CAP = 64
+SIGMA_DICT_CAP = 96
+SIGMA_STR_CAP = 4096
+SIGMA_TOTAL_CAP = 65536
+
+
+def empty_sigma() -> Dict[str, Any]:
+    return {
+        "phase": "init",
+        "progress": [],
+        "open_goals": [],
+        "dependencies": [],
+        "constraints": [],
+        "facts": {},
+        "artifacts": {},
+        "errors": [],
+        "metrics": {},
+        "plan": [],
+        "current_subgoal": "",
+        "skill_notes": [],
+        "verification": {},
+        "cursor": {},
+        "scratch": {},
+    }
+
+
+class StatePatchValidator:
+    DELETE_SENTINELS = {None, "__DELETE__", "$delete", "null"}
+
+    @staticmethod
+    def _truncate_str(value: str, cap: int = SIGMA_STR_CAP) -> str:
+        v = str(value)
+        return v if len(v) <= cap else v[: cap - 3] + "..."
 
     @classmethod
-    def classify(cls, text: str) -> Dict[str, Any]:
-        flags: List[str] = []
-        if not isinstance(text, str):
-            text = str(text)
-        for pat in cls.INJECTION_PATTERNS:
-            if pat.search(text):
-                flags.append("prompt_injection_echo")
-                break
-        for pat in cls.SECRET_PATTERNS:
-            if pat.search(text):
-                flags.append("secret_leak")
-                break
-        if len(text) > 400_000:
-            flags.append("oversize_output")
-        control = sum(1 for ch in text[:20000] if ord(ch) < 9 or (13 < ord(ch) < 32))
-        if control > 32:
-            flags.append("control_char_spam")
-        return {"allowed": not flags, "flags": flags}
+    def validate_patch(cls, patch: Any) -> Dict[str, Any]:
+        if patch is None:
+            return {}
+        if not isinstance(patch, dict):
+            raise ValidationError("state_patch must be an object")
+        clean: Dict[str, Any] = {}
+        for key, value in patch.items():
+            if not isinstance(key, str):
+                raise ValidationError("state_patch keys must be strings")
+            k = key.strip()
+            if not k:
+                continue
+            if k not in SIGMA_ALLOWED_KEYS:
+                clean.setdefault("facts", {})
+                if isinstance(clean["facts"], dict):
+                    clean["facts"][k[:120]] = cls._coerce_scalar(value)
+                continue
+            clean[k] = cls._coerce_slot(k, value)
+        return clean
 
     @classmethod
-    def redact(cls, text: str) -> str:
-        out = text
-        for pat in cls.SECRET_PATTERNS:
-            out = pat.sub("[REDACTED_SECRET]", out)
+    def _coerce_scalar(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (int, float, bool)):
+            return value
+        if isinstance(value, str):
+            return cls._truncate_str(value)
+        if isinstance(value, (list, tuple)):
+            return [cls._coerce_scalar(v) for v in list(value)[:SIGMA_LIST_CAP]]
+        if isinstance(value, dict):
+            out: Dict[str, Any] = {}
+            for i, (k, v) in enumerate(value.items()):
+                if i >= SIGMA_DICT_CAP:
+                    break
+                out[str(k)[:120]] = cls._coerce_scalar(v)
+            return out
+        return cls._truncate_str(str(value))
+
+    @classmethod
+    def _coerce_slot(cls, key: str, value: Any) -> Any:
+        if value in (None,) or (isinstance(value, str) and value in cls.DELETE_SENTINELS and key not in SIGMA_STR_KEYS):
+            return None
+        if key in SIGMA_STR_KEYS:
+            if value is None:
+                return None
+            return cls._truncate_str(str(value), 1024)
+        if key in SIGMA_LIST_KEYS:
+            if isinstance(value, str):
+                value = [value]
+            if not isinstance(value, (list, tuple)):
+                raise ValidationError(f"{key} must be a list")
+            out: List[Any] = []
+            seen: Set[str] = set()
+            for item in list(value)[: SIGMA_LIST_CAP * 2]:
+                coerced = cls._coerce_scalar(item)
+                sig = jdump(coerced)
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                out.append(coerced)
+                if len(out) >= SIGMA_LIST_CAP:
+                    break
+            return out
+        if key in SIGMA_DICT_KEYS:
+            if not isinstance(value, dict):
+                raise ValidationError(f"{key} must be an object")
+            out_d: Dict[str, Any] = {}
+            for i, (k, v) in enumerate(value.items()):
+                if i >= SIGMA_DICT_CAP:
+                    break
+                out_d[str(k)[:120]] = cls._coerce_scalar(v)
+            return out_d
+        return cls._coerce_scalar(value)
+
+    @classmethod
+    def apply(cls, sigma: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+        base = json.loads(jdump(sigma)) if sigma else empty_sigma()
+        for key in list(base.keys()):
+            if key not in SIGMA_ALLOWED_KEYS:
+                base.pop(key, None)
+        for key, value in patch.items():
+            if value is None:
+                if key in SIGMA_LIST_KEYS:
+                    base[key] = []
+                elif key in SIGMA_DICT_KEYS:
+                    base[key] = {}
+                elif key in SIGMA_STR_KEYS:
+                    base[key] = ""
+                else:
+                    base.pop(key, None)
+                continue
+            if key in SIGMA_LIST_KEYS:
+                existing = base.get(key) or []
+                if not isinstance(existing, list):
+                    existing = []
+                merged: List[Any] = []
+                seen: Set[str] = set()
+                for item in list(existing) + list(value):
+                    sig = jdump(item)
+                    if sig in seen:
+                        continue
+                    seen.add(sig)
+                    merged.append(item)
+                base[key] = merged[-SIGMA_LIST_CAP:]
+            elif key in SIGMA_DICT_KEYS:
+                existing_d = base.get(key) or {}
+                if not isinstance(existing_d, dict):
+                    existing_d = {}
+                for k, v in value.items():
+                    if v is None:
+                        existing_d.pop(k, None)
+                    else:
+                        existing_d[k] = v
+                if len(existing_d) > SIGMA_DICT_CAP:
+                    keys = list(existing_d.keys())[-SIGMA_DICT_CAP:]
+                    existing_d = {k: existing_d[k] for k in keys}
+                base[key] = existing_d
+            else:
+                base[key] = value
+        encoded = jdump(base)
+        if len(encoded) > SIGMA_TOTAL_CAP:
+            base = cls._compact(base)
+        return base
+
+    @classmethod
+    def _compact(cls, sigma: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(sigma)
+        for key in ("scratch", "skill_notes", "errors"):
+            val = out.get(key)
+            if isinstance(val, list) and len(val) > 12:
+                out[key] = val[-12:]
+            elif isinstance(val, dict) and len(val) > 12:
+                keys = list(val.keys())[-12:]
+                out[key] = {k: val[k] for k in keys}
+        for key in ("progress", "plan"):
+            val = out.get(key)
+            if isinstance(val, list) and len(val) > 24:
+                out[key] = val[-24:]
+        for key in ("facts", "artifacts", "metrics"):
+            val = out.get(key)
+            if isinstance(val, dict) and len(val) > 40:
+                keys = list(val.keys())[-40:]
+                out[key] = {k: val[k] for k in keys}
+        encoded = jdump(out)
+        if len(encoded) > SIGMA_TOTAL_CAP:
+            out["scratch"] = {"compacted_at": iso()}
+            out["errors"] = (out.get("errors") or [])[-4:]
         return out
 
 
-class SecurityFence:
-    def __init__(self, db: Database) -> None:
-        self.db = db
-        self._risk_order = {ToolRisk.SAFE: 0, ToolRisk.GUARDED: 1, ToolRisk.PRIVILEGED: 2}
+VALIDATOR = StatePatchValidator()
 
-    def authorize(self, tenant: Tenant, tool_name: str, risk: ToolRisk, spec: ProcedureSpec, resource: str) -> None:
-        allowed = True
-        detail = ""
-        if self._risk_order[risk] > self._risk_order[tenant.allowed_risk]:
-            allowed = False
-            detail = f"risk {risk.value} exceeds tenant ceiling {tenant.allowed_risk.value}"
-        elif spec.allowed_tools and tool_name not in spec.allowed_tools and tool_name not in ("finish", "noop"):
-            allowed = False
-            detail = "tool not present in spec allow-list"
-        self.audit(tenant.tenant_id, "agent", f"tool:{tool_name}", resource, allowed, detail)
-        if not allowed:
-            raise AuthorizationDenied(detail)
 
-    def audit(self, tenant_id: str, actor: str, action: str, resource: str, allowed: bool, detail: str) -> None:
-        self.db.execute(
-            "INSERT INTO audit_log(audit_id, tenant_id, actor, action, resource, allowed, detail, created_at)"
-            " VALUES(?,?,?,?,?,?,?,?)",
-            (new_id("aud"), tenant_id, actor, action, resource, 1 if allowed else 0, detail[:2000], iso()),
+@dataclass
+class Observation:
+    step: int
+    source: str
+    tool: Optional[str]
+    ok: bool
+    summary: str
+    data: Dict[str, Any]
+    error: Optional[str]
+    latency_ms: int
+    created_at: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @staticmethod
+    def initial(step: int, note: str) -> "Observation":
+        return Observation(
+            step=step,
+            source="runtime",
+            tool=None,
+            ok=True,
+            summary=note,
+            data={},
+            error=None,
+            latency_ms=0,
+            created_at=iso(),
         )
 
 
-FENCE = SecurityFence(DB)
-
-
-class FileSystemSandbox:
-    def __init__(self, root: Path) -> None:
-        self.root = root.resolve()
+class WorkspaceManager:
+    def __init__(self, root: Path):
+        self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
+        self._locks: Dict[str, threading.RLock] = {}
+        self._lock_guard = threading.RLock()
 
-    def resolve(self, relative: str) -> Path:
-        if relative is None:
-            raise ValueError("path required")
-        candidate = str(relative).strip()
-        if not candidate:
-            raise ValueError("path required")
-        if candidate.startswith("/"):
-            candidate = candidate.lstrip("/")
-        if "\x00" in candidate:
-            raise ValueError("invalid path")
-        target = (self.root / candidate).resolve()
-        if target != self.root and self.root not in target.parents:
-            raise ValueError("path escapes sandbox root")
-        return target
+    def _lock_for(self, key: str) -> threading.RLock:
+        with self._lock_guard:
+            lk = self._locks.get(key)
+            if lk is None:
+                lk = threading.RLock()
+                self._locks[key] = lk
+            return lk
 
-    def write_file(self, path: str, content: str, mode: str = "overwrite") -> Dict[str, Any]:
-        target = self.resolve(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        data = content if isinstance(content, str) else jdump(content)
-        if len(data.encode("utf-8")) > MAX_FILE_BYTES:
-            raise ValueError("content exceeds max file size")
-        with self._lock:
-            if mode == "append":
-                with target.open("a", encoding="utf-8") as fh:
-                    fh.write(data)
-            else:
-                tmp = target.with_name(target.name + f".tmp.{secrets.token_hex(6)}")
-                tmp.write_text(data, encoding="utf-8")
+    def tenant_root(self, tenant_id: str) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", tenant_id)[:64] or "unknown"
+        p = self.root / safe
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def run_root(self, tenant_id: str, run_id: str) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", run_id)[:64] or "run"
+        p = self.tenant_root(tenant_id) / safe
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def resolve(self, tenant_id: str, run_id: str, rel_path: str) -> Path:
+        base = self.run_root(tenant_id, run_id).resolve()
+        candidate = (base / (rel_path or "")).resolve()
+        if candidate != base and base not in candidate.parents:
+            raise SecurityError(f"path escape blocked: {rel_path}")
+        return candidate
+
+    def write_file(self, tenant_id: str, run_id: str, rel_path: str, content: str) -> Dict[str, Any]:
+        target = self.resolve(tenant_id, run_id, rel_path)
+        with self._lock_for(str(target)):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".tmp_", suffix=".part")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(content)
+                    fh.flush()
+                    os.fsync(fh.fileno())
                 os.replace(tmp, target)
-        return {"path": str(target.relative_to(self.root)), "bytes": target.stat().st_size, "mode": mode}
+            except Exception:
+                with contextlib.suppress(Exception):
+                    os.unlink(tmp)
+                raise
+            data = content.encode("utf-8")
+            self._index(tenant_id, run_id, target, data)
+            return {"path": rel_path, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), "lines": content.count("\n") + (0 if content.endswith("\n") or not content else 1)}
 
-    def read_file(self, path: str, start_line: int = 1, end_line: int = 0) -> Dict[str, Any]:
-        target = self.resolve(path)
+    def read_file(self, tenant_id: str, run_id: str, rel_path: str, start: int = 1, end: Optional[int] = None) -> Dict[str, Any]:
+        target = self.resolve(tenant_id, run_id, rel_path)
         if not target.exists() or not target.is_file():
-            raise FileNotFoundError(f"no such file: {path}")
-        text = target.read_text(encoding="utf-8", errors="replace")
+            raise FileNotFoundError(f"file not found: {rel_path}")
+        with self._lock_for(str(target)):
+            text = target.read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
-        s = max(1, int(start_line))
-        e = len(lines) if not end_line else min(len(lines), int(end_line))
-        segment = lines[s - 1 : e] if s <= len(lines) else []
-        body = "\n".join(segment)
-        if len(body) > 200_000:
-            body = body[:200_000] + "\n[TRUNCATED]"
+        s = max(1, int(start))
+        e = len(lines) if end is None else max(s, int(end))
+        segment = lines[s - 1 : e]
         return {
-            "path": str(target.relative_to(self.root)),
+            "path": rel_path,
             "total_lines": len(lines),
-            "start_line": s,
-            "end_line": e,
-            "content": body,
+            "start": s,
+            "end": min(e, len(lines)),
+            "content": "\n".join(segment),
         }
 
-    def append_file(self, path: str, lines: Sequence[str], unique: bool = True) -> Dict[str, Any]:
-        target = self.resolve(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        incoming = [str(l).rstrip("\n") for l in lines if str(l).strip() != ""]
-        with self._lock:
+    def append_file(self, tenant_id: str, run_id: str, rel_path: str, lines: Union[str, List[str]], unique: bool = True) -> Dict[str, Any]:
+        target = self.resolve(tenant_id, run_id, rel_path)
+        incoming = [lines] if isinstance(lines, str) else [str(x) for x in lines]
+        normalized: List[str] = []
+        for chunk in incoming:
+            for part in str(chunk).split("\n"):
+                normalized.append(part.rstrip("\r"))
+        with self._lock_for(str(target)):
+            target.parent.mkdir(parents=True, exist_ok=True)
             existing_text = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
-            existing = existing_text.splitlines()
-            existing_set = set(existing)
+            existing_lines = existing_text.splitlines()
+            existing_set = set(existing_lines) if unique else set()
             added: List[str] = []
             skipped: List[str] = []
-            for line in incoming:
-                if unique and (line in existing_set or line in added):
-                    skipped.append(line)
+            for ln in normalized:
+                if unique and (ln in existing_set):
+                    skipped.append(ln)
                     continue
-                added.append(line)
+                added.append(ln)
+                if unique:
+                    existing_set.add(ln)
             if added:
-                needs_nl = bool(existing_text) and not existing_text.endswith("\n")
-                with target.open("a", encoding="utf-8") as fh:
-                    if needs_nl:
-                        fh.write("\n")
-                    fh.write("\n".join(added) + "\n")
-        return {
-            "path": str(target.relative_to(self.root)),
-            "added": added,
-            "skipped": skipped,
-            "added_count": len(added),
-            "skipped_count": len(skipped),
-        }
+                body = existing_text
+                if body and not body.endswith("\n"):
+                    body += "\n"
+                body += "\n".join(added) + "\n"
+                fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".tmp_", suffix=".part")
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                        fh.write(body)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.replace(tmp, target)
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        os.unlink(tmp)
+                    raise
+                self._index(tenant_id, run_id, target, body.encode("utf-8"))
+            total = len((target.read_text(encoding="utf-8", errors="replace") if target.exists() else "").splitlines())
+        return {"path": rel_path, "added": len(added), "skipped": len(skipped), "total_lines": total, "unique": unique}
 
-    def replace_lines(self, path: str, start_line: int, end_line: int, replacement: Union[str, Sequence[str]]) -> Dict[str, Any]:
-        target = self.resolve(path)
+    def replace_lines(self, tenant_id: str, run_id: str, rel_path: str, start: int, end: int, content: Union[str, List[str]]) -> Dict[str, Any]:
+        target = self.resolve(tenant_id, run_id, rel_path)
         if not target.exists():
-            raise FileNotFoundError(f"no such file: {path}")
-        new_lines = replacement.splitlines() if isinstance(replacement, str) else [str(x) for x in replacement]
-        with self._lock:
-            original = target.read_text(encoding="utf-8", errors="replace").splitlines()
-            s = max(1, int(start_line))
-            e = min(len(original), int(end_line)) if int(end_line) > 0 else s - 1
-            if s > len(original) + 1:
-                raise ValueError("start_line beyond end of file")
-            head = original[: s - 1]
-            tail = original[e:] if e >= s - 1 else original[s - 1 :]
-            merged = head + new_lines + tail
-            tmp = target.with_name(target.name + f".tmp.{secrets.token_hex(6)}")
-            tmp.write_text("\n".join(merged) + ("\n" if merged else ""), encoding="utf-8")
-            os.replace(tmp, target)
+            raise FileNotFoundError(f"file not found: {rel_path}")
+        new_lines = content.split("\n") if isinstance(content, str) else [str(x) for x in content]
+        with self._lock_for(str(target)):
+            text = target.read_text(encoding="utf-8", errors="replace")
+            lines = text.splitlines()
+            s = max(1, int(start))
+            e = max(s - 1, min(int(end), len(lines)))
+            if s > len(lines) + 1:
+                raise ValidationError(f"start line {s} beyond file length {len(lines)}")
+            replaced = lines[s - 1 : e]
+            merged = lines[: s - 1] + new_lines + lines[e:]
+            body = "\n".join(merged)
+            if body and not body.endswith("\n"):
+                body += "\n"
+            fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".tmp_", suffix=".part")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(body)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, target)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    os.unlink(tmp)
+                raise
+            self._index(tenant_id, run_id, target, body.encode("utf-8"))
         return {
-            "path": str(target.relative_to(self.root)),
-            "replaced_range": [s, e],
-            "removed_lines": max(0, e - s + 1),
+            "path": rel_path,
+            "replaced_lines": len(replaced),
             "inserted_lines": len(new_lines),
             "total_lines": len(merged),
+            "start": s,
+            "end": e,
         }
 
-    def check_lines(self, path: str, lines: Sequence[str]) -> Dict[str, Any]:
-        target = self.resolve(path)
+    def check_lines(self, tenant_id: str, run_id: str, rel_path: str, candidates: List[str]) -> Dict[str, Any]:
+        target = self.resolve(tenant_id, run_id, rel_path)
         present: Dict[str, bool] = {}
         existing: Set[str] = set()
         if target.exists() and target.is_file():
-            existing = set(target.read_text(encoding="utf-8", errors="replace").splitlines())
-        for line in lines:
-            key = str(line).rstrip("\n")
-            present[key] = key in existing
-        return {
-            "path": str(target.relative_to(self.root)) if target.exists() else str(path),
-            "results": present,
-            "all_present": all(present.values()) if present else True,
-            "missing": [k for k, v in present.items() if not v],
-        }
+            with self._lock_for(str(target)):
+                existing = set(target.read_text(encoding="utf-8", errors="replace").splitlines())
+        for cand in candidates:
+            present[str(cand)] = str(cand) in existing
+        return {"path": rel_path, "results": present, "missing": [k for k, v in present.items() if not v], "found": [k for k, v in present.items() if v]}
 
-    def list_dir(self, path: str = ".", depth: int = 1) -> Dict[str, Any]:
-        target = self.resolve(path) if path not in ("", ".", "./") else self.root
+    def list_dir(self, tenant_id: str, run_id: str, rel_path: str = ".") -> Dict[str, Any]:
+        target = self.resolve(tenant_id, run_id, rel_path)
         if not target.exists():
-            raise FileNotFoundError(f"no such directory: {path}")
+            return {"path": rel_path, "entries": []}
         entries: List[Dict[str, Any]] = []
-        base_depth = len(target.parts)
-        for item in sorted(target.rglob("*")):
-            if len(item.parts) - base_depth > max(1, depth):
-                continue
+        base = self.run_root(tenant_id, run_id)
+        for child in sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name)):
             try:
-                rel = str(item.relative_to(self.root))
-            except ValueError:
+                stat = child.stat()
+            except Exception:
                 continue
             entries.append(
                 {
-                    "path": rel,
-                    "type": "dir" if item.is_dir() else "file",
-                    "bytes": item.stat().st_size if item.is_file() else 0,
+                    "name": child.name,
+                    "rel_path": str(child.relative_to(base)),
+                    "type": "dir" if child.is_dir() else "file",
+                    "bytes": stat.st_size,
+                    "modified": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
                 }
             )
-            if len(entries) >= 800:
-                break
-        return {"root": str(target.relative_to(self.root)) if target != self.root else ".", "entries": entries}
+        return {"path": rel_path, "entries": entries[:400]}
 
-    def delete(self, path: str) -> Dict[str, Any]:
-        target = self.resolve(path)
-        if target == self.root:
-            raise ValueError("cannot delete sandbox root")
-        with self._lock:
+    def delete_file(self, tenant_id: str, run_id: str, rel_path: str) -> Dict[str, Any]:
+        target = self.resolve(tenant_id, run_id, rel_path)
+        base = self.run_root(tenant_id, run_id).resolve()
+        if target == base:
+            raise SecurityError("cannot delete workspace root")
+        with self._lock_for(str(target)):
             if target.is_dir():
-                shutil.rmtree(target)
+                shutil.rmtree(target, ignore_errors=True)
             elif target.exists():
                 target.unlink()
             else:
-                raise FileNotFoundError(f"no such path: {path}")
-        return {"deleted": str(path)}
+                return {"path": rel_path, "deleted": False}
+        STORE.execute("DELETE FROM file_index WHERE tenant_id = ? AND rel_path = ?", (tenant_id, str(rel_path)))
+        return {"path": rel_path, "deleted": True}
 
-    def search(self, pattern: str, glob: str = "**/*") -> Dict[str, Any]:
-        rx = re.compile(pattern)
-        hits: List[Dict[str, Any]] = []
-        for item in sorted(self.root.glob(glob)):
-            if not item.is_file():
-                continue
+    def _index(self, tenant_id: str, run_id: str, target: Path, data: bytes) -> None:
+        try:
+            rel = str(target.relative_to(self.tenant_root(tenant_id)))
+        except Exception:
+            rel = target.name
+        STORE.execute(
+            "INSERT INTO file_index(file_id, tenant_id, run_id, rel_path, sha256, bytes, updated_at) VALUES(?,?,?,?,?,?,?) "
+            "ON CONFLICT(tenant_id, rel_path) DO UPDATE SET sha256=excluded.sha256, bytes=excluded.bytes, updated_at=excluded.updated_at, run_id=excluded.run_id",
+            (new_id("file"), tenant_id, run_id, rel, hashlib.sha256(data).hexdigest(), len(data), iso()),
+        )
+
+
+WORKSPACE = WorkspaceManager(WORKSPACE_ROOT)
+
+
+@dataclass
+class Skill:
+    skill_id: str
+    tenant_id: str
+    name: str
+    version: int
+    category: str
+    summary: str
+    preconditions: List[str]
+    procedure: List[str]
+    failure_modes: List[str]
+    tags: List[str]
+    uses: int
+    successes: int
+    failures: int
+    score: float
+    status: str
+
+    @staticmethod
+    def from_row(row: sqlite3.Row) -> "Skill":
+        return Skill(
+            skill_id=row["skill_id"],
+            tenant_id=row["tenant_id"],
+            name=row["name"],
+            version=int(row["version"]),
+            category=row["category"],
+            summary=row["summary"],
+            preconditions=jload(row["preconditions"], []) or [],
+            procedure=jload(row["procedure"], []) or [],
+            failure_modes=jload(row["failure_modes"], []) or [],
+            tags=jload(row["tags"], []) or [],
+            uses=int(row["uses"]),
+            successes=int(row["successes"]),
+            failures=int(row["failures"]),
+            score=float(row["score"]),
+            status=row["status"],
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    def render(self) -> str:
+        parts = [f"SKILL {self.name} (v{self.version}, score={self.score:.2f}, category={self.category})", f"SUMMARY: {self.summary}"]
+        if self.preconditions:
+            parts.append("PRECONDITIONS: " + "; ".join(str(p) for p in self.preconditions[:8]))
+        if self.procedure:
+            parts.append("PROCEDURE:")
+            for i, step in enumerate(self.procedure[:14], 1):
+                parts.append(f"  {i}. {step}")
+        if self.failure_modes:
+            parts.append("KNOWN FAILURES: " + "; ".join(str(f) for f in self.failure_modes[:6]))
+        return "\n".join(parts)
+
+
+class ExperientialMemory:
+    def __init__(self, store: SQLiteStore, embedder: HashingEmbedder):
+        self.store = store
+        self.embedder = embedder
+        self._lock = threading.RLock()
+
+    def _text_of(self, name: str, summary: str, procedure: List[str], tags: List[str], category: str) -> str:
+        return " \n".join([name, category, summary, " ".join(str(p) for p in procedure), " ".join(str(t) for t in tags)])
+
+    def upsert(
+        self,
+        tenant_id: str,
+        name: str,
+        summary: str,
+        procedure: List[str],
+        preconditions: Optional[List[str]] = None,
+        failure_modes: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        category: str = "general",
+        skill_id: Optional[str] = None,
+    ) -> Skill:
+        preconditions = [str(x) for x in (preconditions or [])][:16]
+        failure_modes = [str(x) for x in (failure_modes or [])][:16]
+        tags = [str(x).lower() for x in (tags or [])][:16]
+        procedure = [str(x) for x in (procedure or [])][:32]
+        text = self._text_of(name, summary, procedure, tags, category)
+        emb = pack_vector(self.embedder.embed(text))
+        with self._lock:
+            row = None
+            if skill_id:
+                row = self.store.one("SELECT * FROM skills WHERE skill_id = ? AND tenant_id = ?", (skill_id, tenant_id))
+            if row is None:
+                row = self.store.one("SELECT * FROM skills WHERE tenant_id = ? AND name = ?", (tenant_id, name))
+            now = iso()
+            if row is None:
+                sid = skill_id or new_id("skill")
+                self.store.execute(
+                    "INSERT INTO skills(skill_id, tenant_id, name, version, category, summary, preconditions, procedure, failure_modes, tags, embedding, uses, successes, failures, score, status, created_at, updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,0,0,0,?,'active',?,?)",
+                    (
+                        sid,
+                        tenant_id,
+                        name,
+                        1,
+                        category,
+                        summary,
+                        jdump(preconditions),
+                        jdump(procedure),
+                        jdump(failure_modes),
+                        jdump(tags),
+                        emb,
+                        0.5,
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                sid = row["skill_id"]
+                self.store.execute(
+                    "UPDATE skills SET name=?, version=version+1, category=?, summary=?, preconditions=?, procedure=?, failure_modes=?, tags=?, embedding=?, updated_at=?, status='active' WHERE skill_id=?",
+                    (
+                        name,
+                        category,
+                        summary,
+                        jdump(preconditions),
+                        jdump(procedure),
+                        jdump(failure_modes),
+                        jdump(tags),
+                        emb,
+                        now,
+                        sid,
+                    ),
+                )
+            self.store.execute("DELETE FROM skills_fts WHERE skill_id = ?", (sid,))
+            self.store.execute(
+                "INSERT INTO skills_fts(skill_id, tenant_id, name, summary, procedure, tags) VALUES(?,?,?,?,?,?)",
+                (sid, tenant_id, name, summary, " \n".join(procedure), " ".join(tags)),
+            )
+            fresh = self.store.one("SELECT * FROM skills WHERE skill_id = ?", (sid,))
+            return Skill.from_row(fresh)
+
+    def get(self, tenant_id: str, skill_id: str) -> Optional[Skill]:
+        row = self.store.one("SELECT * FROM skills WHERE skill_id = ? AND tenant_id = ?", (skill_id, tenant_id))
+        return Skill.from_row(row) if row else None
+
+    def list(self, tenant_id: str, limit: int = 200) -> List[Skill]:
+        rows = self.store.query(
+            "SELECT * FROM skills WHERE tenant_id = ? AND status = 'active' ORDER BY score DESC, updated_at DESC LIMIT ?",
+            (tenant_id, int(limit)),
+        )
+        return [Skill.from_row(r) for r in rows]
+
+    def retire(self, tenant_id: str, skill_id: str) -> bool:
+        self.store.execute("UPDATE skills SET status='retired', updated_at=? WHERE skill_id=? AND tenant_id=?", (iso(), skill_id, tenant_id))
+        return True
+
+    def search(self, tenant_id: str, query_text: str, limit: int = 2) -> List[Tuple[Skill, float]]:
+        query_text = (query_text or "").strip()
+        if not query_text:
+            return [(s, s.score) for s in self.list(tenant_id, limit)][:limit]
+        rows = self.store.query("SELECT * FROM skills WHERE tenant_id = ? AND status='active'", (tenant_id,))
+        if not rows:
+            return []
+        skills = {r["skill_id"]: r for r in rows}
+        qvec = self.embedder.embed(query_text)
+        dense_scores: List[Tuple[str, float]] = []
+        for sid, r in skills.items():
+            sim = self.embedder.cosine(qvec, unpack_vector(r["embedding"]))
+            dense_scores.append((sid, sim))
+        dense_scores.sort(key=lambda kv: kv[1], reverse=True)
+        dense_ranking = [sid for sid, _ in dense_scores[:50]]
+        sparse_ranking: List[str] = []
+        match = fts_escape(query_text)
+        if match:
             try:
-                text = item.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+                frows = self.store.query(
+                    "SELECT skill_id, bm25(skills_fts) AS rank FROM skills_fts WHERE skills_fts MATCH ? AND tenant_id = ? ORDER BY rank LIMIT 50",
+                    (match, tenant_id),
+                )
+                sparse_ranking = [r["skill_id"] for r in frows if r["skill_id"] in skills]
+            except Exception as exc:
+                log.debug("skills fts failed: %s", exc)
+        prior_ranking = [sid for sid, _ in sorted(((k, float(v["score"])) for k, v in skills.items()), key=lambda kv: kv[1], reverse=True)[:50]]
+        fused = reciprocal_rank_fusion([dense_ranking, sparse_ranking, prior_ranking], weights=[1.0, 0.85, 0.35])
+        out: List[Tuple[Skill, float]] = []
+        for sid, score in fused[: max(1, limit)]:
+            row = skills.get(sid)
+            if row is None:
                 continue
-            for idx, line in enumerate(text.splitlines(), start=1):
-                if rx.search(line):
-                    hits.append({"path": str(item.relative_to(self.root)), "line": idx, "text": line[:400]})
-                    if len(hits) >= 300:
-                        return {"pattern": pattern, "hits": hits, "truncated": True}
-        return {"pattern": pattern, "hits": hits, "truncated": False}
+            out.append((Skill.from_row(row), float(score)))
+        return out
+
+    def record_outcome(self, skill_id: str, success: bool) -> None:
+        with self.store.tx() as c:
+            row = c.execute("SELECT uses, successes, failures FROM skills WHERE skill_id = ?", (skill_id,)).fetchone()
+            if row is None:
+                return
+            uses = int(row[0]) + 1
+            successes = int(row[1]) + (1 if success else 0)
+            failures = int(row[2]) + (0 if success else 1)
+            score = (successes + 1.0) / (uses + 2.0)
+            c.execute(
+                "UPDATE skills SET uses=?, successes=?, failures=?, score=?, updated_at=? WHERE skill_id=?",
+                (uses, successes, failures, score, iso(), skill_id),
+            )
+
+
+EM = ExperientialMemory(STORE, EMBEDDER)
+
+
+class WorkingMemory:
+    def __init__(self, store: SQLiteStore):
+        self.store = store
+
+    def load(self, tenant_id: str, run_id: str) -> Dict[str, Any]:
+        row = self.store.one("SELECT * FROM working_memory WHERE run_id = ? AND tenant_id = ?", (run_id, tenant_id))
+        if row is None:
+            return {"progress": [], "open_goals": [], "dependencies": [], "constraints": [], "facts": {}}
+        return {
+            "progress": jload(row["progress"], []) or [],
+            "open_goals": jload(row["open_goals"], []) or [],
+            "dependencies": jload(row["dependencies"], []) or [],
+            "constraints": jload(row["constraints"], []) or [],
+            "facts": jload(row["facts"], {}) or {},
+        }
+
+    def sync_from_sigma(self, tenant_id: str, run_id: str, sigma: Dict[str, Any]) -> Dict[str, Any]:
+        wm = {
+            "progress": list(sigma.get("progress") or [])[-24:],
+            "open_goals": list(sigma.get("open_goals") or [])[-24:],
+            "dependencies": list(sigma.get("dependencies") or [])[-24:],
+            "constraints": list(sigma.get("constraints") or [])[-24:],
+            "facts": dict(sigma.get("facts") or {}),
+        }
+        row = self.store.one("SELECT wm_id FROM working_memory WHERE run_id = ?", (run_id,))
+        now = iso()
+        if row is None:
+            self.store.execute(
+                "INSERT INTO working_memory(wm_id, run_id, tenant_id, progress, open_goals, dependencies, constraints, facts, updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (new_id("wm"), run_id, tenant_id, jdump(wm["progress"]), jdump(wm["open_goals"]), jdump(wm["dependencies"]), jdump(wm["constraints"]), jdump(wm["facts"]), now),
+            )
+        else:
+            self.store.execute(
+                "UPDATE working_memory SET progress=?, open_goals=?, dependencies=?, constraints=?, facts=?, updated_at=? WHERE run_id=?",
+                (jdump(wm["progress"]), jdump(wm["open_goals"]), jdump(wm["dependencies"]), jdump(wm["constraints"]), jdump(wm["facts"]), now, run_id),
+            )
+        return wm
+
+    def routing_query(self, spec: ProceduralSpec, sigma: Dict[str, Any], observation: Observation) -> str:
+        pieces: List[str] = [spec.objective]
+        subgoal = sigma.get("current_subgoal") or ""
+        if subgoal:
+            pieces.append(str(subgoal))
+        for goal in list(sigma.get("open_goals") or [])[:4]:
+            pieces.append(str(goal))
+        for err in list(sigma.get("errors") or [])[-3:]:
+            pieces.append(str(err))
+        if observation and observation.summary:
+            pieces.append(observation.summary[:400])
+        if observation and observation.error:
+            pieces.append(observation.error[:400])
+        for c in list(sigma.get("constraints") or [])[:3]:
+            pieces.append(str(c))
+        return "\n".join(p for p in pieces if p)[:4000]
+
+
+WM = WorkingMemory(STORE)
+
+
+class WikiKnowledgeBase:
+    def __init__(self, store: SQLiteStore, root: Path, embedder: HashingEmbedder):
+        self.store = store
+        self.root = root
+        self.embedder = embedder
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._git_ready = self._init_git()
+        self._lock = threading.RLock()
+
+    def _git(self, *args: str) -> Tuple[int, str]:
+        try:
+            proc = subprocess.run(
+                ["git", *args],
+                cwd=str(self.root),
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+        except FileNotFoundError:
+            return 127, "git not installed"
+        except Exception as exc:
+            return 1, str(exc)
+
+    def _init_git(self) -> bool:
+        if shutil.which("git") is None:
+            log.info("git unavailable; wiki versioning will use internal revisions only")
+            return False
+        if not (self.root / ".git").exists():
+            code, out = self._git("init")
+            if code != 0:
+                log.warning("git init failed: %s", out)
+                return False
+            self._git("config", "user.email", "agent@runtime.local")
+            self._git("config", "user.name", "Agent Runtime")
+        return True
+
+    @staticmethod
+    def slugify(title: str) -> str:
+        s = re.sub(r"[^a-z0-9]+", "-", (title or "page").lower()).strip("-")
+        return (s or "page")[:80]
+
+    @staticmethod
+    def unified_diff(old: str, new: str) -> str:
+        import difflib
+
+        diff = difflib.unified_diff(
+            old.splitlines(keepends=False),
+            new.splitlines(keepends=False),
+            fromfile="previous",
+            tofile="current",
+            lineterm="",
+            n=2,
+        )
+        return "\n".join(list(diff)[:600])
+
+    def upsert(self, tenant_id: str, title: str, body: str, category: str = "general") -> Dict[str, Any]:
+        slug = self.slugify(title)
+        with self._lock:
+            row = self.store.one("SELECT * FROM wiki_pages WHERE tenant_id = ? AND slug = ?", (tenant_id, slug))
+            now = iso()
+            emb = pack_vector(self.embedder.embed(f"{title}\n{category}\n{body}"))
+            if row is None:
+                page_id = new_id("wiki")
+                version = 1
+                old_body = ""
+                self.store.execute(
+                    "INSERT INTO wiki_pages(page_id, tenant_id, slug, title, category, body, version, embedding, updated_at, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (page_id, tenant_id, slug, title, category, body, version, emb, now, now),
+                )
+            else:
+                page_id = row["page_id"]
+                version = int(row["version"]) + 1
+                old_body = row["body"]
+                self.store.execute(
+                    "UPDATE wiki_pages SET title=?, category=?, body=?, version=?, embedding=?, updated_at=? WHERE page_id=?",
+                    (title, category, body, version, emb, now, page_id),
+                )
+            diff = self.unified_diff(old_body, body)
+            self.store.execute(
+                "INSERT INTO wiki_revisions(revision_id, page_id, tenant_id, version, diff, body, created_at) VALUES(?,?,?,?,?,?,?)",
+                (new_id("rev"), page_id, tenant_id, version, diff, body, now),
+            )
+            self.store.execute("DELETE FROM wiki_fts WHERE page_id = ?", (page_id,))
+            self.store.execute(
+                "INSERT INTO wiki_fts(page_id, tenant_id, title, body, category) VALUES(?,?,?,?,?)",
+                (page_id, tenant_id, title, body, category),
+            )
+            tenant_dir = self.root / re.sub(r"[^A-Za-z0-9_.-]", "_", tenant_id)[:64]
+            tenant_dir.mkdir(parents=True, exist_ok=True)
+            file_path = tenant_dir / f"{slug}.md"
+            header = f"# {title}\n\nCategory: {category}\nVersion: {version}\nUpdated: {now}\n\n"
+            file_path.write_text(header + body + "\n", encoding="utf-8")
+            commit_out = ""
+            if self._git_ready:
+                self._git("add", "-A")
+                code, commit_out = self._git("commit", "-m", f"wiki: {tenant_id}/{slug} v{version}")
+                if code != 0 and "nothing to commit" not in commit_out:
+                    log.debug("git commit note: %s", commit_out[:200])
+            return {"page_id": page_id, "slug": slug, "version": version, "diff": diff, "path": str(file_path.relative_to(self.root))}
+
+    def search(self, tenant_id: str, query_text: str, limit: int = 4) -> List[Dict[str, Any]]:
+        rows = self.store.query("SELECT * FROM wiki_pages WHERE tenant_id = ?", (tenant_id,))
+        if not rows:
+            return []
+        by_id = {r["page_id"]: r for r in rows}
+        qvec = self.embedder.embed(query_text or "")
+        dense = sorted(((r["page_id"], self.embedder.cosine(qvec, unpack_vector(r["embedding"]))) for r in rows), key=lambda kv: kv[1], reverse=True)
+        dense_ranking = [pid for pid, _ in dense[:50]]
+        sparse_ranking: List[str] = []
+        match = fts_escape(query_text or "")
+        if match:
+            try:
+                frows = self.store.query(
+                    "SELECT page_id, bm25(wiki_fts) AS rank FROM wiki_fts WHERE wiki_fts MATCH ? AND tenant_id = ? ORDER BY rank LIMIT 50",
+                    (match, tenant_id),
+                )
+                sparse_ranking = [r["page_id"] for r in frows if r["page_id"] in by_id]
+            except Exception as exc:
+                log.debug("wiki fts failed: %s", exc)
+        fused = reciprocal_rank_fusion([dense_ranking, sparse_ranking], weights=[1.0, 1.0])
+        out: List[Dict[str, Any]] = []
+        for pid, score in fused[: max(1, limit)]:
+            r = by_id.get(pid)
+            if r is None:
+                continue
+            out.append(
+                {
+                    "page_id": pid,
+                    "slug": r["slug"],
+                    "title": r["title"],
+                    "category": r["category"],
+                    "version": int(r["version"]),
+                    "score": float(score),
+                    "excerpt": (r["body"] or "")[:900],
+                }
+            )
+        return out
+
+    def list_pages(self, tenant_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        rows = self.store.query(
+            "SELECT page_id, slug, title, category, version, updated_at FROM wiki_pages WHERE tenant_id = ? ORDER BY updated_at DESC LIMIT ?",
+            (tenant_id, int(limit)),
+        )
+        return [dict(r) for r in rows]
+
+    def get_page(self, tenant_id: str, slug: str) -> Optional[Dict[str, Any]]:
+        row = self.store.one("SELECT * FROM wiki_pages WHERE tenant_id = ? AND slug = ?", (tenant_id, slug))
+        if row is None:
+            return None
+        return {
+            "page_id": row["page_id"],
+            "slug": row["slug"],
+            "title": row["title"],
+            "category": row["category"],
+            "version": int(row["version"]),
+            "body": row["body"],
+            "updated_at": row["updated_at"],
+        }
+
+
+WIKI = WikiKnowledgeBase(STORE, WIKI_ROOT, EMBEDDER)
+
+
+class RawTraceLayer:
+    def __init__(self, store: SQLiteStore, root: Path):
+        self.store = store
+        self.root = root
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+
+    def append(
+        self,
+        tenant_id: str,
+        run_id: str,
+        step: int,
+        kind: str,
+        pre_state: Dict[str, Any],
+        action: Dict[str, Any],
+        outcome: Dict[str, Any],
+        state_delta: Dict[str, Any],
+        success: bool,
+        latency_ms: int,
+        skill_id: Optional[str] = None,
+        receipt: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        trace_id = new_id("trc")
+        payload = {
+            "trace_id": trace_id,
+            "tenant_id": tenant_id,
+            "run_id": run_id,
+            "step": step,
+            "kind": kind,
+            "skill_id": skill_id,
+            "pre_state": pre_state,
+            "action": action,
+            "outcome": outcome,
+            "state_delta": state_delta,
+            "success": bool(success),
+            "latency_ms": int(latency_ms),
+            "created_at": iso(),
+        }
+        receipt = receipt or {}
+        receipt.setdefault("signature", sign_payload(payload))
+        receipt.setdefault("host", os.environ.get("HOSTNAME", "local"))
+        receipt.setdefault("pid", os.getpid())
+        digest = stable_hash(payload)
+        self.store.execute(
+            "INSERT INTO raw_traces(trace_id, run_id, tenant_id, step, kind, skill_id, pre_state, action, outcome, state_delta, receipt, success, latency_ms, created_at, digest) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                trace_id,
+                run_id,
+                tenant_id,
+                step,
+                kind,
+                skill_id,
+                jdump(pre_state),
+                jdump(action),
+                jdump(outcome),
+                jdump(state_delta),
+                jdump(receipt),
+                1 if success else 0,
+                int(latency_ms),
+                payload["created_at"],
+                digest,
+            ),
+        )
+        with self._lock:
+            path = self.root / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', run_id)}.jsonl"
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(jdump({**payload, "receipt": receipt, "digest": digest}) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        return trace_id
+
+    def for_run(self, run_id: str, limit: int = 500) -> List[Dict[str, Any]]:
+        rows = self.store.query("SELECT * FROM raw_traces WHERE run_id = ? ORDER BY step ASC, created_at ASC LIMIT ?", (run_id, int(limit)))
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "trace_id": r["trace_id"],
+                    "step": int(r["step"]),
+                    "kind": r["kind"],
+                    "skill_id": r["skill_id"],
+                    "action": jload(r["action"], {}),
+                    "outcome": jload(r["outcome"], {}),
+                    "state_delta": jload(r["state_delta"], {}),
+                    "success": bool(r["success"]),
+                    "latency_ms": int(r["latency_ms"]),
+                    "created_at": r["created_at"],
+                }
+            )
+        return out
+
+    def failures(self, tenant_id: str, limit: int = 60) -> List[Dict[str, Any]]:
+        rows = self.store.query(
+            "SELECT * FROM raw_traces WHERE tenant_id = ? AND success = 0 ORDER BY created_at DESC LIMIT ?",
+            (tenant_id, int(limit)),
+        )
+        return [
+            {
+                "trace_id": r["trace_id"],
+                "run_id": r["run_id"],
+                "step": int(r["step"]),
+                "kind": r["kind"],
+                "skill_id": r["skill_id"],
+                "action": jload(r["action"], {}),
+                "outcome": jload(r["outcome"], {}),
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
+
+TRACES = RawTraceLayer(STORE, TRACE_ROOT)
+
+
+SAFE_BUILTINS = {
+    "abs": abs,
+    "all": all,
+    "any": any,
+    "ascii": ascii,
+    "bin": bin,
+    "bool": bool,
+    "bytes": bytes,
+    "callable": callable,
+    "chr": chr,
+    "complex": complex,
+    "dict": dict,
+    "divmod": divmod,
+    "enumerate": enumerate,
+    "filter": filter,
+    "float": float,
+    "format": format,
+    "frozenset": frozenset,
+    "hash": hash,
+    "hex": hex,
+    "int": int,
+    "isinstance": isinstance,
+    "issubclass": issubclass,
+    "iter": iter,
+    "len": len,
+    "list": list,
+    "map": map,
+    "max": max,
+    "min": min,
+    "next": next,
+    "oct": oct,
+    "ord": ord,
+    "pow": pow,
+    "print": print,
+    "range": range,
+    "repr": repr,
+    "reversed": reversed,
+    "round": round,
+    "set": set,
+    "slice": slice,
+    "sorted": sorted,
+    "str": str,
+    "sum": sum,
+    "tuple": tuple,
+    "type": type,
+    "zip": zip,
+    "True": True,
+    "False": False,
+    "None": None,
+    "Exception": Exception,
+    "ValueError": ValueError,
+    "TypeError": TypeError,
+    "KeyError": KeyError,
+    "IndexError": IndexError,
+    "ZeroDivisionError": ZeroDivisionError,
+    "ArithmeticError": ArithmeticError,
+    "StopIteration": StopIteration,
+    "AssertionError": AssertionError,
+}
+
+BLOCKED_PY_PATTERNS = [
+    r"\bimport\s+(os|sys|subprocess|socket|shutil|ctypes|multiprocessing|threading|pickle|marshal|importlib|pty|signal|resource)\b",
+    r"\bfrom\s+(os|sys|subprocess|socket|shutil|ctypes|multiprocessing|threading|pickle|marshal|importlib|pty|signal|resource)\s+import\b",
+    r"__import__",
+    r"\beval\s*\(",
+    r"\bexec\s*\(",
+    r"\bcompile\s*\(",
+    r"\bopen\s*\(",
+    r"\bglobals\s*\(",
+    r"\blocals\s*\(",
+    r"\bvars\s*\(",
+    r"\bgetattr\s*\(",
+    r"\bsetattr\s*\(",
+    r"\bdelattr\s*\(",
+    r"__subclasses__",
+    r"__mro__",
+    r"__bases__",
+    r"__globals__",
+    r"__code__",
+    r"__builtins__",
+]
+
+SHELL_ALLOWED = {
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "grep",
+    "find",
+    "sort",
+    "uniq",
+    "cut",
+    "tr",
+    "sed",
+    "awk",
+    "diff",
+    "echo",
+    "pwd",
+    "date",
+    "stat",
+    "du",
+    "mkdir",
+    "touch",
+    "cp",
+    "mv",
+    "python3",
+    "python",
+    "node",
+    "jq",
+}
+
+SHELL_FORBIDDEN_TOKENS = ["rm ", "rm\t", ":(){", "mkfs", "dd ", "shutdown", "reboot", "chmod 777 /", "chown", "sudo", "curl ", "wget ", "nc ", "ssh ", "/etc/passwd", "/dev/sd"]
+
+
+class PythonSandbox:
+    def __init__(self, timeout_s: float = 20.0, max_output: int = 20000):
+        self.timeout_s = timeout_s
+        self.max_output = max_output
+
+    def _screen(self, code: str) -> None:
+        for pattern in BLOCKED_PY_PATTERNS:
+            if re.search(pattern, code):
+                raise SecurityError(f"blocked construct matched: {pattern}")
+
+    def run(self, code: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        if not code or not code.strip():
+            raise ValidationError("empty code")
+        if len(code) > 200000:
+            raise ValidationError("code too large")
+        self._screen(code)
+        import io
+
+        allowed_modules = {
+            "math": __import__("math"),
+            "json": __import__("json"),
+            "re": __import__("re"),
+            "random": __import__("random"),
+            "statistics": __import__("statistics"),
+            "itertools": __import__("itertools"),
+            "functools": __import__("functools"),
+            "collections": __import__("collections"),
+            "datetime": __import__("datetime"),
+            "decimal": __import__("decimal"),
+            "fractions": __import__("fractions"),
+            "hashlib": __import__("hashlib"),
+            "base64": __import__("base64"),
+            "textwrap": __import__("textwrap"),
+            "string": __import__("string"),
+            "heapq": __import__("heapq"),
+            "bisect": __import__("bisect"),
+            "difflib": __import__("difflib"),
+            "unicodedata": __import__("unicodedata"),
+            "uuid": __import__("uuid"),
+        }
+
+        def guarded_import(name: str, globals_=None, locals_=None, fromlist=(), level=0):
+            root = name.split(".")[0]
+            if root not in allowed_modules:
+                raise SecurityError(f"import of module '{name}' is not permitted")
+            return allowed_modules[root]
+
+        builtins_map = dict(SAFE_BUILTINS)
+        builtins_map["__import__"] = guarded_import
+        env: Dict[str, Any] = {"__builtins__": builtins_map, "__name__": "sandbox"}
+        env.update(allowed_modules)
+        if variables:
+            for k, v in variables.items():
+                if isinstance(k, str) and k.isidentifier():
+                    env[k] = v
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        result_holder: Dict[str, Any] = {}
+        error_holder: Dict[str, str] = {}
+
+        def target():
+            try:
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    compiled = compile(code, "<sandbox>", "exec")
+                    exec(compiled, env, env)
+                    if "result" in env:
+                        try:
+                            result_holder["result"] = json.loads(jdump(env["result"]))
+                        except Exception:
+                            result_holder["result"] = str(env["result"])[: self.max_output]
+            except BaseException as exc:
+                error_holder["error"] = f"{type(exc).__name__}: {exc}"
+                error_holder["traceback"] = "".join(traceback.format_exception_only(type(exc), exc))
+
+        thread = threading.Thread(target=target, daemon=True)
+        started = time.time()
+        thread.start()
+        thread.join(self.timeout_s)
+        timed_out = thread.is_alive()
+        elapsed = int((time.time() - started) * 1000)
+        out = stdout.getvalue()[: self.max_output]
+        err = stderr.getvalue()[: self.max_output]
+        return {
+            "ok": (not timed_out) and ("error" not in error_holder),
+            "stdout": out,
+            "stderr": err,
+            "result": result_holder.get("result"),
+            "error": error_holder.get("error") if not timed_out else f"timeout after {self.timeout_s}s",
+            "latency_ms": elapsed,
+            "timed_out": timed_out,
+        }
+
+
+PY_SANDBOX = PythonSandbox()
+
+
+class ShellExecutor:
+    def __init__(self, timeout_s: float = 45.0, max_output: int = 40000):
+        self.timeout_s = timeout_s
+        self.max_output = max_output
+
+    def _screen(self, command: str) -> List[str]:
+        if not command or not command.strip():
+            raise ValidationError("empty command")
+        low = command.lower()
+        for tok in SHELL_FORBIDDEN_TOKENS:
+            if tok in low:
+                raise SecurityError(f"forbidden shell token: {tok.strip()}")
+        if any(ch in command for ch in ("`", "$(", ">", "<", "&")):
+            raise SecurityError("shell metacharacters are not permitted")
+        import shlex
+
+        segments = [seg.strip() for seg in command.split("|")]
+        parsed: List[List[str]] = []
+        for seg in segments:
+            if not seg:
+                raise ValidationError("empty pipeline segment")
+            argv = shlex.split(seg)
+            if not argv:
+                raise ValidationError("empty pipeline segment")
+            binary = os.path.basename(argv[0])
+            if binary not in SHELL_ALLOWED:
+                raise SecurityError(f"binary '{binary}' is not on the allowlist")
+            parsed.append(argv)
+        if len(parsed) > 1:
+            raise SecurityError("pipelines are not permitted")
+        return parsed[0]
+
+    def run(self, tenant_id: str, run_id: str, command: str) -> Dict[str, Any]:
+        argv = self._screen(command)
+        cwd = WORKSPACE.run_root(tenant_id, run_id)
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            "HOME": str(cwd),
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONUNBUFFERED": "1",
+        }
+        started = time.time()
+        try:
+            proc = subprocess.run(
+                argv,
+                cwd=str(cwd),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_s,
+                check=False,
+            )
+            return {
+                "ok": proc.returncode == 0,
+                "exit_code": proc.returncode,
+                "stdout": (proc.stdout or "")[: self.max_output],
+                "stderr": (proc.stderr or "")[: self.max_output],
+                "latency_ms": int((time.time() - started) * 1000),
+                "argv": argv,
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "ok": False,
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": f"timeout after {self.timeout_s}s",
+                "latency_ms": int((time.time() - started) * 1000),
+                "argv": argv,
+            }
+
+
+SHELL = ShellExecutor()
+
+
+class HttpFetcher:
+    BLOCKED_HOST_PATTERNS = [
+        r"^localhost$",
+        r"^127\.",
+        r"^0\.",
+        r"^10\.",
+        r"^192\.168\.",
+        r"^172\.(1[6-9]|2[0-9]|3[01])\.",
+        r"^169\.254\.",
+        r"^::1$",
+        r"^fc00:",
+        r"^fe80:",
+        r"metadata",
+    ]
+
+    def __init__(self, timeout_s: float = 25.0, max_bytes: int = 400000):
+        self.timeout_s = timeout_s
+        self.max_bytes = max_bytes
+
+    def _validate(self, url: str) -> str:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise SecurityError("only http/https schemes are permitted")
+        host = (parsed.hostname or "").lower()
+        if not host:
+            raise SecurityError("missing host")
+        for pattern in self.BLOCKED_HOST_PATTERNS:
+            if re.search(pattern, host):
+                raise SecurityError(f"host '{host}' is blocked by egress policy")
+        return url
+
+    def get(self, url: str, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        import urllib.request
+        import urllib.error
+
+        safe_url = self._validate(url)
+        req = urllib.request.Request(safe_url, method="GET")
+        req.add_header("User-Agent", "AgentRuntime/1.0")
+        req.add_header("Accept", "text/plain, text/html, application/json;q=0.9, */*;q=0.5")
+        if headers:
+            for k, v in list(headers.items())[:12]:
+                if str(k).lower() in ("authorization", "cookie", "proxy-authorization"):
+                    continue
+                req.add_header(str(k)[:64], str(v)[:512])
+        started = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+                raw = resp.read(self.max_bytes + 1)
+                truncated = len(raw) > self.max_bytes
+                body = raw[: self.max_bytes].decode("utf-8", errors="replace")
+                text = re.sub(r"<script[^>]*>.*?</script>", " ", body, flags=re.DOTALL | re.IGNORECASE)
+                text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+                text = re.sub(r"<[^>]+>", " ", text)
+                text = re.sub(r"\s+", " ", text).strip()
+                return {
+                    "ok": True,
+                    "status": resp.status,
+                    "url": safe_url,
+                    "content_type": resp.headers.get("Content-Type", ""),
+                    "text": text[:120000],
+                    "truncated": truncated,
+                    "latency_ms": int((time.time() - started) * 1000),
+                }
+        except urllib.error.HTTPError as exc:
+            return {"ok": False, "status": exc.code, "url": safe_url, "error": f"HTTP {exc.code}", "latency_ms": int((time.time() - started) * 1000)}
+        except Exception as exc:
+            return {"ok": False, "status": 0, "url": safe_url, "error": str(exc)[:500], "latency_ms": int((time.time() - started) * 1000)}
+
+
+HTTP = HttpFetcher()
 
 
 @dataclass
 class ToolSpec:
     name: str
     description: str
-    risk: ToolRisk
-    parameters: Dict[str, Any]
-    handler: Callable[["ToolContext", Dict[str, Any]], Dict[str, Any]]
-
-    def schema(self) -> Dict[str, Any]:
-        return {
-            "name": self.name,
-            "description": self.description,
-            "risk": self.risk.value,
-            "parameters": self.parameters,
-        }
-
-
-@dataclass
-class ToolContext:
-    tenant: Tenant
-    spec: ProcedureSpec
-    run_id: str
-    step: int
-    sandbox: FileSystemSandbox
-    memory: "MemorySubsystem"
-    state: ExecutionState
+    schema: Dict[str, Any]
+    handler: Callable[..., Dict[str, Any]]
+    mutating: bool = False
 
 
 class ToolRegistry:
-    def __init__(self) -> None:
-        self._tools: Dict[str, ToolSpec] = {}
+    def __init__(self):
+        self.tools: "OrderedDict[str, ToolSpec]" = OrderedDict()
 
-    def register(self, tool: ToolSpec) -> None:
-        self._tools[tool.name] = tool
+    def register(self, spec: ToolSpec) -> None:
+        self.tools[spec.name] = spec
 
-    def get(self, name: str) -> Optional[ToolSpec]:
-        return self._tools.get(name)
+    def get(self, name: str) -> ToolSpec:
+        spec = self.tools.get(name)
+        if spec is None:
+            raise ToolDenied(f"unknown tool '{name}'")
+        return spec
 
-    def names(self) -> List[str]:
-        return sorted(self._tools.keys())
-
-    def catalog(self, allowed: Optional[Set[str]] = None) -> List[Dict[str, Any]]:
-        out = []
-        for name in self.names():
+    def describe(self, allowed: Optional[List[str]] = None) -> str:
+        lines: List[str] = []
+        for name, spec in self.tools.items():
             if allowed is not None and name not in allowed:
                 continue
-            out.append(self._tools[name].schema())
-        return out
+            args = ", ".join(f"{k}:{v}" for k, v in spec.schema.items())
+            lines.append(f"- {name}({args}) :: {spec.description}")
+        return "\n".join(lines)
 
-    def execute(self, ctx: ToolContext, action: ActionCommand) -> Observation:
-        started = time.time()
-        tool = self.get(action.tool)
-        if tool is None:
-            return Observation(
-                step=ctx.step,
-                source=action.tool,
-                ok=False,
-                error=f"unknown tool '{action.tool}'",
-                latency_ms=int((time.time() - started) * 1000),
-            )
-        try:
-            FENCE.authorize(ctx.tenant, tool.name, tool.risk, ctx.spec, f"run:{ctx.run_id}")
-            payload = tool.handler(ctx, dict(action.arguments or {}))
-            verdict = OutputClassifier.classify(jdump(payload))
-            if not verdict["allowed"]:
-                return Observation(
-                    step=ctx.step,
-                    source=tool.name,
-                    ok=False,
-                    error=f"output rejected by classifier: {verdict['flags']}",
-                    latency_ms=int((time.time() - started) * 1000),
-                )
-            return Observation(
-                step=ctx.step,
-                source=tool.name,
-                ok=True,
-                payload=payload if isinstance(payload, dict) else {"result": payload},
-                latency_ms=int((time.time() - started) * 1000),
-            )
-        except AuthorizationDenied as exc:
-            return Observation(step=ctx.step, source=tool.name, ok=False, error=f"authorization denied: {exc}",
-                               latency_ms=int((time.time() - started) * 1000))
-        except Exception as exc:
-            return Observation(
-                step=ctx.step,
-                source=tool.name,
-                ok=False,
-                error=f"{type(exc).__name__}: {exc}",
-                latency_ms=int((time.time() - started) * 1000),
-            )
+    def names(self) -> List[str]:
+        return list(self.tools.keys())
 
 
 TOOLS = ToolRegistry()
 
 
-def _tool_write_file(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    return ctx.sandbox.write_file(args.get("path", ""), args.get("content", ""), str(args.get("mode", "overwrite")))
+def _tool_write_file(ctx: Dict[str, Any], path: str = "", content: str = "", **_: Any) -> Dict[str, Any]:
+    return WORKSPACE.write_file(ctx["tenant_id"], ctx["run_id"], str(path), str(content))
 
 
-def _tool_read_file(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    return ctx.sandbox.read_file(args.get("path", ""), int(args.get("start_line", 1)), int(args.get("end_line", 0)))
+def _tool_read_file(ctx: Dict[str, Any], path: str = "", start: int = 1, end: Optional[int] = None, **_: Any) -> Dict[str, Any]:
+    return WORKSPACE.read_file(ctx["tenant_id"], ctx["run_id"], str(path), int(start or 1), int(end) if end is not None else None)
 
 
-def _tool_append_file(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    lines = args.get("lines", [])
-    if isinstance(lines, str):
-        lines = lines.splitlines()
-    return ctx.sandbox.append_file(args.get("path", ""), lines, bool(args.get("unique", True)))
+def _tool_append_file(ctx: Dict[str, Any], path: str = "", lines: Any = "", unique: bool = True, **_: Any) -> Dict[str, Any]:
+    return WORKSPACE.append_file(ctx["tenant_id"], ctx["run_id"], str(path), lines, bool(unique))
 
 
-def _tool_replace_lines(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    return ctx.sandbox.replace_lines(
-        args.get("path", ""),
-        int(args.get("start_line", 1)),
-        int(args.get("end_line", 0)),
-        args.get("replacement", ""),
-    )
+def _tool_replace_lines(ctx: Dict[str, Any], path: str = "", start: int = 1, end: int = 1, content: Any = "", **_: Any) -> Dict[str, Any]:
+    return WORKSPACE.replace_lines(ctx["tenant_id"], ctx["run_id"], str(path), int(start), int(end), content)
 
 
-def _tool_check_lines(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    lines = args.get("lines", [])
-    if isinstance(lines, str):
-        lines = lines.splitlines()
-    return ctx.sandbox.check_lines(args.get("path", ""), lines)
+def _tool_check_lines(ctx: Dict[str, Any], path: str = "", lines: Any = None, **_: Any) -> Dict[str, Any]:
+    cands = lines if isinstance(lines, list) else ([lines] if lines else [])
+    return WORKSPACE.check_lines(ctx["tenant_id"], ctx["run_id"], str(path), [str(c) for c in cands])
 
 
-def _tool_list_dir(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    return ctx.sandbox.list_dir(str(args.get("path", ".")), int(args.get("depth", 1)))
+def _tool_list_dir(ctx: Dict[str, Any], path: str = ".", **_: Any) -> Dict[str, Any]:
+    return WORKSPACE.list_dir(ctx["tenant_id"], ctx["run_id"], str(path or "."))
 
 
-def _tool_delete_path(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    return ctx.sandbox.delete(args.get("path", ""))
+def _tool_delete_file(ctx: Dict[str, Any], path: str = "", **_: Any) -> Dict[str, Any]:
+    return WORKSPACE.delete_file(ctx["tenant_id"], ctx["run_id"], str(path))
 
 
-def _tool_search_files(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    return ctx.sandbox.search(str(args.get("pattern", "")), str(args.get("glob", "**/*")))
+def _tool_wiki_search(ctx: Dict[str, Any], query: str = "", limit: int = 4, **_: Any) -> Dict[str, Any]:
+    results = WIKI.search(ctx["tenant_id"], str(query), int(limit or 4))
+    return {"query": query, "results": results, "count": len(results)}
 
 
-def _tool_run_python(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    code = args.get("code", "")
-    if not isinstance(code, str) or not code.strip():
-        raise ValueError("code required")
-    workdir = ctx.sandbox.root
-    script = workdir / f".exec_{secrets.token_hex(8)}.py"
-    script.write_text(code, encoding="utf-8")
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-I", str(script)],
-            capture_output=True,
-            text=True,
-            timeout=int(args.get("timeout", SHELL_TIMEOUT)),
-            cwd=str(workdir),
-            env={"PATH": os.environ.get("PATH", ""), "HOME": str(workdir), "PYTHONIOENCODING": "utf-8"},
-        )
-        return {
-            "exit_code": proc.returncode,
-            "stdout": proc.stdout[-40000:],
-            "stderr": proc.stderr[-20000:],
+def _tool_wiki_write(ctx: Dict[str, Any], title: str = "", body: str = "", category: str = "general", **_: Any) -> Dict[str, Any]:
+    if not title or not body:
+        raise ValidationError("wiki_write requires title and body")
+    return WIKI.upsert(ctx["tenant_id"], str(title), str(body), str(category or "general"))
+
+
+def _tool_skill_search(ctx: Dict[str, Any], query: str = "", limit: int = 3, **_: Any) -> Dict[str, Any]:
+    found = EM.search(ctx["tenant_id"], str(query), int(limit or 3))
+    return {"query": query, "results": [{"skill": s.to_dict(), "score": sc} for s, sc in found]}
+
+
+def _tool_skill_upsert(
+    ctx: Dict[str, Any],
+    name: str = "",
+    summary: str = "",
+    procedure: Any = None,
+    preconditions: Any = None,
+    failure_modes: Any = None,
+    tags: Any = None,
+    category: str = "general",
+    **_: Any,
+) -> Dict[str, Any]:
+    if not name or not summary:
+        raise ValidationError("skill_upsert requires name and summary")
+    proc = procedure if isinstance(procedure, list) else ([str(procedure)] if procedure else [])
+    pre = preconditions if isinstance(preconditions, list) else ([str(preconditions)] if preconditions else [])
+    fails = failure_modes if isinstance(failure_modes, list) else ([str(failure_modes)] if failure_modes else [])
+    tg = tags if isinstance(tags, list) else ([str(tags)] if tags else [])
+    skill = EM.upsert(ctx["tenant_id"], str(name), str(summary), proc, pre, fails, tg, str(category or "general"))
+    return {"skill_id": skill.skill_id, "name": skill.name, "version": skill.version}
+
+
+def _tool_trace_query(ctx: Dict[str, Any], scope: str = "run", limit: int = 20, **_: Any) -> Dict[str, Any]:
+    if scope == "failures":
+        return {"scope": scope, "traces": TRACES.failures(ctx["tenant_id"], int(limit or 20))}
+    return {"scope": "run", "traces": TRACES.for_run(ctx["run_id"], int(limit or 20))}
+
+
+def _tool_python(ctx: Dict[str, Any], code: str = "", variables: Any = None, **_: Any) -> Dict[str, Any]:
+    vars_map = variables if isinstance(variables, dict) else {}
+    return PY_SANDBOX.run(str(code), vars_map)
+
+
+def _tool_shell(ctx: Dict[str, Any], command: str = "", **_: Any) -> Dict[str, Any]:
+    return SHELL.run(ctx["tenant_id"], ctx["run_id"], str(command))
+
+
+def _tool_http_get(ctx: Dict[str, Any], url: str = "", headers: Any = None, **_: Any) -> Dict[str, Any]:
+    hdrs = headers if isinstance(headers, dict) else None
+    return HTTP.get(str(url), hdrs)
+
+
+def _tool_think(ctx: Dict[str, Any], note: str = "", **_: Any) -> Dict[str, Any]:
+    return {"acknowledged": True, "note": str(note)[:2000]}
+
+
+def _tool_finish(ctx: Dict[str, Any], summary: str = "", artifacts: Any = None, **_: Any) -> Dict[str, Any]:
+    return {"terminal": True, "status": "completed", "summary": str(summary)[:8000], "artifacts": artifacts if isinstance(artifacts, dict) else {}}
+
+
+def _tool_fail(ctx: Dict[str, Any], reason: str = "", **_: Any) -> Dict[str, Any]:
+    return {"terminal": True, "status": "failed", "reason": str(reason)[:4000]}
+
+
+TOOLS.register(ToolSpec("workspace.write_file", "Atomically write a UTF-8 text file in the run workspace.", {"path": "string", "content": "string"}, _tool_write_file, True))
+TOOLS.register(ToolSpec("workspace.read_file", "Read a file or line range from the run workspace.", {"path": "string", "start": "int?", "end": "int?"}, _tool_read_file))
+TOOLS.register(ToolSpec("workspace.append_file", "Append lines with optional exact-line deduplication.", {"path": "string", "lines": "string|string[]", "unique": "bool"}, _tool_append_file, True))
+TOOLS.register(ToolSpec("workspace.replace_lines", "Replace an inclusive 1-indexed line range with new content.", {"path": "string", "start": "int", "end": "int", "content": "string|string[]"}, _tool_replace_lines, True))
+TOOLS.register(ToolSpec("workspace.check_lines", "Batched exact-line membership test against a file.", {"path": "string", "lines": "string[]"}, _tool_check_lines))
+TOOLS.register(ToolSpec("workspace.list_dir", "List entries of a workspace directory.", {"path": "string"}, _tool_list_dir))
+TOOLS.register(ToolSpec("workspace.delete_file", "Delete a workspace file or directory.", {"path": "string"}, _tool_delete_file, True))
+TOOLS.register(ToolSpec("memory.wiki_search", "Hybrid dense+BM25 RRF search over the persistent knowledge wiki.", {"query": "string", "limit": "int"}, _tool_wiki_search))
+TOOLS.register(ToolSpec("memory.wiki_write", "Create or update a versioned markdown wiki page.", {"title": "string", "body": "string", "category": "string"}, _tool_wiki_write, True))
+TOOLS.register(ToolSpec("memory.skill_search", "Search the experiential skill library.", {"query": "string", "limit": "int"}, _tool_skill_search))
+TOOLS.register(ToolSpec("memory.skill_upsert", "Create or revise a reusable procedural skill.", {"name": "string", "summary": "string", "procedure": "string[]", "preconditions": "string[]", "failure_modes": "string[]", "tags": "string[]", "category": "string"}, _tool_skill_upsert, True))
+TOOLS.register(ToolSpec("memory.trace_query", "Query immutable execution traces ('run' or 'failures').", {"scope": "string", "limit": "int"}, _tool_trace_query))
+TOOLS.register(ToolSpec("compute.python", "Execute sandboxed pure-Python computation; assign 'result' to return data.", {"code": "string", "variables": "object"}, _tool_python))
+TOOLS.register(ToolSpec("compute.shell", "Run a single allowlisted binary inside the run workspace.", {"command": "string"}, _tool_shell, True))
+TOOLS.register(ToolSpec("compute.http_get", "Fetch a public http(s) URL and return extracted text.", {"url": "string", "headers": "object"}, _tool_http_get))
+TOOLS.register(ToolSpec("reason.think", "Record a within-step deliberation note without side effects.", {"note": "string"}, _tool_think))
+TOOLS.register(ToolSpec("control.finish", "Terminate the run as completed with a final summary.", {"summary": "string", "artifacts": "object"}, _tool_finish))
+TOOLS.register(ToolSpec("control.fail", "Terminate the run as failed with a reason.", {"reason": "string"}, _tool_fail))
+
+
+class ZeroTrustGate:
+    MUTATING_TOOLS = {name for name, spec in TOOLS.tools.items() if spec.mutating}
+
+    @staticmethod
+    def verify(tenant_id: str, run_id: str, spec: ProceduralSpec, tool: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        if tool not in TOOLS.names():
+            raise ToolDenied(f"tool '{tool}' is not registered")
+        if tool not in spec.allowed_tools:
+            raise ToolDenied(f"tool '{tool}' is not permitted by the procedural specification")
+        TENANTS.authorize_tool(tenant_id, tool)
+        if not isinstance(arguments, dict):
+            raise ValidationError("tool arguments must be an object")
+        encoded = jdump(arguments)
+        if len(encoded) > 400000:
+            raise ValidationError("tool arguments payload too large")
+        path = arguments.get("path")
+        if isinstance(path, str):
+            if path.startswith("/") or ".." in Path(path).parts:
+                raise SecurityError("absolute or traversal paths are prohibited")
+        receipt = {
+            "tool": tool,
+            "tenant_id": tenant_id,
+            "run_id": run_id,
+            "arg_digest": stable_hash(arguments),
+            "mutating": tool in ZeroTrustGate.MUTATING_TOOLS,
+            "authorized_at": iso(),
         }
-    except subprocess.TimeoutExpired:
-        return {"exit_code": 124, "stdout": "", "stderr": "execution timed out"}
-    finally:
-        with contextlib.suppress(OSError):
-            script.unlink()
+        receipt["signature"] = sign_payload(receipt)
+        audit(tenant_id, run_id, "runtime", f"tool_authorized:{tool}", {"arg_digest": receipt["arg_digest"]}, True)
+        return receipt
 
 
-_SHELL_DENY = re.compile(
-    r"(rm\s+-rf\s+/|:\(\)\{|mkfs|dd\s+if=|shutdown|reboot|curl\s+[^|]*\|\s*sh|wget\s+[^|]*\|\s*sh|chmod\s+777\s+/)",
-    re.I,
-)
-
-
-def _tool_run_shell(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    if not ALLOW_SHELL:
-        raise PermissionError("shell execution disabled by configuration")
-    command = args.get("command", "")
-    if not isinstance(command, str) or not command.strip():
-        raise ValueError("command required")
-    if _SHELL_DENY.search(command):
-        raise PermissionError("command blocked by deterministic guardrail")
-    proc = subprocess.run(
-        ["/bin/sh", "-c", command],
-        capture_output=True,
-        text=True,
-        timeout=int(args.get("timeout", SHELL_TIMEOUT)),
-        cwd=str(ctx.sandbox.root),
-        env={"PATH": os.environ.get("PATH", ""), "HOME": str(ctx.sandbox.root)},
-    )
-    return {"exit_code": proc.returncode, "stdout": proc.stdout[-40000:], "stderr": proc.stderr[-20000:]}
-
-
-def _tool_memory_search(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    query = str(args.get("query", ""))
-    limit = int(args.get("limit", 5))
-    skills = ctx.memory.em.retrieve(ctx.tenant.tenant_id, query, limit=limit)
-    pages = ctx.memory.wiki.search(ctx.tenant.tenant_id, query, limit=limit)
-    return {
-        "skills": [s.prompt_view() for s in skills],
-        "wiki": [{"slug": p["slug"], "title": p["title"], "excerpt": p["body"][:900]} for p in pages],
-    }
-
-
-def _tool_memory_write(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    slug = str(args.get("slug", "")).strip()
-    title = str(args.get("title", slug or "note")).strip()
-    body = str(args.get("body", ""))
-    if not slug:
-        raise ValueError("slug required")
-    page = ctx.memory.wiki.upsert(ctx.tenant.tenant_id, slug, title, body, reason=f"run:{ctx.run_id}")
-    return {"slug": page["slug"], "revision": page["revision"]}
-
-
-def _tool_record_skill(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    name = str(args.get("name", "")).strip()
-    if not name:
-        raise ValueError("skill name required")
-    procedure = args.get("procedure", [])
-    if isinstance(procedure, str):
-        procedure = [ln for ln in procedure.splitlines() if ln.strip()]
-    skill = ctx.memory.em.upsert(
-        tenant_id=ctx.tenant.tenant_id,
-        name=name,
-        description=str(args.get("description", "")),
-        trigger_signature=str(args.get("when_to_use", "")),
-        procedure=[str(p) for p in procedure][:32],
-        tools=[str(t) for t in (args.get("tools", []) or [])][:16],
-        reason=f"agent-authored during {ctx.run_id}",
-    )
-    return {"skill_id": skill.skill_id, "version": skill.version, "name": skill.name}
-
-
-def _tool_http_fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    import urllib.error
-    import urllib.request
-
-    url = str(args.get("url", "")).strip()
-    if not url.lower().startswith(("http://", "https://")):
-        raise ValueError("only http/https URLs are permitted")
-    lowered = url.lower()
-    for blocked in ("localhost", "127.0.0.1", "0.0.0.0", "169.254.169.254", "[::1]", "metadata.google"):
-        if blocked in lowered:
-            raise PermissionError("target host blocked by SSRF guardrail")
-    method = str(args.get("method", "GET")).upper()
-    if method not in ("GET", "POST", "HEAD"):
-        raise ValueError("unsupported method")
-    data = args.get("body")
-    encoded = jdump(data).encode("utf-8") if isinstance(data, (dict, list)) else (
-        str(data).encode("utf-8") if data is not None else None
-    )
-    headers = {"User-Agent": "AutonomousAgentRuntime/1.0", "Accept": "*/*"}
-    extra = args.get("headers")
-    if isinstance(extra, dict):
-        for k, v in list(extra.items())[:16]:
-            if str(k).lower() not in ("host", "authorization", "cookie"):
-                headers[str(k)] = str(v)
-    req = urllib.request.Request(url, data=encoded, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=int(args.get("timeout", 25))) as resp:
-            raw = resp.read(2_000_000)
-            charset = resp.headers.get_content_charset() or "utf-8"
-            text = raw.decode(charset, errors="replace")
-            return {
-                "status": resp.status,
-                "url": resp.geturl(),
-                "content_type": resp.headers.get("Content-Type", ""),
-                "body": OutputClassifier.redact(text[:200_000]),
-            }
-    except urllib.error.HTTPError as exc:
-        return {"status": exc.code, "url": url, "error": str(exc), "body": exc.read(50000).decode("utf-8", "replace")}
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"network error: {exc.reason}") from exc
-
-
-def _tool_reason(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    question = str(args.get("question", "")).strip()
-    if not question:
-        raise ValueError("question required")
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a precise analytical subroutine. Answer in plain text, no markdown. Be concise and factual.",
-        },
-        {
-            "role": "user",
-            "content": jdump(
-                {
-                    "task": ctx.spec.objective,
-                    "state_digest": ctx.state.compact(2500),
-                    "question": question,
-                }
-            ),
-        },
+class OutputClassifier:
+    SECRET_PATTERNS = [
+        (re.compile(r"(?i)\b(sk|pk)-[A-Za-z0-9]{16,}\b"), "api_key"),
+        (re.compile(r"(?i)aws_secret_access_key\s*[:=]\s*\S+"), "aws_secret"),
+        (re.compile(r"(?i)-----BEGIN [A-Z ]*PRIVATE KEY-----"), "private_key"),
+        (re.compile(r"(?i)\bpassword\s*[:=]\s*[^\s,;]{6,}"), "password"),
+        (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "ssn_like"),
+        (re.compile(r"\b(?:\d[ -]*?){13,19}\b"), "card_like"),
     ]
-    text, tokens = MODEL.complete(messages, max_tokens=min(4096, MODEL_MAX_TOKENS), temperature=0.4)
-    TENANTS.charge(ctx.tenant.tenant_id, tokens)
-    return {"answer": text.strip()[:20000], "tokens": tokens}
+    UNSAFE_PATTERNS = [
+        (re.compile(r"(?i)\brm\s+-rf\s+/(?:\s|$)"), "destructive_command"),
+        (re.compile(r"(?i)\bmkfs(\.[a-z0-9]+)?\b"), "destructive_command"),
+        (re.compile(r"(?i)\bdd\s+if=/dev/(zero|random)\s+of=/dev/"), "destructive_command"),
+        (re.compile(r"(?i):\(\)\s*\{\s*:\|\s*:\s*&\s*\}\s*;\s*:"), "fork_bomb"),
+    ]
+
+    @classmethod
+    def classify(cls, text: str) -> Dict[str, Any]:
+        findings: List[Dict[str, str]] = []
+        sample = text or ""
+        for pattern, label in cls.SECRET_PATTERNS:
+            if pattern.search(sample):
+                findings.append({"type": "secret", "label": label})
+        for pattern, label in cls.UNSAFE_PATTERNS:
+            if pattern.search(sample):
+                findings.append({"type": "unsafe", "label": label})
+        severity = "clean"
+        if any(f["type"] == "unsafe" for f in findings):
+            severity = "block"
+        elif findings:
+            severity = "redact"
+        return {"severity": severity, "findings": findings}
+
+    @classmethod
+    def sanitize(cls, text: str) -> Tuple[str, Dict[str, Any]]:
+        verdict = cls.classify(text)
+        if verdict["severity"] == "clean":
+            return text, verdict
+        out = text or ""
+        for pattern, label in cls.SECRET_PATTERNS:
+            out = pattern.sub(f"[REDACTED:{label}]", out)
+        if verdict["severity"] == "block":
+            for pattern, label in cls.UNSAFE_PATTERNS:
+                out = pattern.sub(f"[BLOCKED:{label}]", out)
+        return out, verdict
 
 
-def _tool_finish(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    return {"final_answer": str(args.get("final_answer", ""))[:100_000], "terminal": True}
+CLASSIFIER = OutputClassifier()
 
 
-def _tool_noop(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    return {"noop": True, "reason": str(args.get("reason", ""))[:500]}
+class ToolExecutor:
+    def __init__(self, registry: ToolRegistry):
+        self.registry = registry
 
-
-TOOLS.register(ToolSpec("write_file", "Atomically write or append text content to a sandboxed file.", ToolRisk.GUARDED,
-                        {"path": "string", "content": "string", "mode": "overwrite|append"}, _tool_write_file))
-TOOLS.register(ToolSpec("read_file", "Read a sandboxed file, optionally by line range.", ToolRisk.SAFE,
-                        {"path": "string", "start_line": "int", "end_line": "int"}, _tool_read_file))
-TOOLS.register(ToolSpec("append_file", "Append lines with optional exact-line deduplication.", ToolRisk.GUARDED,
-                        {"path": "string", "lines": "string[]", "unique": "bool"}, _tool_append_file))
-TOOLS.register(ToolSpec("replace_lines", "Replace an inclusive line range with new content.", ToolRisk.GUARDED,
-                        {"path": "string", "start_line": "int", "end_line": "int", "replacement": "string|string[]"},
-                        _tool_replace_lines))
-TOOLS.register(ToolSpec("check_lines", "Batched exact-line membership test against a file.", ToolRisk.SAFE,
-                        {"path": "string", "lines": "string[]"}, _tool_check_lines))
-TOOLS.register(ToolSpec("list_dir", "List sandbox directory entries up to a depth.", ToolRisk.SAFE,
-                        {"path": "string", "depth": "int"}, _tool_list_dir))
-TOOLS.register(ToolSpec("delete_path", "Delete a sandboxed file or directory tree.", ToolRisk.PRIVILEGED,
-                        {"path": "string"}, _tool_delete_path))
-TOOLS.register(ToolSpec("search_files", "Regex search across sandbox files.", ToolRisk.SAFE,
-                        {"pattern": "string", "glob": "string"}, _tool_search_files))
-TOOLS.register(ToolSpec("run_python", "Execute an isolated Python script inside the sandbox.", ToolRisk.PRIVILEGED,
-                        {"code": "string", "timeout": "int"}, _tool_run_python))
-TOOLS.register(ToolSpec("run_shell", "Execute a guarded shell command inside the sandbox.", ToolRisk.PRIVILEGED,
-                        {"command": "string", "timeout": "int"}, _tool_run_shell))
-TOOLS.register(ToolSpec("memory_search", "Hybrid RRF retrieval across skills and the knowledge wiki.", ToolRisk.SAFE,
-                        {"query": "string", "limit": "int"}, _tool_memory_search))
-TOOLS.register(ToolSpec("memory_write", "Create or revise a persistent knowledge wiki page.", ToolRisk.GUARDED,
-                        {"slug": "string", "title": "string", "body": "string"}, _tool_memory_write))
-TOOLS.register(ToolSpec("record_skill", "Persist a reusable procedural skill into experiential memory.", ToolRisk.GUARDED,
-                        {"name": "string", "description": "string", "when_to_use": "string",
-                         "procedure": "string[]", "tools": "string[]"}, _tool_record_skill))
-TOOLS.register(ToolSpec("http_fetch", "Fetch an external HTTP(S) resource with SSRF guardrails.", ToolRisk.GUARDED,
-                        {"url": "string", "method": "GET|POST|HEAD", "headers": "object", "body": "any"},
-                        _tool_http_fetch))
-TOOLS.register(ToolSpec("reason", "Invoke a bounded analytical sub-call over the current state.", ToolRisk.SAFE,
-                        {"question": "string"}, _tool_reason))
-TOOLS.register(ToolSpec("finish", "Terminate the run and emit the final answer.", ToolRisk.SAFE,
-                        {"final_answer": "string"}, _tool_finish))
-TOOLS.register(ToolSpec("noop", "Explicit no-operation step used to stabilize state.", ToolRisk.SAFE,
-                        {"reason": "string"}, _tool_noop))
-
-
-class WorkingMemory:
-    def __init__(self, db: Database) -> None:
-        self.db = db
-
-    def derive(self, state: ExecutionState, spec: ProcedureSpec) -> Dict[str, Any]:
-        open_goals = [g for g in state.subgoals if isinstance(g, dict) and not g.get("done")]
-        done_goals = [g for g in state.subgoals if isinstance(g, dict) and g.get("done")]
-        return {
-            "phase": state.phase,
-            "progress": round(state.progress, 3),
-            "open_subgoals": [self._goal_view(g) for g in open_goals[:12]],
-            "completed_subgoals": [self._goal_view(g) for g in done_goals[-6:]],
-            "unresolved_blockers": state.blockers[:8],
-            "environment_constraints": (state.constraints_observed + spec.constraints)[:10],
-            "verified_facts": _truncate_mapping(state.facts, 2400),
-            "artifacts": sorted(list(state.artifacts.keys()))[:24],
-            "next_intent": state.next_intent[:600],
-            "skill_hints": state.skill_hints[:6],
-        }
+    def execute(self, ctx: Dict[str, Any], spec: ProceduralSpec, tool: str, arguments: Dict[str, Any]) -> Tuple[Observation, Dict[str, Any]]:
+        started = time.time()
+        tenant_id = ctx["tenant_id"]
+        run_id = ctx["run_id"]
+        step = int(ctx.get("step", 0))
+        try:
+            receipt = ZeroTrustGate.verify(tenant_id, run_id, spec, tool, arguments)
+        except (ToolDenied, SecurityError, ValidationError) as exc:
+            audit(tenant_id, run_id, "runtime", f"tool_denied:{tool}", {"error": str(exc)}, False)
+            obs = Observation(
+                step=step,
+                source="gate",
+                tool=tool,
+                ok=False,
+                summary=f"authorization denied for {tool}",
+                data={},
+                error=str(exc),
+                latency_ms=int((time.time() - started) * 1000),
+                created_at=iso(),
+            )
+            return obs, {"denied": True, "error": str(exc)}
+        try:
+            handler = self.registry.get(tool).handler
+            result = handler(ctx, **(arguments or {}))
+            if not isinstance(result, dict):
+                result = {"value": result}
+            ok = bool(result.get("ok", True)) and not result.get("error")
+            raw_summary = self._summarize(tool, result)
+            summary, verdict = CLASSIFIER.sanitize(raw_summary)
+            if verdict["severity"] == "block":
+                ok = False
+            obs = Observation(
+                step=step,
+                source="tool",
+                tool=tool,
+                ok=ok,
+                summary=summary,
+                data=self._prune(result),
+                error=(str(result.get("error"))[:2000] if result.get("error") else (None if ok else "tool reported failure")),
+                latency_ms=int((time.time() - started) * 1000),
+                created_at=iso(),
+            )
+            receipt["classifier"] = verdict
+            return obs, receipt
+        except (SecurityError, ValidationError, ToolDenied) as exc:
+            obs = Observation(
+                step=step,
+                source="tool",
+                tool=tool,
+                ok=False,
+                summary=f"{tool} rejected: {exc}",
+                data={},
+                error=str(exc)[:2000],
+                latency_ms=int((time.time() - started) * 1000),
+                created_at=iso(),
+            )
+            return obs, receipt
+        except FileNotFoundError as exc:
+            obs = Observation(
+                step=step,
+                source="tool",
+                tool=tool,
+                ok=False,
+                summary=f"{tool} target missing: {exc}",
+                data={},
+                error=str(exc)[:2000],
+                latency_ms=int((time.time() - started) * 1000),
+                created_at=iso(),
+            )
+            return obs, receipt
+        except Exception as exc:
+            log.warning("tool %s crashed: %s", tool, exc)
+            obs = Observation(
+                step=step,
+                source="tool",
+                tool=tool,
+                ok=False,
+                summary=f"{tool} raised {type(exc).__name__}",
+                data={"traceback": traceback.format_exc()[-2000:]},
+                error=f"{type(exc).__name__}: {exc}"[:2000],
+                latency_ms=int((time.time() - started) * 1000),
+                created_at=iso(),
+            )
+            return obs, receipt
 
     @staticmethod
-    def _goal_view(goal: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "id": str(goal.get("id", ""))[:64],
-            "goal": str(goal.get("goal", goal.get("title", "")))[:300],
-            "done": bool(goal.get("done", False)),
-            "depends_on": [str(d)[:64] for d in (goal.get("depends_on") or [])][:6],
-        }
+    def _prune(result: Dict[str, Any], cap: int = 12000) -> Dict[str, Any]:
+        encoded = jdump(result)
+        if len(encoded) <= cap:
+            return json.loads(encoded)
+        pruned: Dict[str, Any] = {}
+        for key, value in result.items():
+            if isinstance(value, str) and len(value) > 2500:
+                pruned[key] = value[:2500] + f"...[truncated {len(value) - 2500} chars]"
+            elif isinstance(value, list) and len(value) > 40:
+                pruned[key] = value[:40] + [f"...[truncated {len(value) - 40} items]"]
+            elif isinstance(value, dict) and len(jdump(value)) > 3000:
+                keys = list(value.keys())[:25]
+                pruned[key] = {k: value[k] for k in keys}
+            else:
+                pruned[key] = value
+        pruned["_truncated"] = True
+        return json.loads(jdump(pruned))
 
-    def retrieval_signature(self, state: ExecutionState, spec: ProcedureSpec) -> str:
-        wm = self.derive(state, spec)
-        parts = [
-            spec.title,
-            spec.objective[:400],
-            wm["phase"],
-            wm["next_intent"],
-            " ".join(g["goal"] for g in wm["open_subgoals"]),
-            " ".join(wm["unresolved_blockers"]),
-            " ".join(wm["skill_hints"]),
+    @staticmethod
+    def _summarize(tool: str, result: Dict[str, Any]) -> str:
+        if result.get("error"):
+            return f"{tool} failed: {str(result['error'])[:600]}"
+        if tool == "workspace.read_file":
+            return f"read {result.get('path')} lines {result.get('start')}-{result.get('end')} of {result.get('total_lines')}:\n{str(result.get('content', ''))[:2500]}"
+        if tool == "workspace.write_file":
+            return f"wrote {result.get('path')} ({result.get('bytes')} bytes, {result.get('lines')} lines)"
+        if tool == "workspace.append_file":
+            return f"appended {result.get('added')} new lines to {result.get('path')} (skipped {result.get('skipped')} duplicates, total {result.get('total_lines')})"
+        if tool == "workspace.replace_lines":
+            return f"replaced lines {result.get('start')}-{result.get('end')} in {result.get('path')} with {result.get('inserted_lines')} lines (total {result.get('total_lines')})"
+        if tool == "workspace.check_lines":
+            return f"membership check on {result.get('path')}: found={len(result.get('found', []))} missing={len(result.get('missing', []))} missing_sample={result.get('missing', [])[:6]}"
+        if tool == "workspace.list_dir":
+            entries = result.get("entries", [])
+            return f"{len(entries)} entries: " + ", ".join(f"{e.get('name')}({e.get('type')})" for e in entries[:25])
+        if tool == "compute.python":
+            return f"python ok={result.get('ok')} stdout={str(result.get('stdout', ''))[:1500]} result={str(result.get('result'))[:800]} err={str(result.get('error') or '')[:400]}"
+        if tool == "compute.shell":
+            return f"shell exit={result.get('exit_code')} stdout={str(result.get('stdout', ''))[:1500]} stderr={str(result.get('stderr', ''))[:600]}"
+        if tool == "compute.http_get":
+            return f"http {result.get('status')} {result.get('url')} :: {str(result.get('text', ''))[:2000]}"
+        if tool == "memory.wiki_search":
+            return "wiki hits: " + " | ".join(f"{r['title']}({r['score']:.3f}): {r['excerpt'][:200]}" for r in result.get("results", [])[:4])
+        if tool == "memory.skill_search":
+            return "skill hits: " + " | ".join(f"{r['skill']['name']}({r['score']:.3f})" for r in result.get("results", [])[:4])
+        if tool == "memory.trace_query":
+            traces = result.get("traces", [])
+            return f"{len(traces)} traces: " + " | ".join(f"s{t.get('step')}:{t.get('kind')}:{'ok' if t.get('success') else 'fail'}" for t in traces[:12])
+        if tool == "control.finish":
+            return f"run finished: {str(result.get('summary'))[:2000]}"
+        if tool == "control.fail":
+            return f"run failed: {str(result.get('reason'))[:1500]}"
+        return f"{tool} completed: {jdump(result)[:1800]}"
+
+
+EXECUTOR = ToolExecutor(TOOLS)
+
+
+STEP_SYSTEM_PROMPT = """You are the deterministic reasoning core of a long-horizon autonomous agent runtime.
+
+CRITICAL CONTRACT
+You never receive conversational history. Your entire input is exactly three structures:
+  P  = immutable procedural specification (objective, success criteria, constraints)
+  S  = structured execution state (the sufficient statistic of all prior progress)
+  O  = the single latest environment observation
+Your within-step reasoning is destroyed after this step. Anything that must survive to the next
+step MUST be written into the state patch. Nothing else persists.
+
+OUTPUT CONTRACT
+Reply with exactly ONE JSON object and nothing else. No prose, no markdown fences, no commentary.
+
+{
+  "reasoning": "concise within-step analysis, at most 8 sentences",
+  "state_patch": {
+    "phase": "string",
+    "current_subgoal": "string",
+    "plan": ["ordered remaining steps"],
+    "progress": ["verified completed facts to append"],
+    "open_goals": ["unresolved goals to append"],
+    "dependencies": ["blocking dependencies"],
+    "constraints": ["hard constraints discovered"],
+    "facts": {"key": "verified value"},
+    "artifacts": {"logical_name": "workspace/path"},
+    "metrics": {"name": 0},
+    "errors": ["error signatures to append"],
+    "skill_notes": ["reusable procedural insights"],
+    "verification": {"criterion": true},
+    "cursor": {"position": "resume marker"},
+    "scratch": {"ephemeral": "value"}
+  },
+  "action": {
+    "tool": "exact.tool.name",
+    "arguments": {"...": "..."},
+    "rationale": "one sentence justification"
+  }
+}
+
+STATE PATCH SEMANTICS
+- Include ONLY keys you are changing. Omit everything else.
+- List keys (progress, open_goals, dependencies, constraints, errors, plan, skill_notes) APPEND with deduplication.
+- Object keys (facts, artifacts, metrics, verification, cursor, scratch) MERGE key-by-key.
+- Setting any key to null CLEARS that key (deletion primitive).
+- To remove one entry inside an object key, set that inner key to null.
+
+OPERATING RULES
+1. Exactly one tool call per step. Never batch multiple actions.
+2. Write durable knowledge into state_patch before acting; never rely on memory of this reasoning.
+3. Use cursor to record exact resume markers for long file or dataset traversals.
+4. When an observation reports failure, record the error signature and pivot strategy rather than retrying identically.
+5. When every success criterion is verified in state.verification, call control.finish with a complete summary.
+6. Call control.fail only when the objective is provably unachievable under the constraints.
+7. Prefer memory.skill_upsert or memory.wiki_write to persist generalizable procedures you discover.
+8. Keep the state compact: it is a sufficient statistic, not a transcript."""
+
+
+class PromptBuilder:
+    def __init__(self, registry: ToolRegistry, em: ExperientialMemory, wm: WorkingMemory):
+        self.registry = registry
+        self.em = em
+        self.wm = wm
+
+    def render_spec(self, spec: ProceduralSpec) -> str:
+        lines = [f"OBJECTIVE: {spec.objective}"]
+        if spec.success_criteria:
+            lines.append("SUCCESS CRITERIA:")
+            for i, c in enumerate(spec.success_criteria, 1):
+                lines.append(f"  {i}. {c}")
+        if spec.constraints:
+            lines.append("HARD CONSTRAINTS:")
+            for c in spec.constraints:
+                lines.append(f"  - {c}")
+        lines.append(f"STEP BUDGET: {spec.max_steps}")
+        if spec.verifiers:
+            lines.append("AUTOMATED VERIFIERS:")
+            for v in spec.verifiers[:12]:
+                lines.append(f"  - {v.get('type')}: {jdump({k: v[k] for k in v if k != 'type'})[:300]}")
+        return "\n".join(lines)
+
+    def render_sigma(self, sigma: Dict[str, Any]) -> str:
+        view = {k: sigma.get(k) for k in SIGMA_ALLOWED_KEYS if sigma.get(k) not in (None, [], {}, "")}
+        text = json.dumps(view, ensure_ascii=False, indent=1, sort_keys=True, default=str)
+        if len(text) > 24000:
+            text = text[:24000] + "\n...[state view truncated]"
+        return text
+
+    def render_observation(self, obs: Observation) -> str:
+        lines = [
+            f"SOURCE: {obs.source}",
+            f"TOOL: {obs.tool or 'none'}",
+            f"STATUS: {'ok' if obs.ok else 'FAILED'}",
+            f"LATENCY_MS: {obs.latency_ms}",
         ]
-        return " ".join(p for p in parts if p)
+        if obs.error:
+            lines.append(f"ERROR: {obs.error[:1500]}")
+        summary = obs.summary or ""
+        lines.append("SUMMARY:")
+        lines.append(summary[:6000] if summary else "(none)")
+        data_text = jdump(obs.data)
+        if data_text and data_text != "{}":
+            lines.append("DATA:")
+            lines.append(data_text[:6000])
+        return "\n".join(lines)
 
-
-class ExperientialMemory:
-    def __init__(self, db: Database) -> None:
-        self.db = db
-        self._lock = threading.RLock()
-
-    def upsert(
+    def build(
         self,
-        tenant_id: str,
-        name: str,
-        description: str,
-        trigger_signature: str,
-        procedure: List[str],
-        tools: List[str],
-        reason: str,
-        bump_version: bool = True,
-    ) -> Skill:
-        with self._lock:
-            existing = self.db.query_one("SELECT * FROM skills WHERE tenant_id=? AND name=?", (tenant_id, name))
-            text_blob = " ".join([name, description, trigger_signature] + procedure + tools)
-            embedding = encode_vector(hashed_embedding(text_blob))
-            now = iso()
-            if existing:
-                skill = Skill.from_row(existing)
-                version = skill.version + 1 if bump_version else skill.version
-                self.db.execute(
-                    "UPDATE skills SET description=?, trigger_signature=?, procedure=?, tools=?, version=?,"
-                    " embedding=?, updated_at=? WHERE skill_id=?",
-                    (description, trigger_signature, jdump(procedure), jdump(tools), version, embedding, now,
-                     skill.skill_id),
-                )
-                self._reindex(skill.skill_id, tenant_id, text_blob)
-                self._snapshot(skill.skill_id, tenant_id, version, reason, True)
-                return self.get(skill.skill_id) or skill
-            skill_id = new_id("skl")
-            self.db.execute(
-                "INSERT INTO skills(skill_id, tenant_id, name, description, trigger_signature, procedure, tools,"
-                " version, success_count, failure_count, quarantined, embedding, updated_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (skill_id, tenant_id, name, description, trigger_signature, jdump(procedure), jdump(tools),
-                 1, 0, 0, 0, embedding, now),
-            )
-            self._reindex(skill_id, tenant_id, text_blob)
-            self._snapshot(skill_id, tenant_id, 1, reason, True)
-            created = self.get(skill_id)
-            if created is None:
-                raise RuntimeError("skill insert failed")
-            self._write_disk(created)
-            return created
-
-    def _reindex(self, skill_id: str, tenant_id: str, text: str) -> None:
-        with self.db.tx() as conn:
-            conn.execute("DELETE FROM skills_fts WHERE skill_id=?", (skill_id,))
-            conn.execute("INSERT INTO skills_fts(skill_id, tenant_id, text) VALUES(?,?,?)",
-                         (skill_id, tenant_id, text))
-
-    def _snapshot(self, skill_id: str, tenant_id: str, version: int, reason: str, accepted: bool) -> None:
-        row = self.db.query_one("SELECT * FROM skills WHERE skill_id=?", (skill_id,))
-        snapshot = {k: row[k] for k in row.keys()} if row else {}
-        self.db.execute(
-            "INSERT INTO skill_versions(version_id, skill_id, tenant_id, version, snapshot, reason, accepted, created_at)"
-            " VALUES(?,?,?,?,?,?,?,?)",
-            (new_id("skv"), skill_id, tenant_id, version, jdump(snapshot), reason[:1000], 1 if accepted else 0, iso()),
-        )
-
-    def _write_disk(self, skill: Skill) -> None:
-        folder = SKILL_ROOT / skill.tenant_id
-        folder.mkdir(parents=True, exist_ok=True)
-        safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", skill.name)[:80] or skill.skill_id
-        path = folder / f"{safe}.json"
-        payload = {
-            "skill_id": skill.skill_id,
-            "name": skill.name,
-            "description": skill.description,
-            "when_to_use": skill.trigger_signature,
-            "procedure": skill.procedure,
-            "tools": skill.tools,
-            "version": skill.version,
-        }
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(jdump(payload), encoding="utf-8")
-        os.replace(tmp, path)
-
-    def get(self, skill_id: str) -> Optional[Skill]:
-        row = self.db.query_one("SELECT * FROM skills WHERE skill_id=?", (skill_id,))
-        return Skill.from_row(row) if row else None
-
-    def by_name(self, tenant_id: str, name: str) -> Optional[Skill]:
-        row = self.db.query_one("SELECT * FROM skills WHERE tenant_id=? AND name=?", (tenant_id, name))
-        return Skill.from_row(row) if row else None
-
-    def list_skills(self, tenant_id: str, include_quarantined: bool = False) -> List[Skill]:
-        if include_quarantined:
-            rows = self.db.query("SELECT * FROM skills WHERE tenant_id=? ORDER BY name", (tenant_id,))
-        else:
-            rows = self.db.query("SELECT * FROM skills WHERE tenant_id=? AND quarantined=0 ORDER BY name", (tenant_id,))
-        return [Skill.from_row(r) for r in rows]
-
-    def retrieve(self, tenant_id: str, query: str, limit: int = 2) -> List[Skill]:
-        candidates = self.list_skills(tenant_id)
-        if not candidates:
-            return []
-        qvec = hashed_embedding(query)
-        dense = sorted(candidates, key=lambda s: cosine(qvec, s.embedding), reverse=True)
-        dense_ids = [s.skill_id for s in dense[: max(10, limit * 5)]]
-        sparse_ids: List[str] = []
-        fts_query = self._fts_query(query)
-        if fts_query:
-            try:
-                rows = self.db.query(
-                    "SELECT skill_id FROM skills_fts WHERE tenant_id=? AND skills_fts MATCH ?"
-                    " ORDER BY bm25(skills_fts) LIMIT ?",
-                    (tenant_id, fts_query, max(10, limit * 5)),
-                )
-                sparse_ids = [r["skill_id"] for r in rows]
-            except sqlite3.OperationalError:
-                sparse_ids = []
-        fused = reciprocal_rank_fusion([dense_ids, sparse_ids])
-        by_id = {s.skill_id: s for s in candidates}
-        out: List[Skill] = []
-        for skill_id, _score in fused:
-            skill = by_id.get(skill_id)
-            if skill is None:
-                continue
-            out.append(skill)
-            if len(out) >= limit:
-                break
-        if not out:
-            out = dense[:limit]
-        out.sort(key=lambda s: s.reliability, reverse=True)
-        return out
-
-    @staticmethod
-    def _fts_query(query: str) -> str:
-        toks = tokenize(query)[:16]
-        if not toks:
-            return ""
-        return " OR ".join(f'"{t}"' for t in toks)
-
-    def record_outcome(self, skill_id: str, success: bool) -> None:
-        column = "success_count" if success else "failure_count"
-        self.db.execute(f"UPDATE skills SET {column} = {column} + 1, updated_at=? WHERE skill_id=?", (iso(), skill_id))
-
-    def set_quarantine(self, skill_id: str, quarantined: bool) -> None:
-        self.db.execute("UPDATE skills SET quarantined=?, updated_at=? WHERE skill_id=?",
-                        (1 if quarantined else 0, iso(), skill_id))
-
-    def rollback(self, skill_id: str) -> bool:
-        rows = self.db.query(
-            "SELECT * FROM skill_versions WHERE skill_id=? AND accepted=1 ORDER BY version DESC LIMIT 2",
-            (skill_id,),
-        )
-        if len(rows) < 2:
-            return False
-        snapshot = jload(rows[1]["snapshot"], {}) or {}
-        if not snapshot:
-            return False
-        self.db.execute(
-            "UPDATE skills SET description=?, trigger_signature=?, procedure=?, tools=?, version=?, embedding=?,"
-            " updated_at=? WHERE skill_id=?",
-            (
-                snapshot.get("description", ""),
-                snapshot.get("trigger_signature", ""),
-                snapshot.get("procedure", "[]"),
-                snapshot.get("tools", "[]"),
-                int(snapshot.get("version", 1)),
-                snapshot.get("embedding", ""),
-                iso(),
-                skill_id,
-            ),
-        )
-        return True
+        spec: ProceduralSpec,
+        sigma: Dict[str, Any],
+        observation: Observation,
+        step: int,
+        skills: List[Tuple[Skill, float]],
+        cognition: Optional[Dict[str, Any]] = None,
+        reflection: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
+        blocks: List[str] = []
+        blocks.append("=== P :: PROCEDURAL SPECIFICATION (IMMUTABLE) ===")
+        blocks.append(self.render_spec(spec))
+        blocks.append("")
+        blocks.append("=== TOOL SURFACE ===")
+        blocks.append(self.registry.describe(spec.allowed_tools))
+        blocks.append("")
+        if skills:
+            blocks.append("=== EM :: RETRIEVED PROCEDURAL SKILLS ===")
+            for skill, score in skills[:2]:
+                blocks.append(f"[relevance={score:.4f}]")
+                blocks.append(skill.render())
+                blocks.append("")
+        policy_hints = STORE.list_policy_hints(spec.tenant_id, 24)
+        if policy_hints:
+            blocks.append("=== LEARNED POLICY SIGNALS ===")
+            for item in policy_hints:
+                blocks.append(f"{item['feature']} weight={float(item['weight']):.4f} updates={int(item['updates'])}")
+            blocks.append("")
+        if cognition:
+            blocks.append("=== SYSTEM-2 COGNITION DIRECTIVE ===")
+            blocks.append(f"subgoal: {cognition.get('subgoal', '')}")
+            blocks.append(f"gate: {float(cognition.get('gate', 1.0)):.4f}")
+            blocks.append(f"staleness_ms: {int(cognition.get('staleness_ms', 0))}")
+            blocks.append(f"staleness_encoding: {jdump(cognition.get('staleness_encoding', []))[:400]}")
+            blocks.append(f"cognition_signature: {jdump(cognition.get('signature', []))[:600]}")
+            blocks.append("")
+        if reflection:
+            blocks.append("=== REFLECTION PATCH (PRIVILEGED HINDSIGHT) ===")
+            blocks.append(reflection[:4000])
+            blocks.append("")
+        blocks.append(f"=== S :: EXECUTION STATE AT STEP {step} ===")
+        blocks.append(self.render_sigma(sigma))
+        blocks.append("")
+        blocks.append(f"=== O :: LATEST OBSERVATION (STEP {step}) ===")
+        blocks.append(self.render_observation(observation))
+        blocks.append("")
+        blocks.append("Emit exactly one JSON object conforming to the OUTPUT CONTRACT now.")
+        user = "\n".join(blocks)
+        return [{"role": "system", "content": STEP_SYSTEM_PROMPT}, {"role": "user", "content": user}]
 
 
-class KnowledgeWiki:
-    def __init__(self, db: Database, root: Path) -> None:
-        self.db = db
-        self.root = root
-        self._lock = threading.RLock()
-        self._git_init()
-
-    def _tenant_dir(self, tenant_id: str) -> Path:
-        path = self.root / tenant_id
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def _git_init(self) -> None:
-        if not GIT_ENABLED:
-            return
-        if (self.root / ".git").exists():
-            return
-        with contextlib.suppress(Exception):
-            subprocess.run(["git", "init", "-q"], cwd=str(self.root), check=False, capture_output=True, timeout=30)
-            subprocess.run(["git", "config", "user.email", "agent@runtime.local"], cwd=str(self.root),
-                           check=False, capture_output=True, timeout=30)
-            subprocess.run(["git", "config", "user.name", "Agent Runtime"], cwd=str(self.root),
-                           check=False, capture_output=True, timeout=30)
-
-    def _git_commit(self, message: str) -> Optional[str]:
-        if not GIT_ENABLED:
-            return None
-        try:
-            subprocess.run(["git", "add", "-A"], cwd=str(self.root), check=False, capture_output=True, timeout=60)
-            proc = subprocess.run(
-                ["git", "commit", "-q", "-m", message[:2000], "--allow-empty"],
-                cwd=str(self.root), check=False, capture_output=True, timeout=60,
-            )
-            if proc.returncode not in (0, 1):
-                return None
-            rev = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(self.root), check=False,
-                                 capture_output=True, text=True, timeout=30)
-            return rev.stdout.strip() or None
-        except Exception:
-            return None
-
-    def diff(self, limit: int = 1) -> str:
-        if not GIT_ENABLED:
-            return ""
-        try:
-            proc = subprocess.run(
-                ["git", "diff", f"HEAD~{max(1, limit)}", "HEAD", "--unified=2"],
-                cwd=str(self.root), check=False, capture_output=True, text=True, timeout=60,
-            )
-            return proc.stdout[:120_000]
-        except Exception:
-            return ""
-
-    @staticmethod
-    def slugify(text: str) -> str:
-        base = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
-        return base[:80] or "page"
-
-    def upsert(self, tenant_id: str, slug: str, title: str, body: str, reason: str = "") -> Dict[str, Any]:
-        slug = self.slugify(slug)
-        with self._lock:
-            existing = self.db.query_one("SELECT * FROM wiki_pages WHERE tenant_id=? AND slug=?", (tenant_id, slug))
-            embedding = encode_vector(hashed_embedding(f"{title} {body}"))
-            now = iso()
-            if existing:
-                revision = int(existing["revision"]) + 1
-                self.db.execute(
-                    "UPDATE wiki_pages SET title=?, body=?, revision=?, embedding=?, updated_at=? WHERE page_id=?",
-                    (title, body, revision, embedding, now, existing["page_id"]),
-                )
-                page_id = existing["page_id"]
-            else:
-                page_id = new_id("wik")
-                revision = 1
-                self.db.execute(
-                    "INSERT INTO wiki_pages(page_id, tenant_id, slug, title, body, revision, embedding, updated_at)"
-                    " VALUES(?,?,?,?,?,?,?,?)",
-                    (page_id, tenant_id, slug, title, body, revision, embedding, now),
-                )
-            with self.db.tx() as conn:
-                conn.execute("DELETE FROM wiki_fts WHERE page_id=?", (page_id,))
-                conn.execute("INSERT INTO wiki_fts(page_id, tenant_id, text) VALUES(?,?,?)",
-                             (page_id, tenant_id, f"{title}\n{body}"))
-            path = self._tenant_dir(tenant_id) / f"{slug}.md"
-            content = f"# {title}\n\nrevision: {revision}\nupdated: {now}\n\n{body}\n"
-            tmp = path.with_suffix(".md.tmp")
-            tmp.write_text(content, encoding="utf-8")
-            os.replace(tmp, path)
-            commit = self._git_commit(f"wiki({tenant_id}): {slug} r{revision} {reason}".strip())
-            return {"page_id": page_id, "slug": slug, "title": title, "revision": revision, "commit": commit}
-
-    def get(self, tenant_id: str, slug: str) -> Optional[Dict[str, Any]]:
-        row = self.db.query_one("SELECT * FROM wiki_pages WHERE tenant_id=? AND slug=?", (tenant_id, self.slugify(slug)))
-        return {k: row[k] for k in row.keys()} if row else None
-
-    def list_pages(self, tenant_id: str) -> List[Dict[str, Any]]:
-        rows = self.db.query(
-            "SELECT page_id, slug, title, revision, updated_at FROM wiki_pages WHERE tenant_id=? ORDER BY updated_at DESC",
-            (tenant_id,),
-        )
-        return [{k: r[k] for k in r.keys()} for r in rows]
-
-    def search(self, tenant_id: str, query: str, limit: int = 3) -> List[Dict[str, Any]]:
-        rows = self.db.query("SELECT * FROM wiki_pages WHERE tenant_id=?", (tenant_id,))
-        pages = [{k: r[k] for k in r.keys()} for r in rows]
-        if not pages:
-            return []
-        qvec = hashed_embedding(query)
-        dense = sorted(pages, key=lambda p: cosine(qvec, decode_vector(p["embedding"])), reverse=True)
-        dense_ids = [p["page_id"] for p in dense[: max(10, limit * 5)]]
-        sparse_ids: List[str] = []
-        toks = tokenize(query)[:16]
-        if toks:
-            match = " OR ".join(f'"{t}"' for t in toks)
-            try:
-                frows = self.db.query(
-                    "SELECT page_id FROM wiki_fts WHERE tenant_id=? AND wiki_fts MATCH ? ORDER BY bm25(wiki_fts) LIMIT ?",
-                    (tenant_id, match, max(10, limit * 5)),
-                )
-                sparse_ids = [r["page_id"] for r in frows]
-            except sqlite3.OperationalError:
-                sparse_ids = []
-        fused = reciprocal_rank_fusion([dense_ids, sparse_ids])
-        by_id = {p["page_id"]: p for p in pages}
-        out: List[Dict[str, Any]] = []
-        for page_id, _score in fused:
-            page = by_id.get(page_id)
-            if page:
-                out.append(page)
-            if len(out) >= limit:
-                break
-        return out or dense[:limit]
-
-
-class MemorySubsystem:
-    def __init__(self, db: Database) -> None:
-        self.wm = WorkingMemory(db)
-        self.em = ExperientialMemory(db)
-        self.wiki = KnowledgeWiki(db, WIKI_ROOT)
-        self.db = db
-
-    def route_skills(self, tenant_id: str, state: ExecutionState, spec: ProcedureSpec, limit: int = 2) -> List[Skill]:
-        signature = self.wm.retrieval_signature(state, spec)
-        return self.em.retrieve(tenant_id, signature, limit=limit)
-
-    def route_caveats(self, tenant_id: str, state: ExecutionState, spec: ProcedureSpec, limit: int = 2) -> List[Dict[str, Any]]:
-        signature = self.wm.retrieval_signature(state, spec)
-        return self.wiki.search(tenant_id, signature, limit=limit)
-
-    def record_trace(self, trace: ExecutionTrace) -> None:
-        self.db.execute(
-            "INSERT INTO traces(trace_id, run_id, step, pre_state_digest, selected_skill, tool, outcome,"
-            " delta_digest, post_state_digest, receipt, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                trace.trace_id, trace.run_id, trace.step, trace.pre_state_digest, trace.selected_skill,
-                trace.tool, trace.outcome, trace.delta_digest, trace.post_state_digest,
-                jdump(trace.receipt), trace.created_at,
-            ),
-        )
-
-    def run_traces(self, run_id: str, limit: int = 400) -> List[Dict[str, Any]]:
-        rows = self.db.query("SELECT * FROM traces WHERE run_id=? ORDER BY step ASC LIMIT ?", (run_id, limit))
-        return [{k: (jload(r[k], {}) if k == "receipt" else r[k]) for k in r.keys()} for r in rows]
-
-
-MEMORY = MemorySubsystem(DB)
-
-
-class PolicyPriorStore:
-    def __init__(self, db: Database) -> None:
-        self.db = db
-        self._lock = threading.RLock()
-
-    @staticmethod
-    def signature(spec: ProcedureSpec, state: ExecutionState) -> str:
-        raw = "|".join([spec.title[:60], state.phase[:40], (state.next_intent or "")[:80]])
-        return hashlib.blake2b(raw.encode("utf-8"), digest_size=12).hexdigest()
-
-    def get(self, tenant_id: str, signature: str) -> Optional[Dict[str, Any]]:
-        row = self.db.query_one("SELECT * FROM policy_priors WHERE tenant_id=? AND signature=?", (tenant_id, signature))
-        return {k: row[k] for k in row.keys()} if row else None
-
-    def update(self, tenant_id: str, signature: str, directive: str, gradient: float) -> None:
-        with self._lock:
-            existing = self.get(tenant_id, signature)
-            if existing:
-                logit = clamp(float(existing["logit"]) + gradient, -6.0, 6.0)
-                self.db.execute(
-                    "UPDATE policy_priors SET directive=?, logit=?, updates=updates+1, updated_at=? WHERE prior_id=?",
-                    (directive[:2000], logit, iso(), existing["prior_id"]),
-                )
-            else:
-                self.db.execute(
-                    "INSERT INTO policy_priors(prior_id, tenant_id, signature, directive, logit, updates, updated_at)"
-                    " VALUES(?,?,?,?,?,?,?)",
-                    (new_id("pri"), tenant_id, signature, directive[:2000], clamp(gradient, -6.0, 6.0), 1, iso()),
-                )
-
-    def active_directives(self, tenant_id: str, signature: str, limit: int = 3) -> List[str]:
-        rows = self.db.query(
-            "SELECT directive, logit FROM policy_priors WHERE tenant_id=? AND signature=? AND logit > 0"
-            " ORDER BY logit DESC LIMIT ?",
-            (tenant_id, signature, limit),
-        )
-        return [r["directive"] for r in rows if r["directive"]]
-
-    def global_directives(self, tenant_id: str, limit: int = 3) -> List[str]:
-        rows = self.db.query(
-            "SELECT directive FROM policy_priors WHERE tenant_id=? AND logit > 0.8 ORDER BY logit DESC LIMIT ?",
-            (tenant_id, limit),
-        )
-        return [r["directive"] for r in rows if r["directive"]]
-
-
-PRIORS = PolicyPriorStore(DB)
-
-
-class TokenLevelDistiller
-    def __init__(self, db: Database, model: ModelClient) -> None:
-        self.db = db
-        self.model = model
-
-    @staticmethod
-    def _token_split(text: str) -> List[str]:
-        return re.findall(r"\s*\S+", text)[:2048]
-
-    @staticmethod
-    def _distribution(tokens: Sequence[str], bias: Dict[str, float], temperature: float) -> List[float]:
-        counts: Dict[str, float] = defaultdict(float)
-        for t in tokens:
-            counts[t.strip().lower()] += 1.0
-        total = sum(counts.values()) or 1.0
-        logprobs: List[float] = []
-        for tok in tokens:
-            key = tok.strip().lower()
-            p = counts[key] / total
-            adj = bias.get(key, 0.0)
-            score = math.log(max(p, 1e-9)) / max(0.05, temperature) + adj
-            logprobs.append(score)
-        if not logprobs:
-            return []
-        m = max(logprobs)
-        exps = [math.exp(s - m) for s in logprobs]
-        z = sum(exps) or 1.0
-        return [math.log(max(e / z, 1e-12)) for e in exps]
-
-    @staticmethod
-    def _bias_from_patch(patch: ReflectionPatch) -> Dict[str, float]:
-        bias: Dict[str, float] = {}
-        emphasis = " ".join([patch.root_cause, patch.guidance] + patch.pivot_actions)
-        for tok in tokenize(emphasis):
-            bias[tok] = bias.get(tok, 0.0) + 0.55
-        for tok in tokenize(patch.failure_point):
-            bias[tok] = bias.get(tok, 0.0) - 0.35
-        return bias
-
-    def distill(
-        self,
-        tenant_id: str,
-        run_id: str,
-        patch: ReflectionPatch,
-        step_records: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        if not step_records:
-            return {"samples": 0, "mean_reverse_kl": 0.0, "priors_updated": 0}
-        bias = self._bias_from_patch(patch)
-        samples = 0
-        kl_sum = 0.0
-        priors_updated = 0
-        for record in step_records[-64:]:
-            student_text = str(record.get("student_completion", ""))
-            if not student_text.strip():
-                continue
-            tokens = self._token_split(student_text)
-            if not tokens:
-                continue
-            student_lp = self._distribution(tokens, {}, temperature=1.0)
-            teacher_lp = self._distribution(tokens, bias, temperature=0.75)
-            if not student_lp or not teacher_lp:
-                continue
-            n = min(len(student_lp), len(teacher_lp))
-            rkl = 0.0
-            for i in range(n):
-                q = math.exp(student_lp[i])
-                rkl += q * (student_lp[i] - teacher_lp[i])
-            rkl = abs(rkl)
-            weight = clamp(1.0 if not patch.verdict else 0.35, 0.05, 1.0)
-            self.db.execute(
-                "INSERT INTO distillation_samples(sample_id, run_id, tenant_id, step, student_prompt_digest,"
-                " teacher_prompt_digest, tokens, student_logprobs, teacher_logprobs, reverse_kl, weight, created_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    new_id("dst"), run_id, tenant_id, int(record.get("step", 0)),
-                    stable_hash(record.get("student_prompt", "")),
-                    stable_hash(patch.to_dict()),
-                    jdump(tokens[:256]),
-                    jdump([round(v, 6) for v in student_lp[:256]]),
-                    jdump([round(v, 6) for v in teacher_lp[:256]]),
-                    round(rkl, 8), round(weight, 4), iso(),
-                ),
-            )
-            samples += 1
-            kl_sum += rkl
-            signature = str(record.get("signature", ""))
-            if signature:
-                directive = patch.guidance or (patch.pivot_actions[0] if patch.pivot_actions else "")
-                if directive:
-                    gradient = (0.45 if not patch.verdict else 0.12) * clamp(rkl * 4.0, 0.05, 1.0)
-                    PRIORS.update(tenant_id, signature, directive, gradient)
-                    priors_updated += 1
-        mean_kl = kl_sum / samples if samples else 0.0
-        return {"samples": samples, "mean_reverse_kl": round(mean_kl, 8), "priors_updated": priors_updated}
-
-
-DISTILLER = TokenLevelDistiller(DB, MODEL)
+PROMPTS = PromptBuilder(TOOLS, EM, WM)
 
 
 class Verifier:
-    SAFE_BUILTINS = {
-        "len": len, "str": str, "int": int, "float": float, "bool": bool, "abs": abs,
-        "min": min, "max": max, "sum": sum, "any": any, "all": all, "sorted": sorted,
-        "round": round, "list": list, "dict": dict, "set": set, "tuple": tuple,
-        "enumerate": enumerate, "range": range, "isinstance": isinstance, "zip": zip,
-    }
-
-    @classmethod
-    def verify(cls, spec: ProcedureSpec, state: ExecutionState, sandbox: FileSystemSandbox,
-               final_answer: str) -> Dict[str, Any]:
-        checks: List[Dict[str, Any]] = []
-        for criterion in spec.success_criteria:
-            checks.append(cls._check_criterion(criterion, state, sandbox, final_answer))
-        program_result: Optional[Dict[str, Any]] = None
-        if spec.verifier_program and spec.verifier_program.strip():
-            program_result = cls._run_program(spec.verifier_program, state, sandbox, final_answer)
-            checks.append({"criterion": "verifier_program", "passed": bool(program_result.get("passed")),
-                           "detail": program_result.get("detail", "")})
-        if not checks:
-            passed = bool(final_answer and final_answer.strip())
-            checks.append({"criterion": "non_empty_final_answer", "passed": passed,
-                           "detail": "final answer present" if passed else "final answer empty"})
-        overall = all(c["passed"] for c in checks)
-        return {"passed": overall, "checks": checks, "program": program_result}
-
-    @classmethod
-    def _check_criterion(cls, criterion: str, state: ExecutionState, sandbox: FileSystemSandbox,
-                         final_answer: str) -> Dict[str, Any]:
-        text = criterion.strip()
-        lowered = text.lower()
-        if lowered.startswith("file_exists:"):
-            rel = text.split(":", 1)[1].strip()
+    @staticmethod
+    def evaluate(spec: ProceduralSpec, tenant_id: str, run_id: str, sigma: Dict[str, Any], terminal: Dict[str, Any]) -> Dict[str, Any]:
+        results: List[Dict[str, Any]] = []
+        for v in spec.verifiers:
+            vtype = str(v.get("type") or "").strip()
             try:
-                path = sandbox.resolve(rel)
-                ok = path.exists()
-                return {"criterion": text, "passed": ok, "detail": f"exists={ok}"}
-            except ValueError as exc:
-                return {"criterion": text, "passed": False, "detail": str(exc)}
-        if lowered.startswith("file_contains:"):
-            body = text.split(":", 1)[1]
-            if "::" in body:
-                rel, needle = body.split("::", 1)
-            else:
-                parts = body.split(None, 1)
-                rel, needle = (parts + [""])[:2]
-            try:
-                path = sandbox.resolve(rel.strip())
-                content = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
-                ok = needle.strip() in content
-                return {"criterion": text, "passed": ok, "detail": f"needle_found={ok}"}
-            except (ValueError, OSError) as exc:
-                return {"criterion": text, "passed": False, "detail": str(exc)}
-        if lowered.startswith("state_fact:"):
-            key = text.split(":", 1)[1].strip()
-            ok = key in state.facts and state.facts.get(key) not in (None, "", [], {})
-            return {"criterion": text, "passed": ok, "detail": f"fact_present={ok}"}
-        if lowered.startswith("artifact:"):
-            key = text.split(":", 1)[1].strip()
-            ok = key in state.artifacts
-            return {"criterion": text, "passed": ok, "detail": f"artifact_present={ok}"}
-        if lowered.startswith("answer_contains:"):
-            needle = text.split(":", 1)[1].strip().lower()
-            ok = needle in (final_answer or "").lower()
-            return {"criterion": text, "passed": ok, "detail": f"answer_match={ok}"}
-        if lowered.startswith("progress_at_least:"):
-            try:
-                threshold = float(text.split(":", 1)[1].strip())
-            except ValueError:
-                threshold = 1.0
-            ok = state.progress >= threshold
-            return {"criterion": text, "passed": ok, "detail": f"progress={state.progress}"}
-        if lowered.startswith("no_blockers"):
-            ok = not state.blockers
-            return {"criterion": text, "passed": ok, "detail": f"blockers={len(state.blockers)}"}
-        if lowered.startswith("all_subgoals_done"):
-            ok = bool(state.subgoals) and all(bool(g.get("done")) for g in state.subgoals if isinstance(g, dict))
-            return {"criterion": text, "passed": ok, "detail": f"subgoals={len(state.subgoals)}"}
-        keywords = [k for k in tokenize(text) if len(k) > 3][:8]
-        haystack = (final_answer or "") + " " + jdump(state.to_dict())
-        hay_tokens = set(tokenize(haystack))
-        matched = sum(1 for k in keywords if k in hay_tokens)
-        ok = bool(keywords) and matched >= max(1, int(len(keywords) * 0.6))
-        return {"criterion": text, "passed": ok, "detail": f"keyword_coverage={matched}/{len(keywords)}"}
-
-    @classmethod
-    def _run_program(cls, program: str, state: ExecutionState, sandbox: FileSystemSandbox,
-                     final_answer: str) -> Dict[str, Any]:
-        env: Dict[str, Any] = {
-            "__builtins__": dict(cls.SAFE_BUILTINS),
-            "state": json.loads(jdump(state.to_dict())),
-            "final_answer": final_answer,
-            "read_text": lambda p: (sandbox.resolve(p).read_text(encoding="utf-8", errors="replace")
-                                    if sandbox.resolve(p).exists() else ""),
-            "path_exists": lambda p: sandbox.resolve(p).exists(),
-            "list_files": lambda p=".": [e["path"] for e in sandbox.list_dir(p, 3)["entries"]],
-            "result": {},
-        }
-        try:
-            compiled = compile(program, "<verifier>", "exec")
-            exec(compiled, env, env)
-            result = env.get("result")
-            if isinstance(result, dict):
-                return {"passed": bool(result.get("passed")), "detail": str(result.get("detail", ""))[:4000]}
-            return {"passed": bool(result), "detail": "verifier returned non-dict result"}
-        except Exception as exc:
-            return {"passed": False, "detail": f"verifier error: {type(exc).__name__}: {exc}"}
+                if vtype == "file_exists":
+                    path = str(v.get("path") or "")
+                    target = WORKSPACE.resolve(tenant_id, run_id, path)
+                    ok = target.exists() and target.is_file()
+                    results.append({"type": vtype, "path": path, "passed": ok, "detail": "present" if ok else "missing"})
+                elif vtype == "file_contains":
+                    path = str(v.get("path") or "")
+                    needle = str(v.get("value") or "")
+                    target = WORKSPACE.resolve(tenant_id, run_id, path)
+                    text = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
+                    ok = needle in text
+                    results.append({"type": vtype, "path": path, "passed": ok, "detail": f"needle {'found' if ok else 'absent'}"})
+                elif vtype == "file_min_lines":
+                    path = str(v.get("path") or "")
+                    minimum = int(v.get("value") or 1)
+                    target = WORKSPACE.resolve(tenant_id, run_id, path)
+                    count = len(target.read_text(encoding="utf-8", errors="replace").splitlines()) if target.exists() else 0
+                    ok = count >= minimum
+                    results.append({"type": vtype, "path": path, "passed": ok, "detail": f"{count} lines >= {minimum}"})
+                elif vtype == "state_key_truthy":
+                    key = str(v.get("key") or "")
+                    node: Any = sigma
+                    for part in key.split("."):
+                        if isinstance(node, dict):
+                            node = node.get(part)
+                        else:
+                            node = None
+                            break
+                    ok = bool(node)
+                    results.append({"type": vtype, "key": key, "passed": ok, "detail": f"value={str(node)[:200]}"})
+                elif vtype == "state_key_equals":
+                    key = str(v.get("key") or "")
+                    expected = v.get("value")
+                    node = sigma
+                    for part in key.split("."):
+                        if isinstance(node, dict):
+                            node = node.get(part)
+                        else:
+                            node = None
+                            break
+                    ok = node == expected
+                    results.append({"type": vtype, "key": key, "passed": ok, "detail": f"actual={str(node)[:200]}"})
+                elif vtype == "all_criteria_verified":
+                    verification = sigma.get("verification") or {}
+                    if not isinstance(verification, dict) or not spec.success_criteria:
+                        ok = bool(verification) and all(bool(x) for x in verification.values())
+                    else:
+                        ok = len(verification) >= len(spec.success_criteria) and all(bool(x) for x in verification.values())
+                    results.append({"type": vtype, "passed": ok, "detail": jdump(verification)[:400]})
+                elif vtype == "python_assert":
+                    code = str(v.get("code") or "")
+                    run = PY_SANDBOX.run(code, {"sigma": json.loads(jdump(sigma)), "terminal": json.loads(jdump(terminal))})
+                    ok = bool(run.get("ok")) and bool(run.get("result"))
+                    results.append({"type": vtype, "passed": ok, "detail": f"result={str(run.get('result'))[:200]} err={str(run.get('error') or '')[:200]}"})
+                elif vtype == "no_errors":
+                    errs = sigma.get("errors") or []
+                    ok = len(errs) == 0
+                    results.append({"type": vtype, "passed": ok, "detail": f"{len(errs)} recorded errors"})
+                else:
+                    results.append({"type": vtype or "unknown", "passed": False, "detail": "unsupported verifier type"})
+            except Exception as exc:
+                results.append({"type": vtype or "unknown", "passed": False, "detail": f"verifier error: {exc}"[:300]})
+        terminal_ok = str(terminal.get("status") or "") == "completed"
+        if not spec.verifiers:
+            verification = sigma.get("verification") or {}
+            criteria_ok = True
+            if spec.success_criteria:
+                criteria_ok = bool(verification) and all(bool(x) for x in verification.values()) and len(verification) >= min(1, len(spec.success_criteria))
+            passed = terminal_ok and criteria_ok
+            results.append({"type": "terminal_declaration", "passed": terminal_ok, "detail": str(terminal.get("status"))})
+            results.append({"type": "self_verification", "passed": criteria_ok, "detail": jdump(verification)[:400]})
+        else:
+            passed = terminal_ok and all(r["passed"] for r in results)
+        score = (sum(1 for r in results if r["passed"]) / len(results)) if results else (1.0 if passed else 0.0)
+        return {"passed": bool(passed), "score": float(score), "checks": results, "evaluated_at": iso()}
 
 
 class ReflectionEngine:
-    def __init__(self, db: Database, model: ModelClient, memory: MemorySubsystem) -> None:
-        self.db = db
-        self.model = model
-        self.memory = memory
+    SYSTEM = """You are a hindsight reflection compiler for an autonomous agent runtime.
+You receive a completed trajectory summary, the verifier report, and the terminal state.
+Produce a compact Reflection Patch that a future agent could read BEFORE acting to avoid the same failures.
 
-    def build_patch(self, tenant: Tenant, spec: ProcedureSpec, run_id: str, verdict: Dict[str, Any],
-                    state: ExecutionState, traces: List[Dict[str, Any]]) -> ReflectionPatch:
-        failed_checks = [c for c in verdict.get("checks", []) if not c.get("passed")]
-        failing_traces = [t for t in traces if t.get("outcome") != "ok"][-8:]
-        heuristic = self._heuristic_patch(run_id, verdict, failed_checks, failing_traces, state)
-        if not self.model.available:
-            self._persist(tenant.tenant_id, heuristic)
-            return heuristic
-        prompt = {
-            "task": spec.frozen_view(),
-            "verification": {"passed": verdict.get("passed"), "failed_checks": failed_checks[:8]},
-            "terminal_state": state.compact(3000),
-            "recent_failures": [
-                {"step": t.get("step"), "tool": t.get("tool"), "outcome": t.get("outcome"),
-                 "receipt": str(t.get("receipt"))[:600]}
-                for t in failing_traces
-            ],
-            "required_json_schema": {
-                "failure_point": "string",
-                "root_cause": "string",
-                "pivot_actions": ["string"],
-                "memory_target": "working_memory|experiential_memory|knowledge_wiki|tooling|specification",
-                "guidance": "string",
-            },
-        }
-        messages = [
+Reply with exactly ONE JSON object, no prose, no markdown:
+{
+  "verdict": "success" | "failure" | "partial",
+  "root_cause": "single-sentence causal diagnosis",
+  "failure_points": [{"step": 0, "what": "what went wrong", "why": "causal mechanism"}],
+  "pivot_actions": [{"instead_of": "the wrong action", "do": "the correct action", "when": "trigger condition"}],
+  "durable_rules": ["imperative rules that generalize beyond this task"],
+  "skill_candidates": [{"name": "skill_name", "summary": "what it does", "procedure": ["step 1", "step 2"], "tags": ["tag"], "category": "category"}],
+  "wiki_note": {"title": "page title", "category": "category", "body": "markdown body of durable caveats"},
+  "patch_text": "dense imperative guidance block, at most 900 characters, written for injection above a future prompt"
+}"""
+
+    def __init__(self, model: ModelClient, store: SQLiteStore):
+        self.model = model
+        self.store = store
+
+    def _trajectory_digest(self, run_id: str, limit: int = 90) -> str:
+        traces = TRACES.for_run(run_id, limit)
+        lines: List[str] = []
+        for t in traces:
+            action = t.get("action") or {}
+            outcome = t.get("outcome") or {}
+            lines.append(
+                f"step={t['step']} tool={action.get('tool')} ok={t['success']} "
+                f"summary={str(outcome.get('summary') or '')[:220]} err={str(outcome.get('error') or '')[:160]}"
+            )
+        return "\n".join(lines[-limit:])
+
+    def generate(self, tenant_id: str, run_id: str, spec: ProceduralSpec, sigma: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, Any]:
+        digest = self._trajectory_digest(run_id)
+        prompt = [
+            {"role": "system", "content": self.SYSTEM},
             {
-                "role": "system",
-                "content": (
-                    "You are a deterministic post-hoc diagnostician for an autonomous agent runtime. "
-                    "Emit ONLY one JSON object matching the required schema. No markdown, no prose outside JSON. "
-                    "Be specific and actionable. Never invent facts absent from the evidence."
+                "role": "user",
+                "content": "\n".join(
+                    [
+                        "=== OBJECTIVE ===",
+                        spec.objective,
+                        "",
+                        "=== SUCCESS CRITERIA ===",
+                        jdump(spec.success_criteria),
+                        "",
+                        "=== VERIFIER REPORT ===",
+                        jdump(report)[:6000],
+                        "",
+                        "=== TERMINAL STATE ===",
+                        jdump({k: sigma.get(k) for k in ("phase", "progress", "open_goals", "errors", "verification", "metrics", "artifacts")})[:8000],
+                        "",
+                        "=== TRAJECTORY DIGEST ===",
+                        digest[:14000],
+                        "",
+                        "Emit the Reflection Patch JSON now.",
+                    ]
                 ),
             },
-            {"role": "user", "content": jdump(prompt)},
         ]
-        try:
-            text, tokens = self.model.complete(messages, max_tokens=min(6000, MODEL_MAX_TOKENS), temperature=0.3)
-            with contextlib.suppress(BudgetExceeded, AuthorizationDenied):
-                TENANTS.charge(tenant.tenant_id, tokens)
-            parsed = GrammarDecoder.extract_json(text)
-            pivots = parsed.get("pivot_actions", [])
-            if isinstance(pivots, str):
-                pivots = [pivots]
-            patch = ReflectionPatch(
-                patch_id=new_id("ref"),
-                run_id=run_id,
-                verdict=bool(verdict.get("passed")),
-                failure_point=str(parsed.get("failure_point", heuristic.failure_point))[:2000],
-                root_cause=str(parsed.get("root_cause", heuristic.root_cause))[:4000],
-                pivot_actions=[str(p)[:600] for p in pivots][:8] or heuristic.pivot_actions,
-                memory_target=self._normalize_target(str(parsed.get("memory_target", heuristic.memory_target))),
-                guidance=str(parsed.get("guidance", heuristic.guidance))[:4000],
-            )
-        except (SchemaError, Exception) as exc:
-            LOG.warning("reflection model call failed, using heuristic: %s", exc)
-            patch = heuristic
-        self._persist(tenant.tenant_id, patch)
+        parsed: Optional[Dict[str, Any]] = None
+        if self.model.available:
+            try:
+                out = self.model.complete(prompt, override={"temperature": 0.3, "max_tokens": 6000, "frequency_penalty": 0.1, "presence_penalty": 0.0})
+                parsed = DECODER.extract_json_object(out["text"])
+                TENANTS.charge_tokens(tenant_id, out["usage"]["total_tokens"])
+            except Exception as exc:
+                log.warning("reflection generation failed: %s", exc)
+        if not isinstance(parsed, dict):
+            parsed = self._heuristic(spec, sigma, report, digest)
+        patch = self._normalize(parsed, report)
+        self.store.execute(
+            "INSERT INTO reflection_patches(reflection_id, run_id, tenant_id, verdict, failure_points, pivot_actions, patch_text, created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (new_id("refl"), run_id, tenant_id, patch["verdict"], jdump(patch["failure_points"]), jdump(patch["pivot_actions"]), patch["patch_text"], iso()),
+        )
+        self._consolidate(tenant_id, patch)
         return patch
 
-    @staticmethod
-    def _normalize_target(value: str) -> str:
-        allowed = {"working_memory", "experiential_memory", "knowledge_wiki", "tooling", "specification"}
-        v = value.strip().lower().replace(" ", "_")
-        return v if v in allowed else "experiential_memory"
+    def _heuristic(self, spec: ProceduralSpec, sigma: Dict[str, Any], report: Dict[str, Any], digest: str) -> Dict[str, Any]:
+        failed_checks = [c for c in report.get("checks", []) if not c.get("passed")]
+        errors = [str(e) for e in (sigma.get("errors") or [])][-8:]
+        failure_points: List[Dict[str, Any]] = []
+        for line in digest.splitlines():
+            if "ok=False" in line:
+                m = re.search(r"step=(\d+)", line)
+                failure_points.append({"step": int(m.group(1)) if m else 0, "what": line[:220], "why": "tool level failure recorded in trace"})
+        failure_points = failure_points[-8:]
+        verdict = "success" if report.get("passed") else ("partial" if float(report.get("score", 0.0)) > 0.4 else "failure")
+        rules = [f"Verify criterion before finishing: {c}" for c in spec.success_criteria[:4]]
+        for chk in failed_checks[:4]:
+            rules.append(f"Ensure verifier '{chk.get('type')}' passes: {str(chk.get('detail'))[:160]}")
+        for err in errors[:4]:
+            rules.append(f"Avoid recurrence of error signature: {err[:160]}")
+        patch_text = " ".join(
+            ["HINDSIGHT:"]
+            + [f"verdict={verdict}"]
+            + [f"failed={len(failed_checks)}"]
+            + rules[:6]
+        )[:900]
+        return {
+            "verdict": verdict,
+            "root_cause": (failed_checks[0].get("detail") if failed_checks else (errors[-1] if errors else "objective satisfied")),
+            "failure_points": failure_points,
+            "pivot_actions": [{"instead_of": "repeating the failing action", "do": "record the error signature in state and select an alternative tool path", "when": "an observation reports STATUS FAILED"}],
+            "durable_rules": rules[:8],
+            "skill_candidates": [],
+            "wiki_note": {},
+            "patch_text": patch_text,
+        }
 
-    def _heuristic_patch(self, run_id: str, verdict: Dict[str, Any], failed_checks: List[Dict[str, Any]],
-                         failing_traces: List[Dict[str, Any]], state: ExecutionState) -> ReflectionPatch:
-        if verdict.get("passed"):
-            failure_point = "none"
-            root_cause = "trajectory satisfied all verifier checks"
-            pivots = ["preserve current procedure ordering", "promote successful skill sequence"]
-            guidance = "Reinforce the executed procedure; record it as a reusable skill."
-            target = "experiential_memory"
-        else:
-            first = failed_checks[0]["criterion"] if failed_checks else "unspecified criterion"
-            failure_point = f"step {failing_traces[-1]['step']} tool {failing_traces[-1]['tool']}" if failing_traces \
-                else f"terminal verification: {first}"
-            tool_errors = [str(t.get("receipt", {}).get("error", "")) for t in failing_traces if t.get("receipt")]
-            root_cause = "; ".join([e for e in tool_errors if e][:3]) or f"unmet criterion: {first}"
-            pivots = [
-                f"re-attempt the failing objective with an explicit precondition check for: {first}",
-                "decompose the blocking subgoal into verifiable atomic steps",
-            ]
-            if state.blockers:
-                pivots.append(f"resolve persistent blocker: {state.blockers[0][:200]}")
-            guidance = (
-                f"Before terminating, deterministically assert '{first}'. "
-                "If a tool errors twice consecutively, switch strategy instead of retrying identically."
+    @staticmethod
+    def _normalize(parsed: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, Any]:
+        verdict = str(parsed.get("verdict") or ("success" if report.get("passed") else "failure")).lower()
+        if verdict not in ("success", "failure", "partial"):
+            verdict = "success" if report.get("passed") else "failure"
+        fps = parsed.get("failure_points")
+        failure_points: List[Dict[str, Any]] = []
+        if isinstance(fps, list):
+            for item in fps[:12]:
+                if isinstance(item, dict):
+                    failure_points.append({"step": int(item.get("step") or 0), "what": str(item.get("what") or "")[:400], "why": str(item.get("why") or "")[:400]})
+                else:
+                    failure_points.append({"step": 0, "what": str(item)[:400], "why": ""})
+        pvs = parsed.get("pivot_actions")
+        pivots: List[Dict[str, Any]] = []
+        if isinstance(pvs, list):
+            for item in pvs[:12]:
+                if isinstance(item, dict):
+                    pivots.append({"instead_of": str(item.get("instead_of") or "")[:300], "do": str(item.get("do") or "")[:300], "when": str(item.get("when") or "")[:200]})
+                else:
+                    pivots.append({"instead_of": "", "do": str(item)[:300], "when": ""})
+        rules = [str(r)[:300] for r in (parsed.get("durable_rules") or []) if r][:12]
+        skills: List[Dict[str, Any]] = []
+        for cand in (parsed.get("skill_candidates") or [])[:6]:
+            if not isinstance(cand, dict):
+                continue
+            name = str(cand.get("name") or "").strip()[:120]
+            summary = str(cand.get("summary") or "").strip()[:600]
+            proc = [str(p)[:400] for p in (cand.get("procedure") or []) if p][:20]
+            if not name or not summary or not proc:
+                continue
+            skills.append(
+                {
+                    "name": name,
+                    "summary": summary,
+                    "procedure": proc,
+                    "tags": [str(t)[:40] for t in (cand.get("tags") or [])][:10],
+                    "category": str(cand.get("category") or "general")[:60],
+                    "preconditions": [str(p)[:300] for p in (cand.get("preconditions") or [])][:10],
+                    "failure_modes": [str(p)[:300] for p in (cand.get("failure_modes") or [])][:10],
+                }
             )
-            target = "experiential_memory" if failing_traces else "specification"
-        return ReflectionPatch(
-            patch_id=new_id("ref"),
-            run_id=run_id,
-            verdict=bool(verdict.get("passed")),
-            failure_point=failure_point[:2000],
-            root_cause=root_cause[:4000],
-            pivot_actions=pivots[:8],
-            memory_target=target,
-            guidance=guidance[:4000],
-        )
+        wiki = parsed.get("wiki_note") if isinstance(parsed.get("wiki_note"), dict) else {}
+        patch_text = str(parsed.get("patch_text") or "").strip()
+        if not patch_text:
+            patch_text = " ".join(["HINDSIGHT:", f"verdict={verdict}"] + rules[:6])
+        return {
+            "verdict": verdict,
+            "root_cause": str(parsed.get("root_cause") or "")[:600],
+            "failure_points": failure_points,
+            "pivot_actions": pivots,
+            "durable_rules": rules,
+            "skill_candidates": skills,
+            "wiki_note": {
+                "title": str(wiki.get("title") or "")[:160],
+                "category": str(wiki.get("category") or "general")[:60],
+                "body": str(wiki.get("body") or "")[:20000],
+            },
+            "patch_text": patch_text[:900],
+        }
 
-    def _persist(self, tenant_id: str, patch: ReflectionPatch) -> None:
-        self.db.execute(
-            "INSERT INTO reflections(patch_id, run_id, tenant_id, verdict, failure_point, root_cause,"
-            " pivot_actions, memory_target, guidance, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (patch.patch_id, patch.run_id, tenant_id, 1 if patch.verdict else 0, patch.failure_point,
-             patch.root_cause, jdump(patch.pivot_actions), patch.memory_target, patch.guidance, patch.created_at),
-        )
-
-    def latest(self, run_id: str) -> Optional[ReflectionPatch]:
-        row = self.db.query_one("SELECT * FROM reflections WHERE run_id=? ORDER BY created_at DESC LIMIT 1", (run_id,))
-        if not row:
-            return None
-        return ReflectionPatch(
-            patch_id=row["patch_id"], run_id=row["run_id"], verdict=bool(row["verdict"]),
-            failure_point=row["failure_point"], root_cause=row["root_cause"],
-            pivot_actions=jload(row["pivot_actions"], []) or [], memory_target=row["memory_target"],
-            guidance=row["guidance"], created_at=row["created_at"],
-        )
-
-
-REFLECTOR = ReflectionEngine(DB, MODEL, MEMORY)
-
-
-class RegressionGate:
-    def __init__(self, db: Database, memory: MemorySubsystem) -> None:
-        self.db = db
-        self.memory = memory
-
-    def diagnostics(self, tenant_id: str) -> List[Dict[str, Any]]:
-        rows = self.db.query("SELECT * FROM diagnostic_tasks WHERE tenant_id=? ORDER BY created_at", (tenant_id,))
-        return [{"task_id": r["task_id"], "name": r["name"], "payload": jload(r["payload"], {}),
-                 "expectation": jload(r["expectation"], {})} for r in rows]
-
-    def add_diagnostic(self, tenant_id: str, name: str, payload: Dict[str, Any], expectation: Dict[str, Any]) -> str:
-        task_id = new_id("dgt")
-        self.db.execute(
-            "INSERT INTO diagnostic_tasks(task_id, tenant_id, name, payload, expectation, created_at)"
-            " VALUES(?,?,?,?,?,?)",
-            (task_id, tenant_id, name, jdump(payload), jdump(expectation), iso()),
-        )
-        return task_id
-
-    def evaluate_skill(self, skill: Skill, diagnostics: List[Dict[str, Any]]) -> Dict[str, Any]:
-        results: List[Dict[str, Any]] = []
-        blob = " ".join([skill.name, skill.description, skill.trigger_signature] + skill.procedure + skill.tools).lower()
-        vec = hashed_embedding(blob)
-        for task in diagnostics:
-            payload = task.get("payload", {})
-            expectation = task.get("expectation", {})
-            query = str(payload.get("query", payload.get("objective", task.get("name", ""))))
-            relevance = cosine(vec, hashed_embedding(query))
-            must = [str(m).lower() for m in expectation.get("must_include", [])]
-            forbid = [str(m).lower() for m in expectation.get("must_not_include", [])]
-            min_rel = float(expectation.get("min_relevance", 0.0))
-            missing = [m for m in must if m not in blob]
-            violated = [f for f in forbid if f in blob]
-            passed = not missing and not violated and relevance >= min_rel
-            results.append({
-                "task": task.get("name"),
-                "passed": passed,
-                "relevance": round(relevance, 4),
-                "missing": missing,
-                "violated": violated,
-            })
-        structural = self._structural_checks(skill)
-        results.extend(structural)
-        score = sum(1 for r in results if r["passed"]) / len(results) if results else 1.0
-        return {"score": round(score, 4), "passed": all(r["passed"] for r in results), "results": results}
-
-    @staticmethod
-    def _structural_checks(skill: Skill) -> List[Dict[str, Any]]:
-        checks: List[Dict[str, Any]] = []
-        checks.append({"task": "has_name", "passed": bool(skill.name.strip()), "relevance": 1.0,
-                       "missing": [], "violated": []})
-        checks.append({"task": "has_trigger", "passed": len(skill.trigger_signature.strip()) >= 8, "relevance": 1.0,
-                       "missing": [], "violated": []})
-        checks.append({"task": "procedure_nonempty", "passed": len([p for p in skill.procedure if str(p).strip()]) >= 1,
-                       "relevance": 1.0, "missing": [], "violated": []})
-        known = set(TOOLS.names())
-        unknown = [t for t in skill.tools if t not in known]
-        checks.append({"task": "tools_registered", "passed": not unknown, "relevance": 1.0,
-                       "missing": unknown, "violated": []})
-        checks.append({"task": "procedure_bounded", "passed": len(skill.procedure) <= 32, "relevance": 1.0,
-                       "missing": [], "violated": []})
-        return checks
+    def _consolidate(self, tenant_id: str, patch: Dict[str, Any]) -> None:
+        for cand in patch.get("skill_candidates", []):
+            try:
+                EM.upsert(
+                    tenant_id,
+                    cand["name"],
+                    cand["summary"],
+                    cand["procedure"],
+                    cand.get("preconditions"),
+                    cand.get("failure_modes"),
+                    cand.get("tags"),
+                    cand.get("category", "general"),
+                )
+            except Exception as exc:
+                log.warning("skill consolidation failed: %s", exc)
+        note = patch.get("wiki_note") or {}
+        if note.get("title") and note.get("body"):
+            try:
+                WIKI.upsert(tenant_id, note["title"], note["body"], note.get("category", "general"))
+            except Exception as exc:
+                log.warning("wiki consolidation failed: %s", exc)
+        rules = patch.get("durable_rules") or []
+        if rules:
+            try:
+                existing = WIKI.get_page(tenant_id, WIKI.slugify("Durable Operating Rules"))
+                body_lines = (existing["body"].splitlines() if existing else [])
+                have = set(l.strip("- ").strip() for l in body_lines)
+                for r in rules:
+                    if r.strip() and r.strip() not in have:
+                        body_lines.append(f"- {r.strip()}")
+                        have.add(r.strip())
+                WIKI.upsert(tenant_id, "Durable Operating Rules", "\n".join(body_lines[-400:]), "playbook")
+            except Exception as exc:
+                log.warning("rule consolidation failed: %s", exc)
 
 
-GATE = RegressionGate(DB, MEMORY)
+REFLECTION = ReflectionEngine(MODEL, STORE)
 
 
-class MetaAgent:
-    def __init__(self, db: Database, model: ModelClient, memory: MemorySubsystem, gate: RegressionGate) -> None:
-        self.db = db
+class TokenPolicyDistiller:
+    def __init__(self, store: SQLiteStore, model: ModelClient):
+        self.store = store
         self.model = model
-        self.memory = memory
-        self.gate = gate
         self._lock = threading.RLock()
+        self.root = DISTILL_ROOT
 
-    def consolidate(self, tenant: Tenant, spec: ProcedureSpec, run_id: str, patch: ReflectionPatch,
-                    state: ExecutionState, traces: List[Dict[str, Any]]) -> Dict[str, Any]:
+    @staticmethod
+    def token_split(text: str) -> List[str]:
+        return re.findall(r"\s+|[A-Za-z0-9_]+|[^\sA-Za-z0-9_]", text or "")
+
+    def _features(self, prefix_tokens: List[str], token: str) -> List[str]:
+        prev1 = prefix_tokens[-1].strip() if prefix_tokens else "<bos>"
+        prev2 = prefix_tokens[-2].strip() if len(prefix_tokens) > 1 else "<bos>"
+        tok = token.strip()
+        feats = [
+            f"uni::{tok[:32]}",
+            f"bi::{prev1[:16]}|{tok[:16]}",
+            f"tri::{prev2[:12]}|{prev1[:12]}|{tok[:12]}",
+            f"cls::{'ws' if not tok else ('num' if tok.isdigit() else ('word' if tok.isalnum() else 'sym'))}",
+            f"pos::{min(len(prefix_tokens) // 24, 24)}",
+            f"len::{min(len(tok), 12)}",
+        ]
+        return feats
+
+    def _weights(self, tenant_id: str, features: Iterable[str]) -> Dict[str, float]:
+        feats = list(dict.fromkeys(features))
+        if not feats:
+            return {}
+        placeholders = ",".join("?" for _ in feats)
+        rows = self.store.query(
+            f"SELECT feature, weight FROM policy_weights WHERE tenant_id = ? AND feature IN ({placeholders})",
+            [tenant_id, *feats],
+        )
+        return {r["feature"]: float(r["weight"]) for r in rows}
+
+    def _logprob(self, tenant_id: str, prefix: List[str], token: str, bias: float, cache: Dict[str, float]) -> float:
+        feats = self._features(prefix, token)
+        missing = [f for f in feats if f not in cache]
+        if missing:
+            cache.update(self._weights(tenant_id, missing))
+            for f in missing:
+                cache.setdefault(f, 0.0)
+        score = bias + sum(cache.get(f, 0.0) for f in feats)
+        return -math.log1p(math.exp(-clamp(score, -18.0, 18.0)))
+
+    def score_pair(self, tenant_id: str, student_prompt: str, teacher_prompt: str, action_text: str) -> Dict[str, Any]:
+        tokens = self.token_split(action_text)[:6000]
+        if not tokens:
+            return {"tokens": [], "student": [], "teacher": [], "reverse_kl": 0.0}
+        cache: Dict[str, float] = {}
+        student_bias = -0.55 - 0.10 * math.tanh(len(student_prompt) / 60000.0)
+        teacher_bias = -0.18 - 0.05 * math.tanh(len(teacher_prompt) / 60000.0)
+        student_lp: List[float] = []
+        teacher_lp: List[float] = []
+        prefix: List[str] = []
+        for tok in tokens:
+            student_lp.append(self._logprob(tenant_id, prefix, tok, student_bias, cache))
+            teacher_lp.append(self._logprob(tenant_id, prefix, tok, teacher_bias, cache))
+            prefix.append(tok)
+            if len(prefix) > 512:
+                prefix = prefix[-512:]
+        rkl = 0.0
+        for s, t in zip(student_lp, teacher_lp):
+            pt = math.exp(clamp(t, -30.0, 0.0))
+            rkl += pt * (t - s)
+        rkl = rkl / max(1, len(tokens))
+        return {"tokens": tokens, "student": student_lp, "teacher": teacher_lp, "reverse_kl": float(rkl)}
+
+    def record(
+        self,
+        tenant_id: str,
+        run_id: str,
+        step: int,
+        student_prompt: str,
+        teacher_prompt: str,
+        action_text: str,
+        advantage: float,
+    ) -> Dict[str, Any]:
+        scored = self.score_pair(tenant_id, student_prompt, teacher_prompt, action_text)
+        sample_id = new_id("dst")
+        self.store.execute(
+            "INSERT INTO distill_samples(sample_id, run_id, tenant_id, step, student_prompt, teacher_prompt, action_text, student_logprobs, teacher_logprobs, tokens, reverse_kl, advantage, created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                sample_id,
+                run_id,
+                tenant_id,
+                int(step),
+                student_prompt[-24000:],
+                teacher_prompt[-24000:],
+                action_text[:24000],
+                jdump([round(x, 6) for x in scored["student"]]),
+                jdump([round(x, 6) for x in scored["teacher"]]),
+                jdump(scored["tokens"]),
+                float(scored["reverse_kl"]),
+                float(advantage),
+            iso(),
+            ),
+        )
+        return {"sample_id": sample_id, "reverse_kl": scored["reverse_kl"], "tokens": len(scored["tokens"])}
+
+    def optimize(self, tenant_id: str, run_id: Optional[str] = None, lr: float = 0.04, epochs: int = 2, limit: int = 400) -> Dict[str, Any]:
         with self._lock:
-            report: Dict[str, Any] = {
-                "run_id": run_id,
-                "memory_target": patch.memory_target,
-                "wiki": None,
-                "skill": None,
-                "gate": None,
-                "rolled_back": False,
-                "accepted": False,
+            if run_id:
+                rows = self.store.query(
+                    "SELECT * FROM distill_samples WHERE tenant_id = ? AND run_id = ? ORDER BY step ASC LIMIT ?",
+                    (tenant_id, run_id, int(limit)),
+                )
+            else:
+                rows = self.store.query(
+                    "SELECT * FROM distill_samples WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?",
+                    (tenant_id, int(limit)),
+                )
+            if not rows:
+                return {"updated_features": 0, "samples": 0, "mean_reverse_kl_before": 0.0, "mean_reverse_kl_after": 0.0, "epochs": 0}
+            samples: List[Tuple[List[str], float]] = []
+            before_vals: List[float] = []
+            for r in rows:
+                tokens = jload(r["tokens"], []) or []
+                advantage = float(r["advantage"])
+                before_vals.append(float(r["reverse_kl"]))
+                samples.append((tokens, advantage))
+            grads: Dict[str, float] = defaultdict(float)
+            counts: Dict[str, int] = defaultdict(int)
+            total_tokens = 0
+            for epoch in range(max(1, int(epochs))):
+                decay = 1.0 / (1.0 + epoch)
+                for tokens, advantage in samples:
+                    prefix: List[str] = []
+                    for tok in tokens:
+                        feats = self._features(prefix, tok)
+                        for f in feats:
+                            grads[f] += lr * decay * advantage / max(1.0, math.sqrt(len(feats)))
+                            counts[f] += 1
+                        prefix.append(tok)
+                        if len(prefix) > 512:
+                            prefix = prefix[-512:]
+                        total_tokens += 1
+            if not grads:
+                return {"updated_features": 0, "samples": len(samples), "mean_reverse_kl_before": sum(before_vals) / len(before_vals), "mean_reverse_kl_after": sum(before_vals) / len(before_vals), "epochs": epochs}
+            existing = self._weights(tenant_id, grads.keys())
+            now = iso()
+            payload: List[Tuple[Any, ...]] = []
+            for feat, grad in grads.items():
+                current = existing.get(feat, 0.0)
+                updated = clamp(current * 0.995 + grad / max(1, counts[feat]) * 8.0, -6.0, 6.0)
+                payload.append((new_id("pw"), tenant_id, feat, updated, counts[feat], now))
+            self.store.executemany(
+                "INSERT INTO policy_weights(weight_id, tenant_id, feature, weight, updates, updated_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(tenant_id, feature) DO UPDATE SET weight=excluded.weight, updates=policy_weights.updates+excluded.updates, updated_at=excluded.updated_at",
+                payload,
+            )
+            after_vals: List[float] = []
+            for r in rows:
+                rescored = self.score_pair(tenant_id, r["student_prompt"], r["teacher_prompt"], r["action_text"])
+                after_vals.append(float(rescored["reverse_kl"]))
+                self.store.execute("UPDATE distill_samples SET reverse_kl = ? WHERE sample_id = ?", (float(rescored["reverse_kl"]), r["sample_id"]))
+            report = {
+                "updated_features": len(payload),
+                "samples": len(samples),
+                "tokens": total_tokens,
+                "mean_reverse_kl_before": sum(before_vals) / max(1, len(before_vals)),
+                "mean_reverse_kl_after": sum(after_vals) / max(1, len(after_vals)),
+                "epochs": int(epochs),
+                "learning_rate": lr,
+                "optimized_at": iso(),
             }
-            wiki_result = self._update_wiki(tenant.tenant_id, spec, patch, state, traces)
-            report["wiki"] = wiki_result
-            proposal = self._propose_skill(tenant, spec, patch, state, traces)
-            if proposal is None:
-                report["accepted"] = True
-                LEDGER.append(tenant.tenant_id, "consolidation", report, run_id)
-                return report
-            report["skill"] = {"name": proposal["name"], "action": proposal["action"]}
-            diagnostics = self.gate.diagnostics(tenant.tenant_id)
-            previous = self.memory.em.by_name(tenant.tenant_id, proposal["name"])
-            baseline = self.gate.evaluate_skill(previous, diagnostics) if previous else {"score": 0.0, "passed": True}
-            candidate = Skill(
-                skill_id=previous.skill_id if previous else "candidate",
-                tenant_id=tenant.tenant_id,
-                name=proposal["name"],
-                description=proposal["description"],
-                trigger_signature=proposal["when_to_use"],
-                procedure=proposal["procedure"],
-                tools=proposal["tools"],
-                version=(previous.version + 1) if previous else 1,
-                success_count=previous.success_count if previous else 0,
-                failure_count=previous.failure_count if previous else 0,
-                embedding=hashed_embedding(" ".join([proposal["name"], proposal["description"],
-                                                     proposal["when_to_use"]] + proposal["procedure"])),
-            )
-            evaluation = self.gate.evaluate_skill(candidate, diagnostics)
-            report["gate"] = {"candidate": evaluation, "baseline_score": baseline.get("score", 0.0)}
-            regression = evaluation["score"] + 1e-9 < float(baseline.get("score", 0.0))
-            if not evaluation["passed"] or regression:
-                report["accepted"] = False
-                report["rolled_back"] = True
-                if previous:
-                    self.memory.em._snapshot(previous.skill_id, tenant.tenant_id, previous.version,
-                                             f"rejected patch from {run_id}", False)
-                LEDGER.append(tenant.tenant_id, "consolidation_rejected", report, run_id)
-                return report
-            stored = self.memory.em.upsert(
-                tenant_id=tenant.tenant_id,
-                name=candidate.name,
-                description=candidate.description,
-                trigger_signature=candidate.trigger_signature,
-                procedure=candidate.procedure,
-                tools=candidate.tools,
-                reason=f"meta-agent consolidation from {run_id}: {patch.root_cause[:200]}",
-            )
-            self.memory.em._write_disk(stored)
-            self.memory.em.record_outcome(stored.skill_id, bool(patch.verdict))
-            report["accepted"] = True
-            report["skill"]["skill_id"] = stored.skill_id
-            report["skill"]["version"] = stored.version
-            LEDGER.append(tenant.tenant_id, "consolidation_accepted", report, run_id)
+            path = self.root / f"optimize_{re.sub(r'[^A-Za-z0-9_.-]', '_', tenant_id)}.jsonl"
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(jdump(report) + "\n")
             return report
 
-    def _update_wiki(self, tenant_id: str, spec: ProcedureSpec, patch: ReflectionPatch, state: ExecutionState,
-                     traces: List[Dict[str, Any]]) -> Dict[str, Any]:
-        slug = KnowledgeWiki.slugify(spec.title or "general-playbook")
-        existing = self.memory.wiki.get(tenant_id, slug)
-        header = f"Playbook: {spec.title}"
-        entry_lines = [
-            f"## Epoch {iso()}",
-            f"- run: {patch.run_id}",
-            f"- outcome: {'success' if patch.verdict else 'failure'}",
-            f"- failure_point: {patch.failure_point}",
-            f"- root_cause: {patch.root_cause}",
-            f"- memory_target: {patch.memory_target}",
-            "- pivot_actions:",
+
+DISTILLER = TokenPolicyDistiller(STORE, MODEL)
+
+
+class CognitionEngine:
+    def __init__(self, store: SQLiteStore, k: int = COGNITION_K, h: int = COGNITION_H):
+        self.store = store
+        self.k = k
+        self.h = h
+
+    @staticmethod
+    def sinusoidal_staleness(elapsed_ms: int, dim: int = 16) -> List[float]:
+        out: List[float] = []
+        t = max(0.0, float(elapsed_ms) / 1000.0)
+        half = max(1, dim // 2)
+        for i in range(half):
+            freq = 1.0 / (10000.0 ** (2.0 * i / max(1, dim)))
+            out.append(math.sin(t * freq))
+            out.append(math.cos(t * freq))
+        return [round(v, 6) for v in out[:dim]]
+
+    def _project(self, sigma: Dict[str, Any], spec: ProceduralSpec) -> List[List[float]]:
+        seeds = [
+            spec.objective,
+            str(sigma.get("phase") or ""),
+            str(sigma.get("current_subgoal") or ""),
+            jdump(sigma.get("plan") or [])[:2000],
+            jdump(sigma.get("open_goals") or [])[:2000],
+            jdump(sigma.get("errors") or [])[:2000],
+            jdump(sigma.get("verification") or {})[:2000],
+            jdump(sigma.get("facts") or {})[:2000],
         ]
-        entry_lines.extend(f"  - {p}" for p in patch.pivot_actions[:6])
-        entry_lines.append(f"- guidance: {patch.guidance}")
-        failed_tools = sorted({t.get("tool", "") for t in traces if t.get("outcome") != "ok"})
-        if failed_tools:
-            entry_lines.append(f"- unstable_tools: {', '.join(t for t in failed_tools if t)}")
-        if state.constraints_observed:
-            entry_lines.append(f"- environment_caveats: {'; '.join(state.constraints_observed[:5])}")
-        entry = "\n".join(entry_lines)
-        body = (existing["body"] + "\n\n" + entry) if existing else entry
-        if len(body) > 400_000:
-            body = body[-400_000:]
-        result = self.memory.wiki.upsert(tenant_id, slug, header, body, reason=f"consolidate {patch.run_id}")
-        result["diff"] = self.memory.wiki.diff(1)[:8000]
-        return result
+        while len(seeds) < self.k:
+            seeds.append("")
+        tokens: List[List[float]] = []
+        for i in range(self.k):
+            base = EMBEDDER.embed(seeds[i] or f"slot_{i}")
+            vec: List[float] = []
+            stride = max(1, len(base) // self.h) if base else 1
+            for j in range(self.h):
+                idx = (j * stride) % max(1, len(base))
+                vec.append(base[idx] if base else 0.0)
+            norm = math.sqrt(sum(v * v for v in vec))
+            if norm > 0:
+                vec = [v / norm for v in vec]
+            tokens.append([round(v, 6) for v in vec])
+        return tokens
 
-    def _propose_skill(self, tenant: Tenant, spec: ProcedureSpec, patch: ReflectionPatch, state: ExecutionState,
-                       traces: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        successful = [t for t in traces if t.get("outcome") == "ok"]
-        if not successful and not patch.pivot_actions:
-            return None
-        heuristic_name = re.sub(r"[^a-z0-9 ]", "", (spec.title or "task").lower()).strip().replace(" ", "_")[:48]
-        heuristic_name = heuristic_name or "general_procedure"
-        used_tools: List[str] = []
-        for t in successful:
-            tool = t.get("tool")
-            if tool and tool not in used_tools and tool in TOOLS.names():
-                used_tools.append(tool)
-        heuristic_procedure = [f"Use {t} to advance the objective with verified preconditions." for t in used_tools[:8]]
-        heuristic_procedure.extend(patch.pivot_actions[:4])
-        if not heuristic_procedure:
-            heuristic_procedure = ["Decompose the objective into verifiable subgoals before acting."]
-        fallback = {
-            "action": "upsert",
-            "name": heuristic_name,
-            "description": f"Procedure distilled from run {patch.run_id} for objective: {spec.objective[:400]}",
-            "when_to_use": f"{spec.title}: {state.phase}; {patch.failure_point[:200]}",
-            "procedure": [str(p)[:400] for p in heuristic_procedure][:16],
-            "tools": used_tools[:12] or ["reason"],
-        }
-        if not self.model.available:
-            return fallback
-        prompt = {
-            "objective": spec.frozen_view(),
-            "reflection": patch.to_dict(),
-            "terminal_state": state.compact(2500),
-            "successful_tool_sequence": [{"step": t.get("step"), "tool": t.get("tool")} for t in successful[:24]],
-            "registered_tools": TOOLS.names(),
-            "existing_skills": [s.name for s in self.memory.em.list_skills(tenant.tenant_id)][:60],
-            "required_json_schema": {
-                "action": "upsert",
-                "name": "snake_case_identifier",
-                "description": "string",
-                "when_to_use": "string",
-                "procedure": ["ordered imperative steps"],
-                "tools": ["registered tool names only"],
-            },
-        }
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are an isolated meta-agent that authors minimal, scoped procedural skill patches for an "
-                    "agent skill library. You never modify yourself. Output exactly one JSON object matching the "
-                    "schema, no markdown. Tools must be drawn only from registered_tools. Keep procedures under 16 steps."
-                ),
-            },
-            {"role": "user", "content": jdump(prompt)},
-        ]
-        try:
-            text, tokens = self.model.complete(messages, max_tokens=min(6000, MODEL_MAX_TOKENS), temperature=0.35)
-            with contextlib.suppress(BudgetExceeded, AuthorizationDenied):
-                TENANTS.charge(tenant.tenant_id, tokens)
-            parsed = GrammarDecoder.extract_json(text)
-            name = re.sub(r"[^a-zA-Z0-9_]+", "_", str(parsed.get("name", heuristic_name))).strip("_").lower()[:48]
-            procedure = parsed.get("procedure", [])
-            if isinstance(procedure, str):
-                procedure = [ln for ln in procedure.splitlines() if ln.strip()]
-            tools = parsed.get("tools", [])
-            if isinstance(tools, str):
-                tools = [tools]
-            registered = set(TOOLS.names())
-            tools = [str(t) for t in tools if str(t) in registered]
-            if not name or not procedure:
-                return fallback
-            return {
-                "action": "upsert",
-                "name": name,
-                "description": str(parsed.get("description", fallback["description"]))[:2000],
-                "when_to_use": str(parsed.get("when_to_use", fallback["when_to_use"]))[:1200],
-                "procedure": [str(p)[:400] for p in procedure][:16],
-                "tools": tools[:12] or fallback["tools"],
-            }
-        except Exception as exc:
-            LOG.warning("meta-agent proposal failed, using heuristic: %s", exc)
-            return fallback
-
-
-META = MetaAgent(DB, MODEL, MEMORY, GATE)
-
-
-class EventBus:
-    def __init__(self) -> None:
-        self._subs: Dict[str, Set[asyncio.Queue]] = defaultdict(set)
-        self._lock = asyncio.Lock()
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-
-    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
-        self._loop = loop
-
-    async def subscribe(self, topic: str) -> asyncio.Queue:
-        queue: asyncio.Queue = asyncio.Queue(maxsize=2048)
-        async with self._lock:
-            self._subs[topic].add(queue)
-        return queue
-
-    async def unsubscribe(self, topic: str, queue: asyncio.Queue) -> None:
-        async with self._lock:
-            self._subs[topic].discard(queue)
-            if not self._subs[topic]:
-                self._subs.pop(topic, None)
-
-    def publish_threadsafe(self, topic: str, payload: Dict[str, Any]) -> None:
-        loop = self._loop
-        if loop is None or loop.is_closed():
-            return
-        try:
-            loop.call_soon_threadsafe(self._deliver, topic, payload)
-        except RuntimeError:
-            pass
-
-    def _deliver(self, topic: str, payload: Dict[str, Any]) -> None:
-        for queue in list(self._subs.get(topic, set())) + list(self._subs.get("*", set())):
-            try:
-                queue.put_nowait(payload)
-            except asyncio.QueueFull:
-                with contextlib.suppress(asyncio.QueueEmpty):
-                    queue.get_nowait()
-                with contextlib.suppress(asyncio.QueueFull):
-                    queue.put_nowait(payload)
-
-
-BUS = EventBus()
-
-
-class CheckpointStore:
-    def __init__(self, db: Database) -> None:
-        self.db = db
-
-    def save(self, run_id: str, step: int, node: NodeKind, state: ExecutionState, observation: Observation,
-             status: RunState, tokens_used: int) -> str:
-        checkpoint_id = new_id("ckp")
-        state_blob = jdump(state.to_dict())
-        obs_blob = jdump(observation.to_dict())
-        digest = stable_hash({"run": run_id, "step": step, "node": node.value, "state": state_blob, "obs": obs_blob})
-        self.db.execute(
-            "INSERT INTO checkpoints(checkpoint_id, run_id, step, node, state, observation, status, tokens_used,"
-            " digest, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (checkpoint_id, run_id, step, node.value, state_blob, obs_blob, status.value, tokens_used, digest, iso()),
+    def deliberate(self, tenant_id: str, run_id: str, step: int, spec: ProceduralSpec, sigma: Dict[str, Any]) -> Dict[str, Any]:
+        tokens = self._project(sigma, spec)
+        open_goals = list(sigma.get("open_goals") or [])
+        errors = list(sigma.get("errors") or [])
+        verification = sigma.get("verification") or {}
+        criteria = max(1, len(spec.success_criteria) or 1)
+        verified = sum(1 for v in verification.values() if v) if isinstance(verification, dict) else 0
+        gate = clamp(0.25 + 0.55 * (verified / criteria) - 0.08 * min(6, len(errors)) + 0.05 * (1.0 if not open_goals else 0.0), 0.0, 1.0)
+        subgoal = str(sigma.get("current_subgoal") or "").strip()
+        if not subgoal:
+            subgoal = str(open_goals[0]) if open_goals else (spec.success_criteria[0] if spec.success_criteria else spec.objective)
+        flat: List[float] = []
+        for row in tokens:
+            flat.extend(row)
+        cog_id = new_id("cog")
+        created_ms = int(time.time() * 1000)
+        self.store.execute(
+            "INSERT INTO cognition_tokens(cog_id, run_id, tenant_id, step, vector, gate, subgoal, created_at, created_ms) VALUES(?,?,?,?,?,?,?,?,?)",
+            (cog_id, run_id, tenant_id, int(step), pack_vector(flat), float(gate), subgoal[:600], iso(), created_ms),
         )
-        return checkpoint_id
+        self.store.execute(
+            "DELETE FROM cognition_tokens WHERE run_id = ? AND cog_id NOT IN (SELECT cog_id FROM cognition_tokens WHERE run_id = ? ORDER BY step DESC, created_ms DESC LIMIT 24)",
+            (run_id, run_id),
+        )
+        return {
+            "cog_id": cog_id,
+            "step": step,
+            "gate": gate,
+            "subgoal": subgoal,
+            "shape": [self.k, self.h],
+            "created_ms": created_ms,
+            "signature": [round(sum(row) / max(1, len(row)), 6) for row in tokens],
+        }
 
     def latest(self, run_id: str) -> Optional[Dict[str, Any]]:
-        row = self.db.query_one(
-            "SELECT * FROM checkpoints WHERE run_id=? ORDER BY step DESC, rowid DESC LIMIT 1", (run_id,)
-        )
-        if not row:
+        row = self.store.one("SELECT * FROM cognition_tokens WHERE run_id = ? ORDER BY step DESC, created_ms DESC LIMIT 1", (run_id,))
+        if row is None:
             return None
+        vec = unpack_vector(row["vector"])
+        rows_k = self.k if self.k > 0 else 1
+        chunk = max(1, len(vec) // rows_k) if vec else 1
+        signature = []
+        for i in range(rows_k):
+            seg = vec[i * chunk : (i + 1) * chunk]
+            signature.append(round(sum(seg) / max(1, len(seg)), 6) if seg else 0.0)
+        elapsed = max(0, int(time.time() * 1000) - int(row["created_ms"]))
+        return {
+            "cog_id": row["cog_id"],
+            "step": int(row["step"]),
+            "gate": float(row["gate"]),
+            "subgoal": row["subgoal"],
+            "staleness_ms": elapsed,
+            "staleness_encoding": self.sinusoidal_staleness(elapsed),
+            "signature": signature,
+            "shape": [self.k, chunk],
+        }
+
+
+COGNITION = CognitionEngine(STORE)
+
+
+class CheckpointManager:
+    def __init__(self, store: SQLiteStore):
+        self.store = store
+
+    def save(self, tenant_id: str, run_id: str, step: int, node: str, sigma: Dict[str, Any], observation: Observation, pending: Optional[Dict[str, Any]] = None) -> str:
+        payload = {
+            "run_id": run_id,
+            "tenant_id": tenant_id,
+            "step": step,
+            "node": node,
+            "sigma": sigma,
+            "observation": observation.to_dict(),
+            "pending": pending or {},
+        }
+        digest = stable_hash(payload)
+        signature = sign_payload(payload)
+        ckpt_id = new_id("ckpt")
+        with self.store.tx() as c:
+            c.execute(
+                "INSERT INTO checkpoints(checkpoint_id, run_id, tenant_id, step, node, sigma, observation, pending, digest, signature, created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(run_id, step, node) DO UPDATE SET sigma=excluded.sigma, observation=excluded.observation, pending=excluded.pending, digest=excluded.digest, signature=excluded.signature, created_at=excluded.created_at",
+                (
+                    ckpt_id,
+                    run_id,
+                    tenant_id,
+                    int(step),
+                    node,
+                    jdump(sigma),
+                    jdump(observation.to_dict()),
+                    jdump(pending or {}),
+                    digest,
+                    signature,
+                    iso(),
+                ),
+            )
+            c.execute("UPDATE runs SET step = ?, updated_at = ? WHERE run_id = ?", (int(step), iso(), run_id))
+        return ckpt_id
+
+    def latest(self, run_id: str) -> Optional[Dict[str, Any]]:
+        row = self.store.one("SELECT * FROM checkpoints WHERE run_id = ? ORDER BY step DESC, created_at DESC LIMIT 1", (run_id,))
+        if row is None:
+            return None
+        sigma = jload(row["sigma"], empty_sigma()) or empty_sigma()
+        obs_d = jload(row["observation"], {}) or {}
+        payload = {
+            "run_id": row["run_id"],
+            "tenant_id": row["tenant_id"],
+            "step": int(row["step"]),
+            "node": row["node"],
+            "sigma": sigma,
+            "observation": obs_d,
+            "pending": jload(row["pending"], {}) or {},
+        }
+        valid = verify_signature(payload, row["signature"])
         return {
             "checkpoint_id": row["checkpoint_id"],
             "step": int(row["step"]),
             "node": row["node"],
-            "state": jload(row["state"], {}) or {},
-            "observation": jload(row["observation"], {}) or {},
-            "status": row["status"],
-            "tokens_used": int(row["tokens_used"]),
-            "digest": row["digest"],
+            "sigma": sigma,
+            "observation": obs_d,
+            "pending": payload["pending"],
+            "integrity_ok": valid,
             "created_at": row["created_at"],
         }
 
-    def history(self, run_id: str, limit: int = 200) -> List[Dict[str, Any]]:
-        rows = self.db.query(
-            "SELECT checkpoint_id, step, node, status, tokens_used, digest, created_at FROM checkpoints"
-            " WHERE run_id=? ORDER BY step ASC LIMIT ?",
-            (run_id, limit),
+    def prune(self, run_id: str, keep: int = 40) -> None:
+        self.store.execute(
+            "DELETE FROM checkpoints WHERE run_id = ? AND checkpoint_id NOT IN "
+            "(SELECT checkpoint_id FROM checkpoints WHERE run_id = ? ORDER BY step DESC, created_at DESC LIMIT ?)",
+            (run_id, run_id, int(keep)),
         )
-        return [{k: r[k] for k in r.keys()} for r in rows]
-
-    def prune(self, run_id: str, keep: int = 400) -> int:
-        rows = self.db.query("SELECT checkpoint_id FROM checkpoints WHERE run_id=? ORDER BY rowid DESC", (run_id,))
-        stale = [r["checkpoint_id"] for r in rows[keep:]]
-        if not stale:
-            return 0
-        with self.db.tx() as conn:
-            conn.executemany("DELETE FROM checkpoints WHERE checkpoint_id=?", [(cid,) for cid in stale])
-        return len(stale)
 
 
-CHECKPOINTS = CheckpointStore(DB)
+CHECKPOINTS = CheckpointManager(STORE)
 
 
-class RunRecord:
-    __slots__ = ("run_id", "tenant_id", "spec_id", "conversation_id", "status", "node", "step", "tokens_used",
-                 "retries", "state", "last_observation", "final_answer", "error", "created_at", "updated_at")
-
-    def __init__(self, row: sqlite3.Row) -> None:
-        self.run_id = row["run_id"]
-        self.tenant_id = row["tenant_id"]
-        self.spec_id = row["spec_id"]
-        self.conversation_id = row["conversation_id"]
-        self.status = RunState(row["status"])
-        self.node = NodeKind(row["node"])
-        self.step = int(row["step"])
-        self.tokens_used = int(row["tokens_used"])
-        self.retries = int(row["retries"])
-        self.state = ExecutionState.from_dict(jload(row["state"], {}) or {})
-        self.last_observation = jload(row["last_observation"], {}) or {}
-        self.final_answer = row["final_answer"]
-        self.error = row["error"]
-        self.created_at = row["created_at"]
-        self.updated_at = row["updated_at"]
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "run_id": self.run_id,
-            "tenant_id": self.tenant_id,
-            "spec_id": self.spec_id,
-            "conversation_id": self.conversation_id,
-            "status": self.status.value,
-            "node": self.node.value,
-            "step": self.step,
-            "tokens_used": self.tokens_used,
-            "retries": self.retries,
-            "state": self.state.to_dict(),
-            "last_observation": self.last_observation,
-            "final_answer": self.final_answer,
-            "error": self.error,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-        }
+class RunStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    ERROR = "error"
 
 
-class RunStore:
-    def __init__(self, db: Database) -> None:
-        self.db = db
-        self._lock = threading.RLock()
+class GraphNode(str, Enum):
+    OBSERVE = "observe"
+    DELIBERATE = "deliberate"
+    ROUTE = "route"
+    DECIDE = "decide"
+    VALIDATE = "validate"
+    ACT = "act"
+    COMMIT = "commit"
+    VERIFY = "verify"
+    REFLECT = "reflect"
+    TERMINATE = "terminate"
 
-    def create(self, tenant_id: str, spec: ProcedureSpec, conversation_id: str = "") -> RunRecord:
+
+@dataclass
+class RunHandle:
+    run_id: str
+    tenant_id: str
+    conversation_id: Optional[str]
+    spec: ProceduralSpec
+    status: str
+    step: int
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    pause_event: threading.Event = field(default_factory=threading.Event)
+    thread: Optional[threading.Thread] = None
+    started_at: float = field(default_factory=time.time)
+
+
+class RunRepository:
+    def __init__(self, store: SQLiteStore):
+        self.store = store
+
+    def create(self, tenant_id: str, conversation_id: Optional[str], spec: ProceduralSpec) -> str:
         run_id = new_id("run")
         now = iso()
-        state = ExecutionState(
-            phase="bootstrap",
-            next_intent="Analyze the objective and construct an initial verifiable subgoal decomposition.",
+        self.store.execute(
+            "INSERT INTO runs(run_id, tenant_id, conversation_id, spec, status, step, created_at, updated_at, tokens_used, wall_ms, resume_count) "
+            "VALUES(?,?,?,?,?,0,?,?,0,0,0)",
+            (run_id, tenant_id, conversation_id, jdump(spec.to_dict()), RunStatus.PENDING.value, now, now),
         )
-        self.db.execute(
-            "INSERT INTO runs(run_id, tenant_id, spec_id, conversation_id, status, node, step, tokens_used, retries,"
-            " state, last_observation, final_answer, error, lease_owner, lease_expires_at, created_at, updated_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (run_id, tenant_id, spec.spec_id, conversation_id, RunState.PENDING.value, NodeKind.PERCEIVE.value,
-             0, 0, 0, jdump(state.to_dict()), "{}", "", "", "", 0.0, now, now),
-        )
-        record = self.get(run_id)
-        if record is None:
-            raise RuntimeError("run creation failed")
-        return record
+        return run_id
 
-    def get(self, run_id: str) -> Optional[RunRecord]:
-        row = self.db.query_one("SELECT * FROM runs WHERE run_id=?", (run_id,))
-        return RunRecord(row) if row else None
+    def get(self, run_id: str, tenant_id: Optional[str] = None) -> Optional[sqlite3.Row]:
+        if tenant_id:
+            return self.store.one("SELECT * FROM runs WHERE run_id = ? AND tenant_id = ?", (run_id, tenant_id))
+        return self.store.one("SELECT * FROM runs WHERE run_id = ?", (run_id,))
 
-    def get_scoped(self, tenant_id: str, run_id: str) -> Optional[RunRecord]:
-        row = self.db.query_one("SELECT * FROM runs WHERE run_id=? AND tenant_id=?", (run_id, tenant_id))
-        return RunRecord(row) if row else None
-
-    def list_runs(self, tenant_id: str, status: Optional[str] = None, limit: int = 100) -> List[RunRecord]:
+    def list(self, tenant_id: str, limit: int = 100, status: Optional[str] = None) -> List[Dict[str, Any]]:
         if status:
-            rows = self.db.query(
-                "SELECT * FROM runs WHERE tenant_id=? AND status=? ORDER BY updated_at DESC LIMIT ?",
-                (tenant_id, status, limit),
+            rows = self.store.query(
+                "SELECT run_id, tenant_id, conversation_id, status, step, created_at, updated_at, finished_at, verdict, tokens_used, wall_ms, error, spec, resume_count "
+                "FROM runs WHERE tenant_id = ? AND status = ? ORDER BY created_at DESC LIMIT ?",
+                (tenant_id, status, int(limit)),
             )
         else:
-            rows = self.db.query(
-                "SELECT * FROM runs WHERE tenant_id=? ORDER BY updated_at DESC LIMIT ?", (tenant_id, limit)
+            rows = self.store.query(
+                "SELECT run_id, tenant_id, conversation_id, status, step, created_at, updated_at, finished_at, verdict, tokens_used, wall_ms, error, spec, resume_count "
+                "FROM runs WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?",
+                (tenant_id, int(limit)),
             )
-        return [RunRecord(r) for r in rows]
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            spec = jload(r["spec"], {}) or {}
+            out.append(
+                {
+                    "run_id": r["run_id"],
+                    "tenant_id": r["tenant_id"],
+                    "conversation_id": r["conversation_id"],
+                    "status": r["status"],
+                    "step": int(r["step"]),
+                    "created_at": r["created_at"],
+                    "updated_at": r["updated_at"],
+                    "finished_at": r["finished_at"],
+                    "verdict": jload(r["verdict"], None),
+                    "tokens_used": int(r["tokens_used"]),
+                    "wall_ms": int(r["wall_ms"]),
+                    "error": r["error"],
+                    "objective": spec.get("objective", ""),
+                    "resume_count": int(r["resume_count"]),
+                }
+            )
+        return out
 
-    def resumable(self) -> List[RunRecord]:
-        now = time.time()
-        rows = self.db.query(
-            "SELECT * FROM runs WHERE status IN (?,?,?) AND lease_expires_at < ? ORDER BY updated_at ASC",
-            (RunState.RUNNING.value, RunState.PENDING.value, RunState.RECOVERING.value, now),
+    def set_status(self, run_id: str, status: str, error: Optional[str] = None) -> None:
+        finished = iso() if status in (RunStatus.COMPLETED.value, RunStatus.FAILED.value, RunStatus.CANCELLED.value, RunStatus.ERROR.value) else None
+        self.store.execute(
+            "UPDATE runs SET status = ?, updated_at = ?, finished_at = COALESCE(?, finished_at), error = COALESCE(?, error) WHERE run_id = ?",
+            (status, iso(), finished, error, run_id),
         )
-        return [RunRecord(r) for r in rows]
 
-    def acquire_lease(self, run_id: str, owner: str, ttl: float = 45.0) -> bool:
-        with self._lock:
-            now = time.time()
-            with self.db.tx() as conn:
-                cur = conn.execute(
-                    "UPDATE runs SET lease_owner=?, lease_expires_at=? WHERE run_id=? AND"
-                    " (lease_owner=? OR lease_expires_at < ?)",
-                    (owner, now + ttl, run_id, owner, now),
-                )
-                return cur.rowcount > 0
-
-    def renew_lease(self, run_id: str, owner: str, ttl: float = 45.0) -> None:
-        self.db.execute(
-            "UPDATE runs SET lease_expires_at=? WHERE run_id=? AND lease_owner=?",
-            (time.time() + ttl, run_id, owner),
+    def bump(self, run_id: str, step: int, tokens: int, wall_ms: int) -> None:
+        self.store.execute(
+            "UPDATE runs SET step = ?, tokens_used = tokens_used + ?, wall_ms = ?, updated_at = ? WHERE run_id = ?",
+            (int(step), int(tokens), int(wall_ms), iso(), run_id),
         )
+
+    def set_terminal(self, run_id: str, terminal_state: Dict[str, Any], verdict: Dict[str, Any]) -> None:
+        self.store.execute(
+            "UPDATE runs SET terminal_state = ?, verdict = ?, updated_at = ? WHERE run_id = ?",
+            (jdump(terminal_state), jdump(verdict), iso(), run_id),
+        )
+
+    def acquire_lease(self, run_id: str, owner: str, ttl_s: int = 120) -> bool:
+        now = utcnow()
+        expires = (now + timedelta(seconds=ttl_s)).isoformat()
+        with self.store.tx() as c:
+            row = c.execute("SELECT lease_owner, lease_expires_at FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                return False
+            current_owner = row[0]
+            current_exp = row[1]
+            if current_owner and current_owner != owner and current_exp:
+                try:
+                    if datetime.fromisoformat(current_exp) > now:
+                        return False
+                except Exception:
+                    pass
+            c.execute("UPDATE runs SET lease_owner = ?, lease_expires_at = ? WHERE run_id = ?", (owner, expires, run_id))
+            return True
+
+    def renew_lease(self, run_id: str, owner: str, ttl_s: int = 120) -> None:
+        expires = (utcnow() + timedelta(seconds=ttl_s)).isoformat()
+        self.store.execute("UPDATE runs SET lease_owner = ?, lease_expires_at = ? WHERE run_id = ?", (owner, expires, run_id))
 
     def release_lease(self, run_id: str, owner: str) -> None:
-        self.db.execute(
-            "UPDATE runs SET lease_owner='', lease_expires_at=0 WHERE run_id=? AND lease_owner=?", (run_id, owner)
+        self.store.execute("UPDATE runs SET lease_owner = NULL, lease_expires_at = NULL WHERE run_id = ? AND lease_owner = ?", (run_id, owner))
+
+    def increment_resume(self, run_id: str) -> None:
+        self.store.execute("UPDATE runs SET resume_count = resume_count + 1, updated_at = ? WHERE run_id = ?", (iso(), run_id))
+
+    def resumable(self, limit: int = 200) -> List[sqlite3.Row]:
+        return self.store.query(
+            "SELECT * FROM runs WHERE status IN (?, ?, ?) ORDER BY updated_at ASC LIMIT ?",
+            (RunStatus.RUNNING.value, RunStatus.PENDING.value, RunStatus.PAUSED.value, int(limit)),
         )
 
-    def persist(self, run_id: str, *, status: Optional[RunState] = None, node: Optional[NodeKind] = None,
-                step: Optional[int] = None, tokens_used: Optional[int] = None, retries: Optional[int] = None,
-                state: Optional[ExecutionState] = None, observation: Optional[Observation] = None,
-                final_answer: Optional[str] = None, error: Optional[str] = None) -> None:
-        sets: List[str] = ["updated_at=?"]
-        params: List[Any] = [iso()]
-        if status is not None:
-            sets.append("status=?")
-            params.append(status.value)
-        if node is not None:
-            sets.append("node=?")
-            params.append(node.value)
-        if step is not None:
-            sets.append("step=?")
-            params.append(int(step))
-        if tokens_used is not None:
-            sets.append("tokens_used=?")
-            params.append(int(tokens_used))
-        if retries is not None:
-            sets.append("retries=?")
-            params.append(int(retries))
-        if state is not None:
-            sets.append("state=?")
-            params.append(jdump(state.to_dict()))
-        if observation is not None:
-            sets.append("last_observation=?")
-            params.append(jdump(observation.to_dict()))
-        if final_answer is not None:
-            sets.append("final_answer=?")
-            params.append(final_answer[:200_000])
-        if error is not None:
-            sets.append("error=?")
-            params.append(error[:8000])
-        params.append(run_id)
-        self.db.execute(f"UPDATE runs SET {', '.join(sets)} WHERE run_id=?", params)
 
-    def set_status(self, run_id: str, status: RunState) -> None:
-        self.persist(run_id, status=status)
-
-    def request_cancel(self, run_id: str) -> None:
-        self.persist(run_id, status=RunState.CANCELLED)
+RUNS = RunRepository(STORE)
 
 
-RUNS = RunStore(DB)
+class MessageRepository:
+    def __init__(self, store: SQLiteStore):
+        self.store = store
 
-
-class SpecStore:
-    def __init__(self, db: Database) -> None:
-        self.db = db
-
-    def create(self, tenant_id: str, title: str, objective: str, constraints: List[str],
-               success_criteria: List[str], allowed_tools: List[str], max_steps: int, token_budget: int,
-               verifier_program: Optional[str]) -> ProcedureSpec:
-        registered = set(TOOLS.names())
-        tools = [t for t in allowed_tools if t in registered] or [t for t in registered]
-        spec = ProcedureSpec(
-            spec_id=new_id("spc"),
-            tenant_id=tenant_id,
-            title=title[:300] or "Untitled objective",
-            objective=objective[:20000],
-            constraints=[str(c)[:600] for c in constraints][:32],
-            success_criteria=[str(c)[:600] for c in success_criteria][:32],
-            allowed_tools=sorted(set(tools)),
-            max_steps=int(clamp(float(max_steps or DEFAULT_MAX_STEPS), 1, 5000)),
-            token_budget=int(max(1000, token_budget or DEFAULT_TOKEN_BUDGET)),
-            verifier_program=(verifier_program or "")[:40000] or None,
-        )
-        row = spec.to_row()
-        self.db.execute(
-            "INSERT INTO specs(spec_id, tenant_id, title, objective, constraints, success_criteria, allowed_tools,"
-            " max_steps, token_budget, verifier_program, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (row["spec_id"], row["tenant_id"], row["title"], row["objective"], row["constraints"],
-             row["success_criteria"], row["allowed_tools"], row["max_steps"], row["token_budget"],
-             row["verifier_program"], row["created_at"]),
-        )
-        return spec
-
-    def get(self, spec_id: str) -> Optional[ProcedureSpec]:
-        row = self.db.query_one("SELECT * FROM specs WHERE spec_id=?", (spec_id,))
-        return ProcedureSpec.from_row(row) if row else None
-
-    def get_scoped(self, tenant_id: str, spec_id: str) -> Optional[ProcedureSpec]:
-        row = self.db.query_one("SELECT * FROM specs WHERE spec_id=? AND tenant_id=?", (spec_id, tenant_id))
-        return ProcedureSpec.from_row(row) if row else None
-
-    def list_specs(self, tenant_id: str, limit: int = 100) -> List[ProcedureSpec]:
-        rows = self.db.query("SELECT * FROM specs WHERE tenant_id=? ORDER BY created_at DESC LIMIT ?",
-                             (tenant_id, limit))
-        return [ProcedureSpec.from_row(r) for r in rows]
-
-
-SPECS = SpecStore(DB)
-
-
-class ConversationStore:
-    def __init__(self, db: Database) -> None:
-        self.db = db
-
-    def create(self, tenant_id: str, title: str) -> Dict[str, Any]:
-        conversation_id = new_id("cnv")
-        now = iso()
-        self.db.execute(
-            "INSERT INTO conversations(conversation_id, tenant_id, title, created_at, updated_at) VALUES(?,?,?,?,?)",
-            (conversation_id, tenant_id, title[:300] or "New chat", now, now),
-        )
-        return {"conversation_id": conversation_id, "tenant_id": tenant_id, "title": title[:300] or "New chat",
-                "created_at": now, "updated_at": now}
-
-    def get(self, tenant_id: str, conversation_id: str) -> Optional[Dict[str, Any]]:
-        row = self.db.query_one("SELECT * FROM conversations WHERE conversation_id=? AND tenant_id=?",
-                                (conversation_id, tenant_id))
-        return {k: row[k] for k in row.keys()} if row else None
-
-    def ensure(self, tenant_id: str, conversation_id: Optional[str], title: str) -> Dict[str, Any]:
+    def ensure_conversation(self, tenant_id: str, conversation_id: Optional[str], title: str = "New conversation") -> str:
         if conversation_id:
-            existing = self.get(tenant_id, conversation_id)
-            if existing:
-                return existing
-        return self.create(tenant_id, title)
-
-    def list_conversations(self, tenant_id: str, limit: int = 100) -> List[Dict[str, Any]]:
-        rows = self.db.query(
-            "SELECT * FROM conversations WHERE tenant_id=? ORDER BY updated_at DESC LIMIT ?", (tenant_id, limit)
-        )
-        return [{k: r[k] for k in r.keys()} for r in rows]
-
-    def delete(self, tenant_id: str, conversation_id: str) -> bool:
-        existing = self.get(tenant_id, conversation_id)
-        if not existing:
-            return False
-        self.db.execute("DELETE FROM conversations WHERE conversation_id=? AND tenant_id=?",
-                        (conversation_id, tenant_id))
-        return True
-
-    def add_message(self, tenant_id: str, conversation_id: str, role: str, content: str,
-                    meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        message_id = new_id("msg")
+            row = self.store.one("SELECT conversation_id FROM conversations WHERE conversation_id = ? AND tenant_id = ?", (conversation_id, tenant_id))
+            if row is not None:
+                return conversation_id
+        cid = conversation_id or new_id("conv")
         now = iso()
-        self.db.execute(
-            "INSERT INTO messages(message_id, conversation_id, tenant_id, role, content, meta, created_at)"
-            " VALUES(?,?,?,?,?,?,?)",
-            (message_id, conversation_id, tenant_id, role, content, jdump(meta or {}), now),
+        self.store.execute(
+            "INSERT INTO conversations(conversation_id, tenant_id, title, created_at, updated_at, archived) VALUES(?,?,?,?,?,0) "
+            "ON CONFLICT(conversation_id) DO UPDATE SET updated_at=excluded.updated_at",
+            (cid, tenant_id, title[:200], now, now),
         )
-        self.db.execute("UPDATE conversations SET updated_at=? WHERE conversation_id=?", (now, conversation_id))
-        return {"message_id": message_id, "conversation_id": conversation_id, "role": role, "content": content,
-                "meta": meta or {}, "created_at": now}
+        return cid
 
-    def messages(self, tenant_id: str, conversation_id: str, limit: int = 500) -> List[Dict[str, Any]]:
-        rows = self.db.query(
-            "SELECT * FROM messages WHERE conversation_id=? AND tenant_id=? ORDER BY created_at ASC LIMIT ?",
-            (conversation_id, tenant_id, limit),
+    def add(self, tenant_id: str, conversation_id: str, role: str, content: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        seq = self.store.next_seq(f"msg:{conversation_id}")
+        mid = new_id("msg")
+        now = iso()
+        self.store.execute(
+            "INSERT INTO messages(message_id, conversation_id, tenant_id, role, content, meta, created_at, seq) VALUES(?,?,?,?,?,?,?,?)",
+            (mid, conversation_id, tenant_id, role, content, jdump(meta or {}), now, seq),
         )
-        return [{"message_id": r["message_id"], "role": r["role"], "content": r["content"],
-                 "meta": jload(r["meta"], {}) or {}, "created_at": r["created_at"]} for r in rows]
+        self.store.execute("UPDATE conversations SET updated_at = ? WHERE conversation_id = ?", (now, conversation_id))
+        return {"message_id": mid, "conversation_id": conversation_id, "role": role, "content": content, "meta": meta or {}, "created_at": now, "seq": seq}
 
-    def rename(self, tenant_id: str, conversation_id: str, title: str) -> bool:
-        if not self.get(tenant_id, conversation_id):
-            return False
-        self.db.execute("UPDATE conversations SET title=?, updated_at=? WHERE conversation_id=?",
-                        (title[:300], iso(), conversation_id))
-        return True
-
-
-CONVERSATIONS = ConversationStore(DB)
-
-
-class DeliberativeEngine:
-    def __init__(self, model: ModelClient, memory: MemorySubsystem) -> None:
-        self.model = model
-        self.memory = memory
-
-    def build_frame(self, run_id: str, spec: ProcedureSpec, state: ExecutionState,
-                    observation: Observation, directives: List[str]) -> CognitionFrame:
-        wm = self.memory.wm.derive(state, spec)
-        seed_text = jdump({"wm": wm, "obs": observation.to_dict(), "directives": directives})
-        base = hashed_embedding(seed_text, COGNITION_K * COGNITION_H)
-        tokens: List[List[float]] = []
-        for k in range(COGNITION_K):
-            chunk = base[k * COGNITION_H : (k + 1) * COGNITION_H]
-            if len(chunk) < COGNITION_H:
-                chunk = list(chunk) + [0.0] * (COGNITION_H - len(chunk))
-            tokens.append([round(float(v), 6) for v in chunk])
-        open_goals = wm["open_subgoals"]
-        subgoal = open_goals[0]["goal"] if open_goals else (state.next_intent or spec.objective[:200])
-        blocked = 1.0 if wm["unresolved_blockers"] else 0.0
-        gates = {
-            "explore": clamp(0.85 - state.progress * 0.6 + blocked * 0.2, 0.0, 1.0),
-            "exploit": clamp(0.15 + state.progress * 0.7, 0.0, 1.0),
-            "verify": clamp(0.2 + state.progress * 0.75, 0.0, 1.0),
-            "escalate": clamp(blocked * 0.8 + (0.3 if not observation.ok else 0.0), 0.0, 1.0),
-            "consolidate": clamp(state.progress - 0.75, 0.0, 1.0),
-        }
-        directive_text = " | ".join(directives[:3]) if directives else (
-            "Advance the highest-priority open subgoal with a verifiable action."
+    def history(self, tenant_id: str, conversation_id: str, limit: int = 500) -> List[Dict[str, Any]]:
+        rows = self.store.query(
+            "SELECT * FROM messages WHERE conversation_id = ? AND tenant_id = ? ORDER BY seq ASC LIMIT ?",
+            (conversation_id, tenant_id, int(limit)),
         )
-        return CognitionFrame(
-            frame_id=new_id("cog"),
-            run_id=run_id,
-            generated_at=time.time(),
-            tokens=tokens,
-            gates=gates,
-            subgoal=str(subgoal)[:400],
-            directive=directive_text[:1200],
-            horizon=max(1, min(12, spec.max_steps - len([g for g in state.subgoals if isinstance(g, dict) and g.get("done")]))),
-        )
-
-
-DELIBERATOR = DeliberativeEngine(MODEL, MEMORY)
-
-
-STEP_SYSTEM_PROMPT = (
-    "You are the reasoning core of a stateless, long-horizon autonomous agent runtime.\n"
-    "You receive ONLY: the immutable task specification P, the structured execution state SIGMA_t, the latest "
-    "observation O_t, routed procedural skills, knowledge caveats, and a cognition frame. You never receive "
-    "conversational history; SIGMA_t is the complete sufficient statistic.\n"
-    "You may reason internally in multiple steps, but you MUST emit exactly one JSON object and nothing else.\n"
-    "Required JSON shape:\n"
-    "{\n"
-    '  "state_delta": {"phase": "...", "progress": 0.0, "subgoals": [{"id":"g1","goal":"...","done":false,'
-    '"depends_on":[]}], "facts": {}, "artifacts": {}, "blockers": [], "constraints_observed": [], '
-    '"next_intent": "...", "scratch": {}, "metrics": {}, "skill_hints": []},\n'
-    '  "action": {"tool": "<registered tool>", "arguments": {}, "rationale_digest": "one short sentence", '
-    '"terminal": false, "final_answer": null}\n'
-    "}\n"
-    "Rules:\n"
-    "1. state_delta uses dictionary-merge semantics. Include ONLY changed keys. Use JSON null to delete a key.\n"
-    "2. Never restate unchanged state. Keep the delta minimal and O(1) in size.\n"
-    "3. progress is a float in [0,1]. Set terminal true and provide final_answer only when success criteria are "
-    "verifiably satisfied.\n"
-    "4. Use the tool 'finish' with terminal true to end. Use 'noop' only to stabilize state.\n"
-    "5. Do not emit markdown fences, comments, or any prose outside the single JSON object.\n"
-    "6. Record durable, reusable procedures with record_skill and durable caveats with memory_write.\n"
-    "7. If an observation reports an error twice for the same approach, change strategy rather than retrying.\n"
-)
-
-
-class StateTransitionEngine:
-    def __init__(self, model: ModelClient, memory: MemorySubsystem) -> None:
-        self.model = model
-        self.memory = memory
-
-    def build_prompt(self, spec: ProcedureSpec, state: ExecutionState, observation: Observation,
-                     skills: List[Skill], caveats: List[Dict[str, Any]], frame: CognitionFrame,
-                     directives: List[str], allowed_tools: Set[str], attempt: int,
-                     validation_feedback: Optional[List[str]]) -> List[Dict[str, str]]:
-        payload = {
-            "P": spec.frozen_view(),
-            "SIGMA_t": state.compact(),
-            "WM": self.memory.wm.derive(state, spec),
-            "O_t": observation.to_dict(),
-            "routed_skills": [s.prompt_view() for s in skills],
-            "knowledge_caveats": [
-                {"slug": c["slug"], "title": c["title"], "excerpt": c["body"][-2400:]} for c in caveats
-            ],
-            "cognition_frame": frame.prompt_view(),
-            "distilled_directives": directives[:4],
-            "tool_catalog": TOOLS.catalog(allowed_tools),
-            "attempt": attempt,
-            "validation_feedback": validation_feedback or [],
-        }
         return [
-            {"role": "system", "content": STEP_SYSTEM_PROMPT},
-            {"role": "user", "content": jdump(payload)},
+            {
+                "message_id": r["message_id"],
+                "role": r["role"],
+                "content": r["content"],
+                "meta": jload(r["meta"], {}),
+                "created_at": r["created_at"],
+                "seq": int(r["seq"]),
+            }
+            for r in rows
         ]
 
-    def decide(self, tenant: Tenant, spec: ProcedureSpec, state: ExecutionState, observation: Observation,
-               skills: List[Skill], caveats: List[Dict[str, Any]], frame: CognitionFrame,
-               directives: List[str], allowed_tools: Set[str]) -> Tuple[StepDecision, str, int]:
-        feedback: Optional[List[str]] = None
-        last_error = "no attempt executed"
-        total_tokens = 0
-        raw_text = ""
-        for attempt in range(1, MAX_STEP_RETRIES + 1):
-            messages = self.build_prompt(spec, state, observation, skills, caveats, frame, directives,
-                                         allowed_tools, attempt, feedback)
-            try:
-                raw_text, tokens = self.model.complete(messages)
-                total_tokens += tokens
-            except Exception as exc:
-                last_error = f"model invocation failed: {type(exc).__name__}: {exc}"
-                feedback = [last_error]
-                time.sleep(min(4.0, 0.6 * attempt))
-                continue
-            try:
-                parsed = GrammarDecoder.extract_json(raw_text)
-                delta = DeltaValidator.validate(parsed.get("state_delta", {}) or {}, allowed_tools)
-                action = DeltaValidator.validate_action(parsed.get("action", {}) or {}, allowed_tools)
-                decision = StepDecision(
-                    delta=delta,
-                    action=action,
-                    reasoning_tokens=total_tokens,
-                    raw_len=len(raw_text),
-                )
-                return decision, raw_text, total_tokens
-            except (SchemaError, ValidationRejected) as exc:
-                reasons = exc.reasons if isinstance(exc, ValidationRejected) else [str(exc)]
-                last_error = "; ".join(reasons)
-                feedback = reasons + [
-                    "Your previous output was rejected by the deterministic validator. "
-                    "Emit exactly one JSON object with keys state_delta and action. No prose."
+    def conversations(self, tenant_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        rows = self.store.query(
+            "SELECT c.conversation_id, c.title, c.created_at, c.updated_at, "
+            "(SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.conversation_id) AS message_count "
+            "FROM conversations c WHERE c.tenant_id = ? AND c.archived = 0 ORDER BY c.updated_at DESC LIMIT ?",
+            (tenant_id, int(limit)),
+        )
+        return [dict(r) for r in rows]
+
+    def rename(self, tenant_id: str, conversation_id: str, title: str) -> None:
+        self.store.execute(
+            "UPDATE conversations SET title = ?, updated_at = ? WHERE conversation_id = ? AND tenant_id = ?",
+            (title[:200], iso(), conversation_id, tenant_id),
+        )
+
+    def delete(self, tenant_id: str, conversation_id: str) -> None:
+        self.store.execute("DELETE FROM conversations WHERE conversation_id = ? AND tenant_id = ?", (conversation_id, tenant_id))
+
+
+MESSAGES = MessageRepository(STORE)
+
+
+class StateTransitionKernel:
+    def __init__(self):
+        self.model = MODEL
+        self.prompts = PROMPTS
+        self.executor = EXECUTOR
+        self.validator = VALIDATOR
+
+    def decide(
+        self,
+        tenant_id: str,
+        run_id: str,
+        spec: ProceduralSpec,
+        sigma: Dict[str, Any],
+        observation: Observation,
+        step: int,
+        skills: List[Tuple[Skill, float]],
+        cognition: Optional[Dict[str, Any]],
+        reflection: Optional[str],
+        on_delta: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
+        messages = self.prompts.build(spec, sigma, observation, step, skills, cognition, reflection)
+        student_messages = self.prompts.build(spec, sigma, observation, step, skills, cognition, None)
+        prompt_chars = sum(len(m["content"]) for m in messages)
+        attempts = 0
+        last_error: Optional[str] = None
+        while attempts < 3:
+            attempts += 1
+            result = self.model.stream(messages, on_delta=on_delta)
+            raw = result["text"]
+            usage = result["usage"]
+            parsed = DECODER.extract_json_object(raw)
+            if parsed is None:
+                last_error = "no parseable JSON object in model output"
+                messages = messages + [
+                    {"role": "assistant", "content": raw[-4000:]},
+                    {"role": "user", "content": "Your previous output was not a single parseable JSON object. Emit ONLY the JSON object required by the OUTPUT CONTRACT."},
                 ]
-        fallback_delta = {
-            "blockers": (state.blockers + [f"state transition validation failure: {last_error[:300]}"])[:12],
-            "next_intent": "Recover from schema validation failure with a minimal verifiable action.",
-        }
-        decision = StepDecision(
-            delta=fallback_delta,
-            action=ActionCommand(tool="noop", arguments={"reason": last_error[:400]},
-                                 rationale_digest="validator fallback"),
-            reasoning_tokens=total_tokens,
-            raw_len=len(raw_text),
-        )
-        return decision, raw_text, total_tokens
-
-
-TRANSITION = StateTransitionEngine(MODEL, MEMORY)
-
-
-class OrchestratorGraph:
-    def __init__(self) -> None:
-        self.edges: Dict[NodeKind, List[NodeKind]] = {
-            NodeKind.PERCEIVE: [NodeKind.DELIBERATE],
-            NodeKind.DELIBERATE: [NodeKind.ACT],
-            NodeKind.ACT: [NodeKind.VALIDATE],
-            NodeKind.VALIDATE: [NodeKind.PERCEIVE, NodeKind.REFLECT],
-            NodeKind.REFLECT: [NodeKind.CONSOLIDATE],
-            NodeKind.CONSOLIDATE: [NodeKind.TERMINAL],
-            NodeKind.TERMINAL: [],
-        }
-
-    def can_transition(self, src: NodeKind, dst: NodeKind) -> bool:
-        return dst in self.edges.get(src, [])
-
-    def describe(self) -> Dict[str, List[str]]:
-        return {k.value: [v.value for v in vs] for k, vs in self.edges.items()}
-
-
-GRAPH = OrchestratorGraph()
-
-
-class AgentWorker(threading.Thread):
-    def __init__(self, run_id: str, owner: str, supervisor: "Supervisor") -> None:
-        super().__init__(name=f"agent-{run_id}", daemon=True)
-        self.run_id = run_id
-        self.owner = owner
-        self.supervisor = supervisor
-        self.stop_event = threading.Event()
-        self.pause_event = threading.Event()
-        self._frame: Optional[CognitionFrame] = None
-        self._frame_lock = threading.RLock()
-        self._system2: Optional[threading.Thread] = None
-        self._distill_records: List[Dict[str, Any]] = []
-        self._skill_attribution: Dict[int, str] = {}
-
-    def request_stop(self) -> None:
-        self.stop_event.set()
-
-    def emit(self, kind: str, payload: Dict[str, Any]) -> None:
-        message = {"type": kind, "run_id": self.run_id, "ts": iso(), **payload}
-        BUS.publish_threadsafe(f"run:{self.run_id}", message)
-        BUS.publish_threadsafe("*", message)
-
-    def run(self) -> None:
-        try:
-            self._execute()
-        except Exception as exc:
-            LOG.exception("worker crashed for run %s", self.run_id)
-            RUNS.persist(self.run_id, status=RunState.FAILED, error=f"worker crash: {type(exc).__name__}: {exc}")
-            self.emit("error", {"error": f"{type(exc).__name__}: {exc}", "trace": traceback.format_exc()[-4000:]})
-        finally:
-            self.stop_event.set()
-            if self._system2 is not None:
-                with contextlib.suppress(Exception):
-                    self._system2.join(timeout=3.0)
-            RUNS.release_lease(self.run_id, self.owner)
-            self.supervisor.forget(self.run_id)
-            self.emit("worker_exit", {})
-
-    def _load(self) -> Tuple[RunRecord, ProcedureSpec, Tenant]:
-        record = RUNS.get(self.run_id)
-        if record is None:
-            raise RuntimeError(f"run {self.run_id} not found")
-        spec = SPECS.get(record.spec_id)
-        if spec is None:
-            raise RuntimeError(f"spec {record.spec_id} not found")
-        tenant = TENANTS.by_id(record.tenant_id)
-        if tenant is None:
-            raise RuntimeError(f"tenant {record.tenant_id} not found")
-        return record, spec, tenant
-
-    def _system2_loop(self, spec: ProcedureSpec, run_id: str) -> None:
-        period = 1.0 / max(0.05, SYSTEM2_HZ)
-        while not self.stop_event.is_set():
-            started = time.time()
-            try:
-                record = RUNS.get(run_id)
-                if record is None:
-                    return
-                observation = Observation(
-                    step=record.step,
-                    source=str(record.last_observation.get("source", "bootstrap")),
-                    ok=bool(record.last_observation.get("ok", True)),
-                    payload=record.last_observation.get("payload", {}) or {},
-                    error=record.last_observation.get("error"),
-                )
-                signature = PolicyPriorStore.signature(spec, record.state)
-                directives = PRIORS.active_directives(record.tenant_id, signature) or \
-                    PRIORS.global_directives(record.tenant_id)
-                frame = DELIBERATOR.build_frame(run_id, spec, record.state, observation, directives)
-                with self._frame_lock:
-                    self._frame = frame
-                self.emit("cognition", {"frame": frame.prompt_view()})
-            except Exception as exc:
-                LOG.warning("system2 loop error on %s: %s", run_id, exc)
-            elapsed = time.time() - started
-            self.stop_event.wait(max(0.0, period - elapsed))
-
-    def _current_frame(self, spec: ProcedureSpec, record: RunRecord, observation: Observation) -> CognitionFrame:
-        with self._frame_lock:
-            frame = self._frame
-        if frame is None or frame.staleness() > 30.0:
-            signature = PolicyPriorStore.signature(spec, record.state)
-            directives = PRIORS.active_directives(record.tenant_id, signature) or \
-                PRIORS.global_directives(record.tenant_id)
-            frame = DELIBERATOR.build_frame(self.run_id, spec, record.state, observation, directives)
-            with self._frame_lock:
-                self._frame = frame
-        return frame
-
-    def _execute(self) -> None:
-        record, spec, tenant = self._load()
-        sandbox = FileSystemSandbox(WORKSPACE_ROOT / tenant.tenant_id / self.run_id)
-        allowed_tools = set(spec.allowed_tools) | {"finish", "noop"}
-        checkpoint = CHECKPOINTS.latest(self.run_id)
-        if checkpoint:
-            record.state = ExecutionState.from_dict(checkpoint["state"])
-            record.step = int(checkpoint["step"])
-            self.emit("resumed", {"from_step": record.step, "checkpoint_id": checkpoint["checkpoint_id"]})
-        RUNS.persist(self.run_id, status=RunState.RUNNING, node=NodeKind.PERCEIVE, state=record.state,
-                     step=record.step, error="")
-        LEDGER.append(tenant.tenant_id, "run_started", {"run_id": self.run_id, "step": record.step}, self.run_id)
-        self.emit("status", {"status": RunState.RUNNING.value, "step": record.step})
-
-        self._system2 = threading.Thread(target=self._system2_loop, args=(spec, self.run_id),
-                                        name=f"system2-{self.run_id}", daemon=True)
-        self._system2.start()
-
-        observation = Observation(
-            step=record.step,
-            source=str(record.last_observation.get("source", "bootstrap")) or "bootstrap",
-            ok=bool(record.last_observation.get("ok", True)),
-            payload=record.last_observation.get("payload", {}) or {"note": "runtime initialized"},
-            error=record.last_observation.get("error"),
-        )
-        period = 1.0 / max(1.0, SYSTEM1_HZ)
-        terminal_answer = ""
-        terminated = False
-        failure_reason = ""
-
-        while not self.stop_event.is_set():
-            loop_started = time.time()
-            live = RUNS.get(self.run_id)
-            if live is None:
-                failure_reason = "run record vanished"
-                break
-            if live.status == RunState.CANCELLED:
-                self.emit("status", {"status": RunState.CANCELLED.value, "step": record.step})
-                LEDGER.append(tenant.tenant_id, "run_cancelled", {"step": record.step}, self.run_id)
-                return
-            if live.status == RunState.PAUSED:
-                self.emit("status", {"status": RunState.PAUSED.value, "step": record.step})
-                self.stop_event.wait(1.0)
                 continue
-            if record.step >= spec.max_steps:
-                failure_reason = f"step budget exhausted at {record.step}/{spec.max_steps}"
-                break
-            if record.tokens_used >= spec.token_budget:
-                failure_reason = f"token budget exhausted ({record.tokens_used}/{spec.token_budget})"
-                break
-
-            RUNS.renew_lease(self.run_id, self.owner)
-            step = record.step + 1
-            pre_state = record.state
-            pre_digest = stable_hash(pre_state.to_dict())
-
-            RUNS.persist(self.run_id, node=NodeKind.DELIBERATE)
-            frame = self._current_frame(spec, record, observation)
-            skills = MEMORY.route_skills(tenant.tenant_id, pre_state, spec, limit=2)
-            caveats = MEMORY.route_caveats(tenant.tenant_id, pre_state, spec, limit=2)
-            signature = PolicyPriorStore.signature(spec, pre_state)
-            directives = PRIORS.active_directives(tenant.tenant_id, signature) or \
-                PRIORS.global_directives(tenant.tenant_id)
-
-            self.emit("step_begin", {
-                "step": step,
-                "phase": pre_state.phase,
-                "routed_skills": [s.name for s in skills],
-                "caveats": [c["slug"] for c in caveats],
-                "gates": {k: round(v, 3) for k, v in frame.gates.items()},
-                "staleness_s": round(frame.staleness(), 3),
-            })
-
             try:
-                decision, raw_text, tokens = TRANSITION.decide(
-                    tenant, spec, pre_state, observation, skills, caveats, frame, directives, allowed_tools
-                )
-            except Exception as exc:
-                failure_reason = f"transition engine failure: {type(exc).__name__}: {exc}"
-                break
-
-            try:
-                TENANTS.charge(tenant.tenant_id, tokens)
-            except BudgetExceeded as exc:
-                failure_reason = str(exc)
-                break
-
-            record.tokens_used += tokens
-            self._distill_records.append({
-                "step": step,
-                "signature": signature,
-                "student_prompt": jdump({"P": spec.frozen_view(), "SIGMA": pre_state.compact(1500)}),
-                "student_completion": raw_text[:20000],
-            })
-            if len(self._distill_records) > 256:
-                self._distill_records = self._distill_records[-256:]
-
-            try:
-                next_state = DeltaValidator.merge(pre_state, decision.delta)
-            except Exception as exc:
-                self.emit("validation_rollback", {"step": step, "reason": f"merge failure: {exc}"})
-                next_state = pre_state
-
-            action = decision.action
-            RUNS.persist(self.run_id, node=NodeKind.ACT)
-            self.emit("action", {"step": step, "tool": action.tool,
-                                 "arguments": _safe_args(action.arguments),
-                                 "rationale": action.rationale_digest,
-                                 "terminal": action.terminal})
-
-            ctx = ToolContext(tenant=tenant, spec=spec, run_id=self.run_id, step=step, sandbox=sandbox,
-                              memory=MEMORY, state=next_state)
-            if action.terminal or action.tool == "finish":
-                terminal_answer = action.final_answer or str(action.arguments.get("final_answer", ""))
-                observation = Observation(step=step, source="finish", ok=True,
-                                          payload={"final_answer": terminal_answer[:4000], "terminal": True})
-                terminated = True
-            else:
-                observation = TOOLS.execute(ctx, action)
-
-            selected_skill = skills[0].skill_id if skills else None
-            if selected_skill:
-                self._skill_attribution[step] = selected_skill
-                MEMORY.em.record_outcome(selected_skill, bool(observation.ok))
-
-            RUNS.persist(self.run_id, node=NodeKind.VALIDATE)
-            trace = ExecutionTrace(
-                trace_id=new_id("trc"),
-                run_id=self.run_id,
-                step=step,
-                pre_state_digest=pre_digest,
-                selected_skill=selected_skill,
-                tool=action.tool,
-                outcome="ok" if observation.ok else "error",
-                delta_digest=stable_hash(decision.delta),
-                post_state_digest=stable_hash(next_state.to_dict()),
-                receipt={
-                    "arguments": _safe_args(action.arguments),
-                    "payload": _clip_payload(observation.payload),
-                    "error": observation.error,
-                    "latency_ms": observation.latency_ms,
-                    "tokens": tokens,
-                    "rationale_digest": action.rationale_digest,
-                },
-            )
-            MEMORY.record_trace(trace)
-            LEDGER.append(tenant.tenant_id, "step_receipt", {
-                "step": step, "tool": action.tool, "ok": observation.ok,
-                "delta_digest": trace.delta_digest, "post_digest": trace.post_state_digest,
-            }, self.run_id)
-
-            if not observation.ok and observation.error:
-                blockers = list(next_state.blockers)
-                marker = f"step {step} {action.tool}: {observation.error[:220]}"
-                if marker not in blockers:
-                    blockers.append(marker)
-                next_state.blockers = blockers[-12:]
-
-            record.state = next_state
-            record.step = step
-            RUNS.persist(self.run_id, step=step, state=next_state, observation=observation,
-                         tokens_used=record.tokens_used, node=NodeKind.PERCEIVE)
-            if step % max(1, CHECKPOINT_EVERY) == 0:
-                CHECKPOINTS.save(self.run_id, step, NodeKind.PERCEIVE, next_state, observation,
-                                 RunState.RUNNING, record.tokens_used)
-
-            self.emit("step_end", {
-                "step": step,
-                "tool": action.tool,
-                "ok": observation.ok,
-                "error": observation.error,
-                "delta_keys": sorted(decision.delta.keys()),
-                "state": next_state.compact(3000),
-                "tokens_used": record.tokens_used,
-                "observation": _clip_payload(observation.payload),
-            })
-
-            if terminated:
-                break
-
-            elapsed = time.time() - loop_started
-            if elapsed < period:
-                self.stop_event.wait(period - elapsed)
-
-        if self.stop_event.is_set() and not terminated and not failure_reason:
-            RUNS.persist(self.run_id, status=RunState.PAUSED, state=record.state)
-            self.emit("status", {"status": RunState.PAUSED.value, "step": record.step})
-            return
-
-        RUNS.persist(self.run_id, node=NodeKind.REFLECT)
-        verdict = Verifier.verify(spec, record.state, sandbox, terminal_answer)
-        if failure_reason and verdict["passed"]:
-            verdict["passed"] = False
-            verdict["checks"].append({"criterion": "runtime_budget", "passed": False, "detail": failure_reason})
-        self.emit("verification", {"verdict": verdict, "reason": failure_reason})
-
-        traces = MEMORY.run_traces(self.run_id)
-        patch = REFLECTOR.build_patch(tenant, spec, self.run_id, verdict, record.state, traces)
-        self.emit("reflection", {"patch": patch.to_dict()})
-
-        distill = DISTILLER.distill(tenant.tenant_id, self.run_id, patch, self._distill_records)
-        self.emit("distillation", distill)
-
-        RUNS.persist(self.run_id, node=NodeKind.CONSOLIDATE)
-        consolidation = META.consolidate(tenant, spec, self.run_id, patch, record.state, traces)
-        self.emit("consolidation", consolidation)
-
-        final_status = RunState.SUCCEEDED if verdict["passed"] else RunState.FAILED
-        answer = terminal_answer or self._synthesize_answer(spec, record.state, verdict, patch)
-        RUNS.persist(self.run_id, status=final_status, node=NodeKind.TERMINAL, final_answer=answer,
-                     error=failure_reason, state=record.state)
-        CHECKPOINTS.save(self.run_id, record.step, NodeKind.TERMINAL, record.state,
-                         Observation(step=record.step, source="terminal", ok=verdict["passed"],
-                                     payload={"final_answer": answer[:4000]}),
-                         final_status, record.tokens_used)
-        CHECKPOINTS.prune(self.run_id)
-        LEDGER.append(tenant.tenant_id, "run_finished", {
-            "status": final_status.value, "steps": record.step, "tokens": record.tokens_used,
-            "verdict": verdict["passed"],
-        }, self.run_id)
-
-        live = RUNS.get(self.run_id)
-        if live and live.conversation_id:
-            CONVERSATIONS.add_message(
-                tenant.tenant_id, live.conversation_id, "assistant", answer,
-                {"run_id": self.run_id, "status": final_status.value, "steps": record.step,
-                 "tokens": record.tokens_used, "verified": verdict["passed"]},
-            )
-        self.emit("final", {"status": final_status.value, "final_answer": answer, "steps": record.step,
-                            "tokens_used": record.tokens_used, "verified": verdict["passed"]})
-
-    def _synthesize_answer(self, spec: ProcedureSpec, state: ExecutionState, verdict: Dict[str, Any],
-                           patch: ReflectionPatch) -> str:
-        lines: List[str] = []
-        lines.append(f"Objective: {spec.objective[:600]}")
-        lines.append(f"Terminal phase: {state.phase} (progress {round(state.progress * 100)}%)")
-        done = [g for g in state.subgoals if isinstance(g, dict) and g.get("done")]
-        pending = [g for g in state.subgoals if isinstance(g, dict) and not g.get("done")]
-        if done:
-            lines.append("Completed subgoals: " + "; ".join(str(g.get("goal", ""))[:160] for g in done[:8]))
-        if pending:
-            lines.append("Outstanding subgoals: " + "; ".join(str(g.get("goal", ""))[:160] for g in pending[:8]))
-        if state.artifacts:
-            lines.append("Artifacts: " + ", ".join(sorted(state.artifacts.keys())[:12]))
-        failed = [c["criterion"] for c in verdict.get("checks", []) if not c.get("passed")]
-        if failed:
-            lines.append("Unsatisfied criteria: " + "; ".join(str(f)[:160] for f in failed[:6]))
-        if state.blockers:
-            lines.append("Blockers: " + "; ".join(b[:160] for b in state.blockers[:5]))
-        lines.append(f"Diagnosis: {patch.root_cause[:600]}")
-        if patch.guidance:
-            lines.append(f"Next-run guidance: {patch.guidance[:600]}")
-        return "\n".join(lines)
+                patch = self.validator.validate_patch(parsed.get("state_patch"))
+            except ValidationError as exc:
+                last_error = f"state_patch rejected: {exc}"
+                messages = messages + [
+                    {"role": "assistant", "content": raw[-4000:]},
+                    {"role": "user", "content": f"Your state_patch was rejected by the deterministic validator: {exc}. Re-emit a corrected single JSON object."},
+                ]
+                continue
+            action = parsed.get("action")
+            if not isinstance(action, dict) or not action.get("tool"):
+                last_error = "action.tool missing"
+                messages = messages + [
+                    {"role": "assistant", "content": raw[-4000:]},
+                    {"role": "user", "content": "Your output lacked action.tool. Re-emit the full JSON object with a valid action.tool from the TOOL SURFACE."},
+                ]
+                continue
+            tool = str(action.get("tool")).strip()
+            arguments = action.get("arguments")
+            if not isinstance(arguments, dict):
+                arguments = {}
+            if tool not in TOOLS.names():
+                candidates = [n for n in TOOLS.names() if n.endswith("." + tool) or n.split(".")[-1] == tool]
+                if len(candidates) == 1:
+                    tool = candidates[0]
+                else:
+                    last_error = f"unknown tool '{tool}'"
+                    messages = messages + [
+                        {"role": "assistant", "content": raw[-4000:]},
+                        {"role": "user", "content": f"Tool '{tool}' does not exist. Choose exactly one tool from the TOOL SURFACE and re-emit the JSON object."},
+                    ]
+                    continue
+            reasoning = str(parsed.get("reasoning") or "")[:8000]
+            return {
+                "ok": True,
+                "attempts": attempts,
+                "raw": raw,
+                "reasoning": reasoning,
+                "state_patch": patch,
+                "tool": tool,
+                "arguments": arguments,
+                "rationale": str(action.get("rationale") or "")[:1000],
+                "usage": usage,
+                "prompt_chars": prompt_chars,
+                "teacher_prompt": "\n".join(m["content"] for m in messages),
+                "student_prompt": "\n".join(m["content"] for m in student_messages),
+            }
+        return {
+            "ok": False,
+            "attempts": attempts,
+            "error": last_error or "decision failed",
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "prompt_chars": prompt_chars,
+            "teacher_prompt": "\n".join(m["content"] for m in messages),
+            "student_prompt": "\n".join(m["content"] for m in student_messages),
+        }
 
 
-def _safe_args(args: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for key, value in (args or {}).items():
-        text = value if isinstance(value, str) else jdump(value)
-        if len(text) > 2000:
-            text = text[:2000] + "...[clipped]"
-        out[key] = OutputClassifier.redact(text) if isinstance(value, str) else text
-    return out
+KERNEL = StateTransitionKernel()
 
 
-def _clip_payload(payload: Dict[str, Any], limit: int = 6000) -> Dict[str, Any]:
-    blob = jdump(payload or {})
-    if len(blob) <= limit:
-        return payload or {}
-    out: Dict[str, Any] = {}
-    used = 0
-    for key in sorted((payload or {}).keys()):
-        chunk = jdump({key: payload[key]})
-        if used + len(chunk) > limit:
-            out["__clipped__"] = True
-            break
-        out[key] = payload[key]
-        used += len(chunk)
-    return out
-
-
-class Supervisor:
-    def __init__(self) -> None
-        self.owner = f"{os.getpid()}-{secrets.token_hex(4)}"
-        self._workers: Dict[str, AgentWorker] = {}
+class AgentOrchestrator:
+    def __init__(self):
+        self.handles: Dict[str, RunHandle] = {}
         self._lock = threading.RLock()
-        self._reaper: Optional[threading.Thread] = None
+        self.executor = EXECUTOR
+        self.owner = f"{os.environ.get('HOSTNAME', 'local')}:{os.getpid()}"
         self._shutdown = threading.Event()
 
-    def start_background(self) -> None:
-        if self._reaper is None or not self._reaper.is_alive():
-            self._reaper = threading.Thread(target=self._reap_loop, name="supervisor-reaper", daemon=True)
-            self._reaper.start()
-
-    def shutdown(self) -> None:
-        self._shutdown.set()
+    def _handle(self, run_id: str) -> Optional[RunHandle]:
         with self._lock:
-            workers = list(self._workers.values())
-        for worker in workers:
-            worker.request_stop()
-        for worker in workers:
-            with contextlib.suppress(Exception):
-                worker.join(timeout=5.0)
+            return self.handles.get(run_id)
 
-    def _reap_loop(self) -> None:
-        while not self._shutdown.is_set():
-            try:
-                self.recover_orphans()
-                with self._lock:
-                    dead = [rid for rid, w in self._workers.items() if not w.is_alive()]
-                    for rid in dead:
-                        self._workers.pop(rid, None)
-            except Exception as exc:
-                LOG.warning("supervisor reaper error: %s", exc)
-            self._shutdown.wait(10.0)
-
-    def recover_orphans(self) -> List[str]:
-        recovered: List[str] = []
-        for record in RUNS.resumable():
-            with self._lock:
-                if record.run_id in self._workers:
-                    continue
-            if RUNS.acquire_lease(record.run_id, self.owner):
-                RUNS.persist(record.run_id, status=RunState.RECOVERING)
-                LOG.info("recovering orphaned run %s from step %s", record.run_id, record.step)
-                self._spawn(record.run_id)
-                recovered.append(record.run_id)
-        return recovered
-
-    def _spawn(self, run_id: str) -> AgentWorker:
-        worker = AgentWorker(run_id, self.owner, self)
+    def active_runs(self) -> List[Dict[str, Any]]:
         with self._lock:
-            self._workers[run_id] = worker
-        worker.start()
-        return worker
+            return [
+                {
+                    "run_id": h.run_id,
+                    "tenant_id": h.tenant_id,
+                    "status": h.status,
+                    "step": h.step,
+                    "paused": h.pause_event.is_set(),
+                    "uptime_s": round(time.time() - h.started_at, 2),
+                }
+                for h in self.handles.values()
+            ]
 
-    def launch(self, run_id: str) -> bool:
-        with self._lock:
-            existing = self._workers.get(run_id)
-            if existing is not None and existing.is_alive():
-                return False
+    def start(self, tenant_id: str, conversation_id: Optional[str], spec: ProceduralSpec, resume_run_id: Optional[str] = None) -> str:
+        if resume_run_id:
+            row = RUNS.get(resume_run_id, tenant_id)
+            if row is None:
+                raise ValidationError(f"run {resume_run_id} not found")
+            run_id = resume_run_id
+            RUNS.increment_resume(run_id)
+            spec = ProceduralSpec.from_dict(jload(row["spec"], {}) or {})
+            conversation_id = conversation_id or row["conversation_id"]
+        else:
+            run_id = RUNS.create(tenant_id, conversation_id, spec)
         if not RUNS.acquire_lease(run_id, self.owner):
-            return False
-        self._spawn(run_id)
-        return True
+            raise ValidationError(f"run {run_id} is leased by another worker")
+        handle = RunHandle(
+            run_id=run_id,
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            spec=spec,
+            status=RunStatus.RUNNING.value,
+            step=int(RUNS.get(run_id)["step"] or 0),
+        )
+        with self._lock:
+            existing = self.handles.get(run_id)
+            if existing and existing.thread and existing.thread.is_alive():
+                return run_id
+            self.handles[run_id] = handle
+        thread = threading.Thread(target=self._loop, args=(handle,), name=f"agent-{run_id}", daemon=True)
+        handle.thread = thread
+        RUNS.set_status(run_id, RunStatus.RUNNING.value)
+        emit_event("run_started", run_id, tenant_id, {"objective": spec.objective, "spec": spec.to_dict(), "resumed": bool(resume_run_id)}, conversation_id)
+        thread.start()
+        return run_id
 
     def pause(self, run_id: str) -> bool:
-        record = RUNS.get(run_id)
-        if record is None or record.status not in (RunState.RUNNING, RunState.PENDING, RunState.RECOVERING):
+        h = self._handle(run_id)
+        if h is None:
             return False
-        RUNS.persist(run_id, status=RunState.PAUSED)
+        h.pause_event.set()
+        h.status = RunStatus.PAUSED.value
+        RUNS.set_status(run_id, RunStatus.PAUSED.value)
+        emit_event("run_paused", run_id, h.tenant_id, {}, h.conversation_id)
         return True
 
-    def resume(self, run_id: str) -> bool:
-        record = RUNS.get(run_id)
-        if record is None:
+    def resume_paused(self, run_id: str) -> bool:
+        h = self._handle(run_id)
+        if h is None:
             return False
-        if record.status in (RunState.SUCCEEDED, RunState.FAILED):
-            return False
-        RUNS.persist(run_id, status=RunState.RUNNING)
-        with self._lock:
-            worker = self._workers.get(run_id)
-        if worker is not None and worker.is_alive():
-            return True
-        return self.launch(run_id)
+        h.pause_event.clear()
+        h.status = RunStatus.RUNNING.value
+        RUNS.set_status(run_id, RunStatus.RUNNING.value)
+        emit_event("run_resumed", run_id, h.tenant_id, {}, h.conversation_id)
+        return True
 
     def cancel(self, run_id: str) -> bool:
-        record = RUNS.get(run_id)
-        if record is None:
-            return False
-        RUNS.request_cancel(run_id)
-        with self._lock:
-            worker = self._workers.get(run_id)
-        if worker is not None:
-            worker.request_stop()
+        h = self._handle(run_id)
+        if h is None:
+            RUNS.set_status(run_id, RunStatus.CANCELLED.value)
+            return True
+        h.status = RunStatus.CANCELLED.value
+        h.stop_event.set()
+        h.pause_event.clear()
         return True
 
-    def forget(self, run_id: str) -> None:
+    def shutdown(self, timeout: float = 12.0) -> None:
+        self._shutdown.set()
         with self._lock:
-            self._workers.pop(run_id, None)
+            handles = list(self.handles.values())
+        for h in handles:
+            h.stop_event.set()
+        deadline = time.time() + timeout
+        for h in handles:
+            if h.thread is not None:
+                remaining = max(0.1, deadline - time.time())
+                h.thread.join(remaining)
 
-    def active(self) -> List[str]:
+    def recover(self) -> int:
+        rows = RUNS.resumable()
+        recovered = 0
+        for row in rows:
+            run_id = row["run_id"]
+            tenant_id = row["tenant_id"]
+            spec = ProceduralSpec.from_dict(jload(row["spec"], {}) or {})
+            if self._handle(run_id) is not None:
+                continue
+            try:
+                TENANTS.get(tenant_id)
+            except SecurityError:
+                RUNS.set_status(run_id, RunStatus.ERROR.value, "tenant unavailable during recovery")
+                continue
+            try:
+                self.start(tenant_id, row["conversation_id"], spec, resume_run_id=run_id)
+                recovered += 1
+                log.info("recovered run %s at step %s", run_id, row["step"])
+            except Exception as exc:
+                log.warning("recovery failed for %s: %s", run_id, exc)
+        return recovered
+
+    def _load_state(self, handle: RunHandle) -> Tuple[Dict[str, Any], Observation, int]:
+        ckpt = CHECKPOINTS.latest(handle.run_id)
+        if ckpt is None:
+            sigma = empty_sigma()
+            sigma["phase"] = "bootstrap"
+            sigma["open_goals"] = list(handle.spec.success_criteria) or [handle.spec.objective]
+            sigma["constraints"] = list(handle.spec.constraints)
+            sigma["plan"] = ["analyze objective", "decompose into verifiable subgoals", "execute", "verify each success criterion", "finish"]
+            obs = Observation.initial(0, f"Run initialized. Objective: {handle.spec.objective[:1200]}")
+            CHECKPOINTS.save(handle.tenant_id, handle.run_id, 0, GraphNode.OBSERVE.value, sigma, obs, {})
+            return sigma, obs, 0
+        if not ckpt.get("integrity_ok"):
+            log.warning("checkpoint integrity mismatch for run %s at step %s", handle.run_id, ckpt["step"])
+            emit_event("checkpoint_integrity_warning", handle.run_id, handle.tenant_id, {"step": ckpt["step"]}, handle.conversation_id)
+        sigma = ckpt["sigma"] or empty_sigma()
+        obs_d = ckpt["observation"] or {}
+        obs = Observation(
+            step=int(obs_d.get("step") or ckpt["step"]),
+            source=str(obs_d.get("source") or "checkpoint"),
+            tool=obs_d.get("tool"),
+            ok=bool(obs_d.get("ok", True)),
+            summary=str(obs_d.get("summary") or f"resumed from checkpoint at step {ckpt['step']}"),
+            data=obs_d.get("data") or {},
+            error=obs_d.get("error"),
+            latency_ms=int(obs_d.get("latency_ms") or 0),
+            created_at=str(obs_d.get("created_at") or iso()),
+        )
+        return sigma, obs, int(ckpt["step"])
+
+    def _reflection_hint(self, tenant_id: str, spec: ProceduralSpec) -> Optional[str]:
+        rows = STORE.query(
+            "SELECT patch_text FROM reflection_patches WHERE tenant_id = ? AND verdict IN ('failure','partial') ORDER BY created_at DESC LIMIT 3",
+            (tenant_id,),
+        )
+        if not rows:
+            return None
+        texts = [r["patch_text"] for r in rows if r["patch_text"]]
+        if not texts:
+            return None
+        return "\n".join(texts)[:3500]
+
+    def _loop(self, handle: RunHandle) -> None:
+        run_id = handle.run_id
+        tenant_id = handle.tenant_id
+        spec = handle.spec
+        started_wall = time.time()
+        sigma, observation, step = self._load_state(handle)
+        WM.sync_from_sigma(tenant_id, run_id, sigma)
+        reflection_hint = self._reflection_hint(tenant_id, spec)
+        terminal: Dict[str, Any] = {}
+        last_deliberation = 0.0
+        cognition_state: Optional[Dict[str, Any]] = COGNITION.latest(run_id)
+        min_interval = 1.0 / max(0.5, SYSTEM1_HZ)
+        deliberate_interval = 1.0 / max(0.05, SYSTEM2_HZ)
+        consecutive_failures = 0
+        try:
+            while not handle.stop_event.is_set() and not self._shutdown.is_set():
+                if handle.pause_event.is_set():
+                    time.sleep(0.4)
+                    RUNS.renew_lease(run_id, self.owner)
+                    continue
+                if step >= spec.max_steps:
+                    terminal = {"status": "failed", "reason": f"step budget exhausted at {step} steps"}
+                    break
+                if time.time() - started_wall > DEFAULT_WALL_BUDGET_S:
+                    terminal = {"status": "failed", "reason": "wall clock budget exhausted"}
+                    break
+                cycle_started = time.time()
+                step += 1
+                handle.step = step
+                RUNS.renew_lease(run_id, self.owner)
+
+                if (time.time() - last_deliberation) >= deliberate_interval or cognition_state is None:
+                    try:
+                        COGNITION.deliberate(tenant_id, run_id, step, spec, sigma)
+                        cognition_state = COGNITION.latest(run_id)
+                        last_deliberation = time.time()
+                        emit_event(
+                            "cognition",
+                            run_id,
+                            tenant_id,
+                            {"step": step, "gate": cognition_state.get("gate") if cognition_state else None, "subgoal": cognition_state.get("subgoal") if cognition_state else ""},
+                            handle.conversation_id,
+                        )
+                    except Exception as exc:
+                        log.warning("deliberation failed: %s", exc)
+
+                routing_query = WM.routing_query(spec, sigma, observation)
+                try:
+                    skills = EM.search(tenant_id, routing_query, 2)
+                except Exception as exc:
+                    log.warning("skill routing failed: %s", exc)
+                    skills = []
+                if skills:
+                    emit_event("skills_routed", run_id, tenant_id, {"step": step, "skills": [{"name": s.name, "score": round(sc, 5)} for s, sc in skills]}, handle.conversation_id)
+
+                CHECKPOINTS.save(tenant_id, run_id, step, GraphNode.DECIDE.value, sigma, observation, {"routing_query": routing_query[:2000]})
+
+                emit_event("step_begin", run_id, tenant_id, {"step": step, "phase": sigma.get("phase"), "subgoal": sigma.get("current_subgoal")}, handle.conversation_id)
+
+                stream_buffer: List[str] = []
+
+                def on_delta(chunk: str) -> None:
+                    stream_buffer.append(chunk)
+                    if len(stream_buffer) % 6 == 0:
+                        emit_event("model_delta", run_id, tenant_id, {"step": step, "delta": "".join(stream_buffer[-6:])}, handle.conversation_id)
+
+                decision = KERNEL.decide(
+                    tenant_id,
+                    run_id,
+                    spec,
+                    sigma,
+                    observation,
+                    step,
+                    skills,
+                    cognition_state,
+                    reflection_hint,
+                    on_delta,
+                )
+                usage = decision.get("usage") or {"total_tokens": 0}
+                try:
+                    TENANTS.charge_tokens(tenant_id, int(usage.get("total_tokens") or 0))
+                except BudgetExceeded as exc:
+                    terminal = {"status": "failed", "reason": str(exc)}
+                    break
+                RUNS.bump(run_id, step, int(usage.get("total_tokens") or 0), int((time.time() - started_wall) * 1000))
+
+                if not decision.get("ok"):
+                    consecutive_failures += 1
+                    err = str(decision.get("error") or "decision failure")
+                    sigma = VALIDATOR.apply(sigma, {"errors": [f"step{step}:decode:{err[:200]}"]})
+                    observation = Observation(
+                        step=step,
+                        source="runtime",
+                        tool=None,
+                        ok=False,
+                        summary=f"decision layer failed at step {step}: {err[:400]}. Re-emit a valid JSON object.",
+                        data={},
+                        error=err[:1000],
+                        latency_ms=int((time.time() - cycle_started) * 1000),
+                        created_at=iso(),
+                    )
+                    TRACES.append(tenant_id, run_id, step, "decision_failure", {"phase": sigma.get("phase")}, {"tool": None}, {"error": err}, {}, False, observation.latency_ms)
+                    CHECKPOINTS.save(tenant_id, run_id, step, GraphNode.VALIDATE.value, sigma, observation, {})
+                    emit_event("step_error", run_id, tenant_id, {"step": step, "error": err[:800]}, handle.conversation_id)
+                    if consecutive_failures >= 8:
+                        terminal = {"status": "failed", "reason": f"decision layer failed {consecutive_failures} consecutive times: {err[:400]}"}
+                        break
+                    time.sleep(min(8.0, 0.6 * consecutive_failures))
+                    continue
+
+                pre_sigma = json.loads(jdump(sigma))
+                patch = decision["state_patch"]
+                try:
+                    candidate_sigma = VALIDATOR.apply(sigma, patch)
+                except Exception as exc:
+                    log.warning("state merge failed, rolling back: %s", exc)
+                    candidate_sigma = pre_sigma
+                    patch = {}
+                    emit_event("state_rollback", run_id, tenant_id, {"step": step, "error": str(exc)[:400]}, handle.conversation_id)
+
+                tool = decision["tool"]
+                arguments = decision["arguments"]
+                emit_event(
+                    "action_selected",
+                    run_id,
+                    tenant_id,
+                    {"step": step, "tool": tool, "rationale": decision.get("rationale", ""), "arguments": ToolExecutor._prune(arguments, 3000)},
+                    handle.conversation_id,
+                )
+
+                ctx = {"tenant_id": tenant_id, "run_id": run_id, "step": step, "conversation_id": handle.conversation_id}
+                obs_next, receipt = self.executor.execute(ctx, spec, tool, arguments)
+
+                skill_id = skills[0][0].skill_id if skills else None
+                if skill_id:
+                    try:
+                        EM.record_outcome(skill_id, obs_next.ok)
+                    except Exception as exc:
+                        log.debug("skill outcome record failed: %s", exc)
+
+                TRACES.append(
+                    tenant_id,
+                    run_id,
+                    step,
+                    "step",
+                    {"phase": pre_sigma.get("phase"), "current_subgoal": pre_sigma.get("current_subgoal"), "open_goals": pre_sigma.get("open_goals", [])[:8]},
+                    {"tool": tool, "arguments": ToolExecutor._prune(arguments, 4000), "rationale": decision.get("rationale", "")},
+                    {"ok": obs_next.ok, "summary": obs_next.summary[:3000], "error": obs_next.error, "latency_ms": obs_next.latency_ms},
+                    patch,
+                    obs_next.ok,
+                    obs_next.latency_ms,
+                    skill_id,
+                    receipt,
+                )
+
+                sigma = candidate_sigma
+                if obs_next.ok:
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                    sigma = VALIDATOR.apply(sigma, {"errors": [f"step{step}:{tool}:{(obs_next.error or 'failed')[:180]}"]})
+                    reflection_hint = self._reflection_hint(tenant_id, spec)
+
+                WM.sync_from_sigma(tenant_id, run_id, sigma)
+                CHECKPOINTS.save(tenant_id, run_id, step, GraphNode.COMMIT.value, sigma, obs_next, {})
+                CHECKPOINTS.prune(run_id)
+
+                try:
+                    advantage = 1.0 if obs_next.ok else -1.0
+                    DISTILLER.record(
+                        tenant_id,
+                        run_id,
+                        step,
+                        decision.get("student_prompt", "")[-20000:],
+                        decision.get("teacher_prompt", "")[-20000:],
+                        jdump({"reasoning": decision.get("reasoning", "")[:2000], "state_patch": patch, "action": {"tool": tool, "arguments": arguments}}),
+                        advantage,
+                    )
+                except Exception as exc:
+                    log.debug("distill record failed: %s", exc)
+
+                emit_event(
+                    "step_complete",
+                    run_id,
+                    tenant_id,
+                    {
+                        "step": step,
+                        "tool": tool,
+                        "ok": obs_next.ok,
+                        "summary": obs_next.summary[:2500],
+                        "error": obs_next.error,
+                        "state": {
+                            "phase": sigma.get("phase"),
+                            "current_subgoal": sigma.get("current_subgoal"),
+                            "progress": (sigma.get("progress") or [])[-6:],
+                            "open_goals": (sigma.get("open_goals") or [])[:6],
+                            "verification": sigma.get("verification") or {},
+                            "errors": (sigma.get("errors") or [])[-4:],
+                        },
+                        "tokens": int(usage.get("total_tokens") or 0),
+                        "prompt_chars": decision.get("prompt_chars", 0),
+                        "reasoning": decision.get("reasoning", "")[:1500],
+                    },
+                    handle.conversation_id,
+                )
+
+                observation = obs_next
+                if isinstance(obs_next.data, dict) and obs_next.data.get("terminal"):
+                    terminal = {
+                        "status": str(obs_next.data.get("status") or ("completed" if obs_next.ok else "failed")),
+                        "summary": obs_next.data.get("summary") or obs_next.data.get("reason") or "",
+                        "artifacts": obs_next.data.get("artifacts") or {},
+                    }
+                    break
+                if consecutive_failures >= 12:
+                    terminal = {"status": "failed", "reason": f"12 consecutive tool failures; last error: {(obs_next.error or '')[:400]}"}
+                    break
+
+                elapsed = time.time() - cycle_started
+                if elapsed < min_interval:
+                    time.sleep(min_interval - elapsed)
+
+            if handle.stop_event.is_set() and not terminal:
+                terminal = {"status": "cancelled", "reason": "cancelled by operator"}
+            if self._shutdown.is_set() and not terminal:
+                terminal = {"status": "paused", "reason": "worker shutdown; run is checkpointed and resumable"}
+            if not terminal:
+                terminal = {"status": "failed", "reason": "loop exited without terminal declaration"}
+
+            self._finalize(handle, sigma, observation, step, terminal, started_wall)
+        except BudgetExceeded as exc:
+            self._finalize(handle, sigma, observation, step, {"status": "failed", "reason": str(exc)}, started_wall)
+        except Exception as exc:
+            log.exception("run %s crashed", run_id)
+            RUNS.set_status(run_id, RunStatus.ERROR.value, f"{type(exc).__name__}: {exc}"[:2000])
+            emit_event("run_error", run_id, tenant_id, {"error": f"{type(exc).__name__}: {exc}"[:1500], "step": step, "resumable": True}, handle.conversation_id)
+        finally:
+            RUNS.release_lease(run_id, self.owner)
+            with self._lock:
+                self.handles.pop(run_id, None)
+
+    def _finalize(self, handle: RunHandle, sigma: Dict[str, Any], observation: Observation, step: int, terminal: Dict[str, Any], started_wall: float) -> None:
+        run_id = handle.run_id
+        tenant_id = handle.tenant_id
+        spec = handle.spec
+        status_raw = str(terminal.get("status") or "failed")
+        CHECKPOINTS.save(tenant_id, run_id, step, GraphNode.TERMINATE.value, sigma, observation, {"terminal": terminal})
+        if status_raw == "paused":
+            RUNS.set_status(run_id, RunStatus.PAUSED.value)
+            emit_event("run_paused", run_id, tenant_id, {"step": step, "reason": terminal.get("reason", "")}, handle.conversation_id)
+            return
+        if status_raw == "cancelled":
+            RUNS.set_status(run_id, RunStatus.CANCELLED.value)
+            emit_event("run_cancelled", run_id, tenant_id, {"step": step, "reason": terminal.get("reason", "")}, handle.conversation_id)
+            return
+        report = Verifier.evaluate(spec, tenant_id, run_id, sigma, terminal)
+        RUNS.set_terminal(run_id, {"sigma": sigma, "terminal": terminal, "step": step}, report)
+        final_status = RunStatus.COMPLETED.value if report["passed"] else RunStatus.FAILED.value
+        RUNS.set_status(run_id, final_status, None if report["passed"] else str(terminal.get("reason") or "verification failed")[:2000])
+        RUNS.bump(run_id, step, 0, int((time.time() - started_wall) * 1000))
+        emit_event("verification", run_id, tenant_id, {"report": report, "step": step}, handle.conversation_id)
+
+        final_text = self._compose_final(spec, sigma, terminal, report)
+        if handle.conversation_id:
+            MESSAGES.add(
+                tenant_id,
+                handle.conversation_id,
+                "assistant",
+                final_text,
+                {"run_id": run_id, "steps": step, "passed": report["passed"], "score": report["score"]},
+            )
+        emit_event(
+            "run_finished",
+            run_id,
+            tenant_id,
+            {
+                "status": final_status,
+                "steps": step,
+                "passed": report["passed"],
+                "score": report["score"],
+                "summary": final_text[:6000],
+                "terminal": terminal,
+            },
+            handle.conversation_id,
+        )
+        try:
+            patch = REFLECTION.generate(tenant_id, run_id, spec, sigma, report)
+            emit_event("reflection", run_id, tenant_id, {"verdict": patch["verdict"], "root_cause": patch["root_cause"], "rules": patch["durable_rules"][:6]}, handle.conversation_id)
+        except Exception as exc:
+            log.warning("reflection stage failed: %s", exc)
+        try:
+            advantage_report = DISTILLER.optimize(tenant_id, run_id, lr=0.05 if report["passed"] else 0.03, epochs=2)
+            emit_event("distillation", run_id, tenant_id, advantage_report, handle.conversation_id)
+        except Exception as exc:
+            log.warning("distillation stage failed: %s", exc)
+        try:
+            META.consider(tenant_id, run_id)
+        except Exception as exc:
+            log.warning("meta-agent stage failed: %s", exc)
+
+    @staticmethod
+    def _compose_final(spec: ProceduralSpec, sigma: Dict[str, Any], terminal: Dict[str, Any], report: Dict[str, Any]) -> str:
+        lines: List[str] = []
+        summary = str(terminal.get("summary") or terminal.get("reason") or "").strip()
+        if summary:
+            lines.append(summary)
+        else:
+            lines.append(f"Run concluded with status {terminal.get('status')}.")
+        progress = [str(p) for p in (sigma.get("progress") or [])][-10:]
+        if progress:
+            lines.append("")
+            lines.append("Verified progress:")
+            for p in progress:
+                lines.append(f"- {p}")
+        artifacts = sigma.get("artifacts") or {}
+        if isinstance(artifacts, dict) and artifacts:
+            lines.append("")
+            lines.append("Artifacts:")
+            for name, path in list(artifacts.items())[:20]:
+                lines.append(f"- {name}: {path}")
+        checks = report.get("checks") or []
+        if checks:
+            lines.append("")
+            lines.append(f"Verification score {report.get('score', 0.0):.2f} ({'passed' if report.get('passed') else 'not passed'}):")
+            for c in checks[:12]:
+                lines.append(f"- [{'x' if c.get('passed') else ' '}] {c.get('type')}: {str(c.get('detail'))[:200]}")
+        errors = [str(e) for e in (sigma.get("errors") or [])][-6:]
+        if errors:
+            lines.append("")
+            lines.append("Recorded error signatures:")
+            for e in errors:
+                lines.append(f"- {e}")
+        text = "\n".join(lines)
+        sanitized, _ = CLASSIFIER.sanitize(text)
+        return sanitized[:20000]
+
+
+ORCHESTRATOR = AgentOrchestrator()
+
+
+class MetaAgent:
+    SYSTEM = """You are an isolated, non-self-modifying Meta-Agent that repairs an autonomous agent's memory layers.
+You never execute tasks. You only read failure diagnostics and emit minimal, scoped patch proposals.
+
+Attribute each failure to exactly one memory component:
+  "skill"      - a procedural skill is wrong, incomplete, or missing
+  "wiki"       - durable environment knowledge or caveats are missing
+  "state"      - the execution state schema usage is wrong
+  "tool_usage" - the tool was called with incorrect arguments
+
+Reply with exactly ONE JSON object, no prose, no markdown:
+{
+  "attribution": "skill" | "wiki" | "state" | "tool_usage",
+  "diagnosis": "one paragraph causal analysis",
+  "patches": [
+    {
+      "component": "skill" | "wiki",
+      "operation": "create" | "revise",
+      "target_name": "skill or page name",
+      "category": "category",
+      "summary": "what the skill does",
+      "procedure": ["minimal corrected steps"],
+      "preconditions": ["applicability conditions"],
+      "failure_modes": ["known failure modes"],
+      "tags": ["tags"],
+      "body": "markdown body when component is wiki",
+      "rationale": "why this patch fixes the attributed failure"
+    }
+  ]
+}
+Emit at most two patches. Keep every patch minimal and scoped to the observed failure."""
+
+    def __init__(self, model: ModelClient, store: SQLiteStore):
+        self.model = model
+        self.store = store
+        self._lock = threading.RLock()
+
+    def consider(self, tenant_id: str, run_id: Optional[str] = None) -> Dict[str, Any]:
         with self._lock:
-            return [rid for rid, w in self._workers.items() if w.is_alive()]
+            failures = TRACES.failures(tenant_id, 40)
+            if run_id:
+                run_failures = [f for f in failures if f["run_id"] == run_id]
+                failures = run_failures or failures
+            if not failures:
+                return {"considered": 0, "proposed": 0, "attribution": None}
+            signature_groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+            for f in failures:
+                action = f.get("action") or {}
+                outcome = f.get("outcome") or {}
+                key = f"{action.get('tool')}::{str(outcome.get('error') or '')[:80]}"
+                signature_groups[key].append(f)
+            ranked = sorted(signature_groups.items(), key=lambda kv: len(kv[1]), reverse=True)
+            top_key, group = ranked[0]
+            digest_lines = [
+                f"tool={ (g.get('action') or {}).get('tool') } step={g.get('step')} error={str((g.get('outcome') or {}).get('error') or '')[:220]}"
+                for g in group[:12]
+            ]
+            skills = EM.list(tenant_id, 12)
+            proposal = None
+            if self.model.available:
+                try:
+                    out = self.model.complete(
+                        [
+                            {"role": "system", "content": self.SYSTEM},
+                            {
+                                "role": "user",
+                                "content": "\n".join(
+                                    [
+                                        "=== RECURRING FAILURE SIGNATURE ===",
+                                        top_key,
+                                        f"occurrences={len(group)}",
+                                        "",
+                                        "=== FAILURE DIGEST ===",
+                                        "\n".join(digest_lines),
+                                        "",
+                                        "=== CURRENT ACTIVE SKILLS ===",
+                                        jdump([{"name": s.name, "category": s.category, "summary": s.summary[:200], "score": round(s.score, 3)} for s in skills])[:6000],
+                                        "",
+                                        "Emit the patch proposal JSON now.",
+                                    ]
+                                ),
+                            },
+                        ],
+                        override={"temperature": 0.25, "max_tokens": 5000, "frequency_penalty": 0.1, "presence_penalty": 0.0},
+                    )
+                    proposal = DECODER.extract_json_object(out["text"])
+                    TENANTS.charge_tokens(tenant_id, out["usage"]["total_tokens"])
+                except Exception as exc:
+                    log.warning("meta-agent proposal failed: %s", exc)
+            if not isinstance(proposal, dict):
+                proposal = self._heuristic(top_key, group)
+            attribution = str(proposal.get("attribution") or "skill")
+            if attribution not in ("skill", "wiki", "state", "tool_usage"):
+                attribution = "skill"
+            patches = proposal.get("patches") if isinstance(proposal.get("patches"), list) else []
+            proposed = 0
+            for raw in patches[:2]:
+                if not isinstance(raw, dict):
+                    continue
+                normalized = self._normalize_patch(raw, attribution)
+                if normalized is None:
+                    continue
+                patch_id = new_id("patch")
+                self.store.execute(
+                    "INSERT INTO skill_patches(patch_id, tenant_id, target_skill_id, component, diagnosis, proposal, status, gate_report, created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        patch_id,
+                        tenant_id,
+                        normalized.get("target_skill_id"),
+                        normalized["component"],
+                        str(proposal.get("diagnosis") or "")[:4000],
+                        jdump(normalized),
+                        "proposed",
+                        jdump({}),
+                        iso(),
+                    ),
+                )
+                proposed += 1
+                emit_event("patch_proposed", run_id, tenant_id, {"patch_id": patch_id, "component": normalized["component"], "target": normalized.get("target_name")}, None)
+                GATE.evaluate(tenant_id, patch_id)
+            return {"considered": len(failures), "proposed": proposed, "attribution": attribution, "signature": top_key}
+
+    @staticmethod
+    def _heuristic(signature: str, group: List[Dict[str, Any]]) -> Dict[str, Any]:
+        tool = signature.split("::")[0]
+        error = signature.split("::")[-1]
+        name = f"recover_{re.sub(r'[^a-z0-9]+', '_', tool.lower())}"[:60] or "recover_generic"
+        return {
+            "attribution": "tool_usage",
+            "diagnosis": f"The tool {tool} failed {len(group)} times with error signature '{error}'. Argument construction or precondition verification is likely incorrect.",
+            "patches": [
+                {
+                    "component": "skill",
+                    "operation": "create",
+                    "target_name": name,
+                    "category": "recovery",
+                    "summary": f"Deterministic recovery procedure for repeated {tool} failures with signature '{error}'.",
+                    "procedure": [
+                        f"Before calling {tool}, verify every precondition with a read-only tool (workspace.list_dir or workspace.read_file).",
+                        f"Record the exact argument set in state.scratch prior to invoking {tool}.",
+                        f"If {tool} fails, append the error signature to state.errors and do not retry with identical arguments.",
+                        "Select an alternative tool path or reduce the scope of the operation, then re-verify.",
+                    ],
+                    "preconditions": [f"A prior invocation of {tool} failed with '{error}'."],
+                    "failure_modes": [f"{tool} repeatedly failing with '{error}'"],
+                    "tags": ["recovery", tool.split(".")[0] if "." in tool else tool],
+                    "rationale": "Prevents identical retry loops and forces precondition verification.",
+                }
+            ],
+        }
+
+    @staticmethod
+    def _normalize_patch(raw: Dict[str, Any], attribution: str) -> Optional[Dict[str, Any]]:
+        component = str(raw.get("component") or ("wiki" if attribution == "wiki" else "skill")).lower()
+        if component not in ("skill", "wiki"):
+            component = "skill"
+        target_name = str(raw.get("target_name") or "").strip()[:120]
+        if not target_name:
+            return None
+        if component == "skill":
+            procedure = [str(p)[:400] for p in (raw.get("procedure") or []) if p][:24]
+            summary = str(raw.get("summary") or "").strip()[:800]
+            if not procedure or not summary:
+                return None
+            return {
+                "component": "skill",
+                "operation": str(raw.get("operation") or "create").lower(),
+                "target_name": target_name,
+                "category": str(raw.get("category") or "general")[:60],
+                "summary": summary,
+                "procedure": procedure,
+                "preconditions": [str(p)[:300] for p in (raw.get("preconditions") or [])][:12],
+                "failure_modes": [str(p)[:300] for p in (raw.get("failure_modes") or [])][:12],
+                "tags": [str(t)[:40] for t in (raw.get("tags") or [])][:12],
+                "rationale": str(raw.get("rationale") or "")[:800],
+            }
+        body = str(raw.get("body") or "").strip()
+        if not body:
+            return None
+        return {
+            "component": "wiki",
+            "operation": str(raw.get("operation") or "revise").lower(),
+            "target_name": target_name,
+            "category": str(raw.get("category") or "general")[:60],
+            "body": body[:24000],
+            "rationale": str(raw.get("rationale") or "")[:800],
+        }
 
 
-SUPERVISOR = Supervisor()
+class ValidationGate:
+    def __init__(self, store: SQLiteStore):
+        self.store = store
+        self._lock = threading.RLock()
+
+    def _diagnostics(self, tenant_id: str) -> List[Dict[str, Any]]:
+        rows = self.store.query("SELECT * FROM diagnostic_tasks WHERE tenant_id = ? ORDER BY created_at ASC", (tenant_id,))
+        if rows:
+            return [
+                {
+                    "task_id": r["task_id"],
+                    "name": r["name"],
+                    "spec": jload(r["spec"], {}) or {},
+                    "verifier": jload(r["verifier"], {}) or {},
+                    "baseline_score": float(r["baseline_score"]),
+                }
+                for r in rows
+            ]
+        return self._seed(tenant_id)
+
+    def _seed(self, tenant_id: str) -> List[Dict[str, Any]]:
+        seeds = [
+            {
+                "name": "schema_conformance",
+                "spec": {"objective": "Emit a state patch and single tool action conforming to the runtime contract."},
+                "verifier": {"type": "structure", "required_keys": ["procedure", "summary"], "min_procedure_steps": 2},
+            },
+            {
+                "name": "determinism_and_scope",
+                "spec": {"objective": "Skill procedures must be deterministic, scoped, and free of destructive operations."},
+                "verifier": {"type": "safety", "forbidden": ["rm -rf", "mkfs", "sudo", "curl ", "wget ", "chmod 777"]},
+            },
+            {
+                "name": "actionability",
+                "spec": {"objective": "Each procedure step must reference a registered tool or a concrete verifiable check."},
+                "verifier": {"type": "actionability", "min_tool_references": 1},
+            },
+            {
+                "name": "no_regression_in_library",
+                "spec": {"objective": "A patch must not duplicate or contradict an existing high-scoring skill."},
+                "verifier": {"type": "no_duplicate", "similarity_threshold": 0.94},
+            },
+        ]
+        out: List[Dict[str, Any]] = []
+        for s in seeds:
+            task_id = new_id("diag")
+            self.store.execute(
+                "INSERT INTO diagnostic_tasks(task_id, tenant_id, name, spec, verifier, baseline_score, created_at) VALUES(?,?,?,?,?,?,?)",
+                (task_id, tenant_id, s["name"], jdump(s["spec"]), jdump(s["verifier"]), 1.0, iso()),
+            )
+            out.append({"task_id": task_id, "name": s["name"], "spec": s["spec"], "verifier": s["verifier"], "baseline_score": 1.0})
+        return out
+
+    def _run_check(self, tenant_id: str, task: Dict[str, Any], proposal: Dict[str, Any]) -> Dict[str, Any]:
+        verifier = task["verifier"]
+        vtype = str(verifier.get("type") or "")
+        component = proposal.get("component")
+        if vtype == "structure":
+            if component == "skill":
+                ok = bool(proposal.get("summary")) and len(proposal.get("procedure") or []) >= int(verifier.get("min_procedure_steps") or 2)
+                detail = f"summary={bool(proposal.get('summary'))} steps={len(proposal.get('procedure') or [])}"
+            else:
+                ok = len(str(proposal.get("body") or "")) >= 40
+                detail = f"body_len={len(str(proposal.get('body') or ''))}"
+            return {"task": task["name"], "passed": ok, "detail": detail}
+        if vtype == "safety":
+            blob = jdump(proposal).lower()
+            forbidden = [f for f in (verifier.get("forbidden") or []) if str(f).lower() in blob]
+            verdict = CLASSIFIER.classify(jdump(proposal))
+            ok = not forbidden and verdict["severity"] != "block"
+            return {"task": task["name"], "passed": ok, "detail": f"forbidden={forbidden} classifier={verdict['severity']}"}
+        if vtype == "actionability":
+            if component != "skill":
+                return {"task": task["name"], "passed": True, "detail": "not applicable to wiki patches"}
+            blob = " ".join(str(s) for s in (proposal.get("procedure") or []))
+            refs = sum(1 for name in TOOLS.names() if name in blob or name.split(".")[-1] in blob)
+            concrete = sum(1 for s in (proposal.get("procedure") or []) if re.search(r"(verify|check|read|write|append|replace|record|compare|assert|list)", str(s), re.IGNORECASE))
+            ok = (refs >= int(verifier.get("min_tool_references") or 1)) or concrete >= 2
+            return {"task": task["name"], "passed": ok, "detail": f"tool_refs={refs} concrete_steps={concrete}"}
+        if vtype == "no_duplicate":
+            if component != "skill":
+                return {"task": task["name"], "passed": True, "detail": "not applicable to wiki patches"}
+            threshold = float(verifier.get("similarity_threshold") or 0.94)
+            text = " ".join([str(proposal.get("summary") or ""), " ".join(str(x) for x in (proposal.get("procedure") or []))])
+            qvec = EMBEDDER.embed(text)
+            worst = 0.0
+            worst_name = ""
+            for skill in EM.list(tenant_id, 120):
+                if skill.name == proposal.get("target_name"):
+                    continue
+                sim = EMBEDDER.cosine(qvec, EMBEDDER.embed(" ".join([skill.summary, " ".join(str(x) for x in skill.procedure)])))
+                if sim > worst:
+                    worst = sim
+                    worst_name = skill.name
+            ok = worst < threshold
+            return {"task": task["name"], "passed": ok, "detail": f"max_similarity={worst:.4f} vs '{worst_name}' threshold={threshold}"}
+        return {"task": task["name"], "passed": True, "detail": "unknown verifier treated as neutral"}
+
+    def evaluate(self, tenant_id: str, patch_id: str) -> Dict[str, Any]:
+        with self._lock:
+            row = self.store.one("SELECT * FROM skill_patches WHERE patch_id = ? AND tenant_id = ?", (patch_id, tenant_id))
+            if row is None:
+                raise ValidationError(f"patch {patch_id} not found")
+            if row["status"] != "proposed":
+                return {"patch_id": patch_id, "status": row["status"], "gate_report": jload(row["gate_report"], {})}
+            proposal = jload(row["proposal"], {}) or {}
+            tasks = self._diagnostics(tenant_id)
+            checks = [self._run_check(tenant_id, t, proposal) for t in tasks]
+            passed_count = sum(1 for c in checks if c["passed"])
+            score = passed_count / max(1, len(checks))
+            accepted = all(c["passed"] for c in checks)
+            report = {
+                "checks": checks,
+                "score": score,
+                "accepted": accepted,
+                "evaluated_at": iso(),
+                "baseline": 1.0,
+                "regression": (not accepted),
+            }
+            applied: Dict[str, Any] = {}
+            status = "rejected"
+            if accepted:
+                try:
+                    applied = self._apply(tenant_id, proposal)
+                    status = "applied"
+                except Exception as exc:
+                    status = "rollback"
+                    report["apply_error"] = str(exc)[:800]
+                    log.warning("patch apply failed, rolled back: %s", exc)
+            report["applied"] = applied
+            self.store.execute(
+                "UPDATE skill_patches SET status = ?, gate_report = ?, decided_at = ? WHERE patch_id = ?",
+                (status, jdump(report), iso(), patch_id),
+            )
+            audit(tenant_id, None, "validation_gate", f"patch_{status}", {"patch_id": patch_id, "score": score}, accepted)
+            emit_event("patch_decision", None, tenant_id, {"patch_id": patch_id, "status": status, "score": score, "checks": checks}, None)
+            return {"patch_id": patch_id, "status": status, "gate_report": report}
+
+    def _apply(self, tenant_id: str, proposal: Dict[str, Any]) -> Dict[str, Any]:
+        component = proposal.get("component")
+        if component == "skill":
+            skill = EM.upsert(
+                tenant_id,
+                proposal["target_name"],
+                proposal["summary"],
+                proposal["procedure"],
+                proposal.get("preconditions"),
+                proposal.get("failure_modes"),
+                proposal.get("tags"),
+                proposal.get("category", "general"),
+            )
+            return {"component": "skill", "skill_id": skill.skill_id, "name": skill.name, "version": skill.version}
+        page = WIKI.upsert(tenant_id, proposal["target_name"], proposal["body"], proposal.get("category", "general"))
+        return {"component": "wiki", **page}
+
+    def rollback(self, tenant_id: str, patch_id: str) -> Dict[str, Any]:
+        row = self.store.one("SELECT * FROM skill_patches WHERE patch_id = ? AND tenant_id = ?", (patch_id, tenant_id))
+        if row is None:
+            raise ValidationError("patch not found")
+        report = jload(row["gate_report"], {}) or {}
+        applied = report.get("applied") or {}
+        if applied.get("component") == "skill" and applied.get("skill_id"):
+            EM.retire(tenant_id, applied["skill_id"])
+        self.store.execute("UPDATE skill_patches SET status = 'rollback', decided_at = ? WHERE patch_id = ?", (iso(), patch_id))
+        audit(tenant_id, None, "validation_gate", "patch_rollback", {"patch_id": patch_id}, True)
+        return {"patch_id": patch_id, "status": "rollback"}
 
 
-class CreateConversationRequest(BaseModel):
-    title: str = Field(default="New chat", max_length=300)
+GATE = ValidationGate(STORE)
+META = MetaAgent(MODEL, STORE)
 
 
-class RenameConversationRequest(BaseModel):
-    title: str = Field(min_length=1, max_length=300)
+CHAT_SYSTEM_PROMPT = "You are a helpful assistant. Be concise and accurate. Answer in plain text without markdown unless asked."
+
+PLANNER_SYSTEM = """You are the intake planner of an autonomous agent runtime. You convert a user request into an executable procedural specification.
+
+Reply with exactly ONE JSON object, no prose, no markdown:
+{
+  "mode": "chat" | "agent",
+  "objective": "single imperative sentence describing the complete goal",
+  "success_criteria": ["objectively verifiable completion conditions"],
+  "constraints": ["hard constraints the agent must never violate"],
+  "max_steps": 60,
+  "verifiers": [{"type": "all_criteria_verified"}],
+  "reply": "direct plain-text answer when mode is chat, otherwise empty string"
+}
+
+Choose "chat" only for pure conversation, greetings, or a question you can fully answer in one reply with no tools.
+Choose "agent" whenever the request requires multi-step work, file creation, computation, research, iteration, or verification.
+Supported verifier types: all_criteria_verified, file_exists, file_contains, file_min_lines, state_key_truthy, state_key_equals, no_errors, python_assert."""
+
+
+class ChatService:
+    def __init__(self, model: ModelClient):
+        self.model = model
+
+    def plan(self, tenant_id: str, message: str, history: List[Dict[str, Any]]) -> Dict[str, Any]:
+        recent = history[-6:]
+        context_lines = [f"{m['role']}: {str(m['content'])[:600]}" for m in recent]
+        if not self.model.available:
+            return {
+                "mode": "agent",
+                "objective": message.strip()[:2000] or "Assist the user.",
+                "success_criteria": ["The user request is fully satisfied and every claim is verified."],
+                "constraints": ["Do not fabricate results.", "Verify each success criterion before finishing."],
+                "max_steps": 60,
+                "verifiers": [{"type": "all_criteria_verified"}],
+                "reply": "",
+            }
+        try:
+            out = self.model.complete(
+                [
+                    {"role": "system", "content": PLANNER_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": "\n".join(
+                            [
+                                "=== RECENT CONVERSATION ===",
+                                "\n".join(context_lines) if context_lines else "(none)",
+                                "",
+                                "=== CURRENT USER REQUEST ===",
+                                message[:12000],
+                                "",
+                                "=== AVAILABLE TOOLS ===",
+                                TOOLS.describe(),
+                                "",
+                                "Emit the specification JSON now.",
+                            ]
+                        ),
+                    },
+                ],
+                override={"temperature": 0.3, "max_tokens": 4000, "frequency_penalty": 0.1, "presence_penalty": 0.0},
+            )
+            TENANTS.charge_tokens(tenant_id, out["usage"]["total_tokens"])
+            parsed = DECODER.extract_json_object(out["text"])
+        except Exception as exc:
+            log.warning("planner failed: %s", exc)
+            parsed = None
+        if not isinstance(parsed, dict):
+            return {
+                "mode": "agent",
+                "objective": message.strip()[:2000] or "Assist the user.",
+                "success_criteria": ["The user request is fully satisfied and every claim is verified."],
+                "constraints": ["Do not fabricate results."],
+                "max_steps": 60,
+                "verifiers": [{"type": "all_criteria_verified"}],
+                "reply": "",
+            }
+        mode = str(parsed.get("mode") or "agent").lower()
+        if mode not in ("chat", "agent"):
+            mode = "agent"
+        criteria = [str(c)[:400] for c in (parsed.get("success_criteria") or []) if c][:12]
+        constraints = [str(c)[:400] for c in (parsed.get("constraints") or []) if c][:12]
+        verifiers: List[Dict[str, Any]] = []
+        for v in (parsed.get("verifiers") or [])[:12]:
+            if isinstance(v, dict) and v.get("type"):
+                verifiers.append({str(k): v[k] for k in v})
+        if not verifiers:
+            verifiers = [{"type": "all_criteria_verified"}]
+        return {
+            "mode": mode,
+            "objective": str(parsed.get("objective") or message)[:4000],
+            "success_criteria": criteria or ["The user request is fully satisfied and verified."],
+            "constraints": constraints,
+            "max_steps": int(clamp(float(parsed.get("max_steps") or 60), 1, 2000)),
+            "verifiers": verifiers,
+            "reply": str(parsed.get("reply") or ""),
+        }
+
+    def chat_stream(self, tenant_id: str, conversation_id: str, message: str, history: List[Dict[str, Any]]) -> Iterable[str]:
+        messages: List[Dict[str, str]] = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
+        for m in history[-16:]:
+            role = m.get("role")
+            if role in ("user", "assistant"):
+                messages.append({"role": role, "content": str(m.get("content") or "")[:8000]})
+        messages.append({"role": "user", "content": message[:20000]})
+        chunks: List[str] = []
+        queue: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
+
+        def collector(delta: str) -> None:
+            chunks.append(delta)
+
+        result = self.model.stream(messages, on_delta=collector)
+        TENANTS.charge_tokens(tenant_id, result["usage"]["total_tokens"])
+        text = result["text"]
+        sanitized, verdict = CLASSIFIER.sanitize(text)
+        MESSAGES.add(tenant_id, conversation_id, "assistant", sanitized, {"mode": "chat", "classifier": verdict, "usage": result["usage"]})
+        yield sanitized
+
+
+CHAT = ChatService(MODEL)
+
+
+class StartRunRequest(BaseModel):
+    objective: str = Field(min_length=1, max_length=20000)
+    success_criteria: List[str] = Field(default_factory=list)
+    constraints: List[str] = Field(default_factory=list)
+    allowed_tools: Optional[List[str]] = None
+    max_steps: int = Field(default=DEFAULT_STEP_BUDGET, ge=1, le=5000)
+    verifiers: List[Dict[str, Any]] = Field(default_factory=list)
+    conversation_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=200000)
+    message: str = Field(min_length=1, max_length=100000)
     conversation_id: Optional[str] = None
-    stream: bool = True
-    autonomous: bool = False
-    title: Optional[str] = Field(default=None, max_length=300)
-    constraints: List[str] = Field(default_factory=list)
-    success_criteria: List[str] = Field(default_factory=list)
-    allowed_tools: List[str] = Field(default_factory=list)
-    max_steps: int = Field(default=DEFAULT_MAX_STEPS, ge=1, le=5000)
-    token_budget: int = Field(default=DEFAULT_TOKEN_BUDGET, ge=1000)
-    verifier_program: Optional[str] = None
-
-    @field_validator("constraints", "success_criteria", "allowed_tools")
-    @classmethod
-    def _cap_lists(cls, value: List[str]) -> List[str]:
-        return [str(v)[:600] for v in value][:32]
+    force_agent: bool = False
+    max_steps: Optional[int] = Field(default=None, ge=1, le=5000)
 
 
-class CreateRunRequest(BaseModel):
-    title: str = Field(default="Autonomous objective", max_length=300)
-    objective: str = Field(min_length=1, max_length=20000)
-    constraints: List[str] = Field(default_factory=list)
-    success_criteria: List[str] = Field(default_factory=list)
-    allowed_tools: List[str] = Field(default_factory=list)
-    max_steps: int = Field(default=DEFAULT_MAX_STEPS, ge=1, le=5000)
-    token_budget: int = Field(default=DEFAULT_TOKEN_BUDGET, ge=1000)
-    verifier_program: Optional[str] = None
-    conversation_id: Optional[str] = None
-    autostart: bool = True
-
-
-class SkillUpsertRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=64)
-    description: str = Field(default="", max_length=4000)
-    when_to_use: str = Field(default="", max_length=2000)
+class SkillRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    summary: str = Field(min_length=1, max_length=4000)
     procedure: List[str] = Field(default_factory=list)
-    tools: List[str] = Field(default_factory=list)
+    preconditions: List[str] = Field(default_factory=list)
+    failure_modes: List[str] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list)
+    category: str = "general"
 
 
-class WikiUpsertRequest(BaseModel):
-    slug: str = Field(min_length=1, max_length=120)
-    title: str = Field(default="", max_length=300)
-    body: str = Field(default="", max_length=400000)
+class WikiRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    body: str = Field(min_length=1, max_length=200000)
+    category: str = "general"
 
 
-class DiagnosticRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=200)
-    payload: Dict[str, Any] = Field(default_factory=dict)
-    expectation: Dict[str, Any] = Field(default_factory=dict)
+class OptimizeRequest(BaseModel):
+    run_id: Optional[str] = None
+    learning_rate: float = Field(default=0.04, gt=0.0, le=1.0)
+    epochs: int = Field(default=2, ge=1, le=20)
+    limit: int = Field(default=400, ge=1, le=5000)
 
 
-class TenantCreateRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
+class RenameRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+
+
+class TenantRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=160)
     api_key: str = Field(min_length=8, max_length=256)
     token_budget: int = Field(default=DEFAULT_TOKEN_BUDGET, ge=1000)
-    allowed_risk: str = Field(default="guarded")
 
 
-def extract_api_key(request: Request, authorization: Optional[str], x_api_key: Optional[str]) -> str:
-    if authorization and authorization.lower().startswith("bearer "):
-        return authorization[7:].strip()
-    if x_api_key:
-        return x_api_key.strip()
-    query_key = request.query_params.get("api_key")
-    if query_key:
-        return query_key.strip()
-    return os.environ.get("AGENT_DEFAULT_API_KEY", "local-dev-key")
+app = FastAPI(title="Autonomous Agent Runtime", version="1.0.0", docs_url="/api/docs", openapi_url="/api/openapi.json")
 
-
-async def require_tenant(
-    request: Request,
-    authorization: Optional[str] = Header(default=None),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
-) -> Tenant:
-    key = extract_api_key(request, authorization, x_api_key)
-    tenant = TENANTS.by_api_key(key)
-    if tenant is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid or missing API key")
-    return tenant
-
-
-async def require_admin(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")) -> bool:
-    if not ADMIN_TOKEN:
-        return True
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin token required")
-    return True
-
-
-app = FastAPI(title="Autonomous Agent Runtime", version="1.0.0", docs_url="/api/docs", redoc_url=None)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.environ.get("AGENT_CORS", "*").split(","),
@@ -4064,733 +4944,864 @@ app.add_middleware(
 )
 
 
+async def resolve_tenant(
+    x_tenant_id: Optional[str] = Header(default=None, alias="X-Tenant-Id"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key"),
+) -> Tenant:
+    try:
+        return TENANTS.authenticate(x_tenant_id, x_api_key)
+    except SecurityError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+
+
+async def require_admin(x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token")) -> bool:
+    if not x_admin_token or not hmac.compare_digest(x_admin_token, ADMIN_TOKEN):
+        raise HTTPException(status_code=403, detail="admin token required")
+    return True
+
+
+@app.exception_handler(SecurityError)
+async def security_handler(request: Request, exc: SecurityError) -> JSONResponse:
+    return JSONResponse(status_code=403, content={"error": "security_error", "detail": str(exc)})
+
+
+@app.exception_handler(ValidationError)
+async def validation_handler(request: Request, exc: ValidationError) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"error": "validation_error", "detail": str(exc)})
+
+
+@app.exception_handler(BudgetExceeded)
+async def budget_handler(request: Request, exc: BudgetExceeded) -> JSONResponse:
+    return JSONResponse(status_code=429, content={"error": "budget_exceeded", "detail": str(exc)})
+
+
+@app.exception_handler(ToolDenied)
+async def tool_handler(request: Request, exc: ToolDenied) -> JSONResponse:
+    return JSONResponse(status_code=403, content={"error": "tool_denied", "detail": str(exc)})
+
+
 @app.on_event("startup")
-async def _on_startup() -> None:
+async def on_startup() -> None:
     BUS.bind_loop(asyncio.get_running_loop())
-    SUPERVISOR.start_background()
-    _seed_defaults()
-    LOG.info("runtime online | model=%s | tools=%d | git=%s", MODEL_NAME, len(TOOLS.names()), GIT_ENABLED)
+    log.info("agent runtime starting; home=%s model=%s api_key_present=%s", BASE_DIR, MODEL_NAME, bool(MODEL_API_KEY))
+    recovered = await asyncio.get_running_loop().run_in_executor(None, ORCHESTRATOR.recover)
+    log.info("recovered %d interrupted runs from durable checkpoints", recovered)
+    asyncio.create_task(_janitor())
 
 
 @app.on_event("shutdown")
-async def _on_shutdown() -> None:
-    SUPERVISOR.shutdown()
-    LOG.info("runtime shutdown complete")
+async def on_shutdown() -> None:
+    log.info("agent runtime shutting down; checkpointing active runs")
+    await asyncio.get_running_loop().run_in_executor(None, ORCHESTRATOR.shutdown)
 
 
-def _seed_defaults() -> None:
-    for tenant in TENANTS.list_all():
-        if not MEMORY.em.list_skills(tenant.tenant_id, include_quarantined=True):
-            MEMORY.em.upsert(
-                tenant_id=tenant.tenant_id,
-                name="decompose_and_verify",
-                description="Baseline procedure: decompose the objective into atomic verifiable subgoals, "
-                            "execute one at a time, and assert each success criterion before terminating.",
-                trigger_signature="bootstrap phase, no subgoals present, or objective is broad and underspecified",
-                procedure=[
-                    "Restate the objective as 3-7 atomic subgoals with explicit completion predicates.",
-                    "Persist the subgoals into state_delta.subgoals with stable ids and dependencies.",
-                    "Select the first subgoal whose dependencies are satisfied.",
-                    "Execute exactly one tool call that materially advances that subgoal.",
-                    "Record verified outcomes into state_delta.facts and artifacts.",
-                    "Mark the subgoal done only when its completion predicate is objectively satisfied.",
-                    "Before terminal finish, re-check every declared success criterion with a read or check tool.",
-                ],
-                tools=["read_file", "write_file", "check_lines", "list_dir", "reason", "finish"],
-                reason="runtime bootstrap seed",
-            )
-            MEMORY.em.upsert(
-                tenant_id=tenant.tenant_id,
-                name="recover_from_tool_error",
-                description="Deterministic recovery ladder when a tool returns an error, preventing identical retries.",
-                trigger_signature="latest observation ok=false, or blockers list is non-empty",
-                procedure=[
-                    "Read the observation error verbatim and classify it: missing input, bad path, permission, or timeout.",
-                    "For missing or bad paths, list_dir the parent directory before retrying.",
-                    "For permission errors, choose a lower-risk tool that achieves the same effect.",
-                    "For timeouts, reduce the work unit size and retry once.",
-                    "If the same tool errors twice, change strategy and record the caveat with memory_write.",
-                ],
-                tools=["list_dir", "read_file", "search_files", "memory_write", "reason"],
-                reason="runtime bootstrap seed",
-            )
-        if not GATE.diagnostics(tenant.tenant_id):
-            GATE.add_diagnostic(
-                tenant.tenant_id,
-                "skill_declares_verification",
-                {"query": "verify success criteria before finishing the task"},
-                {"must_include": ["verif"], "must_not_include": ["ignore previous instructions"],
-                 "min_relevance": 0.02},
-            )
-            GATE.add_diagnostic(
-                tenant.tenant_id,
-                "skill_has_bounded_procedure",
-                {"query": "ordered atomic steps with explicit completion predicates"},
-                {"must_include": [], "must_not_include": ["rm -rf /"], "min_relevance": 0.0},
-            )
-        if not MEMORY.wiki.list_pages(tenant.tenant_id):
-            MEMORY.wiki.upsert(
-                tenant.tenant_id,
-                "runtime-playbook",
-                "Runtime Playbook",
-                "## Invariants\n"
-                "- The execution state is the sole sufficient statistic; no conversational history is replayed.\n"
-                "- Every state delta is validated deterministically before being merged.\n"
-                "- Identical failing tool calls must never be retried more than once.\n"
-                "- Success criteria are asserted with read or check tools before terminating.\n",
-                reason="bootstrap",
-            )
+async def _janitor() -> None:
+    while True:
+        try:
+            await asyncio.sleep(45.0)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _janitor_pass)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            log.warning("janitor pass failed: %s", exc)
+
+
+def _janitor_pass() -> None:
+    now = utcnow()
+    rows = STORE.query("SELECT run_id, tenant_id, spec, conversation_id, lease_owner, lease_expires_at, status FROM runs WHERE status = ?", (RunStatus.RUNNING.value,))
+    for r in rows:
+        if ORCHESTRATOR._handle(r["run_id"]) is not None:
+            continue
+        exp = r["lease_expires_at"]
+        expired = True
+        if exp:
+            try:
+                expired = datetime.fromisoformat(exp) <= now
+            except Exception:
+                expired = True
+        if not expired:
+            continue
+        try:
+            spec = ProceduralSpec.from_dict(jload(r["spec"], {}) or {})
+            ORCHESTRATOR.start(r["tenant_id"], r["conversation_id"], spec, resume_run_id=r["run_id"])
+            log.info("janitor resumed orphaned run %s", r["run_id"])
+        except Exception as exc:
+            log.warning("janitor resume failed for %s: %s", r["run_id"], exc)
+    STORE.execute("DELETE FROM events WHERE created_at < ?", ((now - timedelta(days=7)).isoformat(),))
 
 
 @app.get("/api/health")
 async def health() -> Dict[str, Any]:
+    row = STORE.one("SELECT COUNT(*) AS c FROM runs")
     return {
         "status": "ok",
         "time": iso(),
         "model": MODEL_NAME,
         "model_configured": MODEL.available,
-        "tools": TOOLS.names(),
-        "graph": GRAPH.describe(),
-        "active_runs": SUPERVISOR.active(),
+        "base_url": MODEL_BASE_URL,
+        "home": str(BASE_DIR),
+        "runs_total": int(row["c"]) if row else 0,
+        "active_runs": ORCHESTRATOR.active_runs(),
         "system1_hz": SYSTEM1_HZ,
         "system2_hz": SYSTEM2_HZ,
-        "git_versioning": GIT_ENABLED,
-        "ledger": LEDGER.verify_chain(500),
+        "tools": TOOLS.names(),
+        "tokens": {"prompt": MODEL.total_prompt_tokens, "completion": MODEL.total_completion_tokens},
     }
 
 
 @app.get("/api/config")
-async def config(tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
+async def config(tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
     return {
-        "tenant": {"tenant_id": tenant.tenant_id, "name": tenant.name,
-                   "token_budget": tenant.token_budget, "tokens_used": tenant.tokens_used,
-                   "allowed_risk": tenant.allowed_risk.value},
+        "tenant_id": tenant.tenant_id,
+        "name": tenant.name,
+        "token_budget": tenant.token_budget,
+        "tokens_used": tenant.tokens_used,
+        "allowed_tools": tenant.allowed_tools,
         "model": MODEL_NAME,
-        "defaults": {"max_steps": DEFAULT_MAX_STEPS, "token_budget": DEFAULT_TOKEN_BUDGET},
-        "tools": TOOLS.catalog(),
+        "model_configured": MODEL.available,
+        "max_steps_default": DEFAULT_STEP_BUDGET,
+        "verifier_types": [
+            "all_criteria_verified",
+            "file_exists",
+            "file_contains",
+            "file_min_lines",
+            "state_key_truthy",
+            "state_key_equals",
+            "no_errors",
+            "python_assert",
+        ],
     }
 
 
 @app.get("/api/conversations")
-async def list_conversations(tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    return {"conversations": CONVERSATIONS.list_conversations(tenant.tenant_id)}
+async def list_conversations(tenant: Tenant = Depends(resolve_tenant), limit: int = 100) -> Dict[str, Any]:
+    return {"conversations": MESSAGES.conversations(tenant.tenant_id, min(500, max(1, limit)))}
 
 
 @app.post("/api/conversations")
-async def create_conversation(body: CreateConversationRequest,
-                              tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    return CONVERSATIONS.create(tenant.tenant_id, body.title)
+async def create_conversation(tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
+    cid = MESSAGES.ensure_conversation(tenant.tenant_id, None, "New conversation")
+    return {"conversation_id": cid}
 
 
 @app.get("/api/conversations/{conversation_id}")
-async def get_conversation(conversation_id: str, tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    conv = CONVERSATIONS.get(tenant.tenant_id, conversation_id)
-    if conv is None:
+async def get_conversation(conversation_id: str, tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
+    row = STORE.one("SELECT * FROM conversations WHERE conversation_id = ? AND tenant_id = ?", (conversation_id, tenant.tenant_id))
+    if row is None:
         raise HTTPException(status_code=404, detail="conversation not found")
-    conv["messages"] = CONVERSATIONS.messages(tenant.tenant_id, conversation_id)
-    conv["runs"] = [r.to_dict() for r in RUNS.list_runs(tenant.tenant_id, limit=200)
-                    if r.conversation_id == conversation_id]
-    return conv
-
-
-@app.patch("/api/conversations/{conversation_id}")
-async def rename_conversation(conversation_id: str, body: RenameConversationRequest,
-                              tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    if not CONVERSATIONS.rename(tenant.tenant_id, conversation_id, body.title):
-        raise HTTPException(status_code=404, detail="conversation not found")
-    return {"ok": True, "conversation_id": conversation_id, "title": body.title}
-
-
-@app.delete("/api/conversations/{conversation_id}")
-async def delete_conversation(conversation_id: str, tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    if not CONVERSATIONS.delete(tenant.tenant_id, conversation_id):
-        raise HTTPException(status_code=404, detail="conversation not found")
-    return {"ok": True}
-
-
-def _sse(event: str, data: Dict[str, Any]) -> str:
-    return f"event: {event}\ndata: {jdump(data)}\n\n"
-
-
-@app.post("/api/chat")
-async def chat(body: ChatRequest, tenant: Tenant = Depends(require_tenant)) -> Response:
-    conv = CONVERSATIONS.ensure(tenant.tenant_id, body.conversation_id,
-                                body.title or body.message[:80] or "New chat")
-    conversation_id = conv["conversation_id"]
-    CONVERSATIONS.add_message(tenant.tenant_id, conversation_id, "user", body.message, {"autonomous": body.autonomous})
-
-    if body.autonomous:
-        spec = SPECS.create(
-            tenant_id=tenant.tenant_id,
-            title=body.title or body.message[:120],
-            objective=body.message,
-            constraints=body.constraints,
-            success_criteria=body.success_criteria,
-            allowed_tools=body.allowed_tools,
-            max_steps=body.max_steps,
-            token_budget=body.token_budget,
-            verifier_program=body.verifier_program,
-        )
-        record = RUNS.create(tenant.tenant_id, spec, conversation_id)
-        SUPERVISOR.launch(record.run_id)
-        return JSONResponse({
-            "mode": "autonomous",
-            "conversation_id": conversation_id,
-            "run_id": record.run_id,
-            "spec_id": spec.spec_id,
-            "stream_url": f"/api/runs/{record.run_id}/events",
-            "websocket_url": f"/ws/runs/{record.run_id}",
-        })
-
-    if not MODEL.available:
-        raise HTTPException(status_code=503, detail="MODULAR_API_KEY is not configured on the server")
-
-    history = CONVERSATIONS.messages(tenant.tenant_id, conversation_id, limit=40)
-    messages: List[Dict[str, str]] = [{
-        "role": "system",
-        "content": "You are a helpful assistant. Be concise and accurate. Answer in plain text without markdown "
-                   "unless asked.",
-    }]
-    for msg in history[-24:]:
-        if msg["role"] in ("user", "assistant"):
-            messages.append({"role": msg["role"], "content": msg["content"][:24000]})
-
-    if not body.stream:
-        try:
-            text, tokens = MODEL.complete(messages)
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"model error: {exc}") from exc
-        with contextlib.suppress(BudgetExceeded, AuthorizationDenied):
-            TENANTS.charge(tenant.tenant_id, tokens)
-        verdict = OutputClassifier.classify(text)
-        safe = text if verdict["allowed"] else OutputClassifier.redact(text)
-        stored = CONVERSATIONS.add_message(tenant.tenant_id, conversation_id, "assistant", safe,
-                                           {"tokens": tokens, "flags": verdict["flags"]})
-        return JSONResponse({"mode": "chat", "conversation_id": conversation_id, "message": stored,
-                             "tokens": tokens, "flags": verdict["flags"]})
-
-    async def generator() -> AsyncGenerator[str, None]:
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
-        accumulated: List[str] = []
-        usage_holder = {"tokens": 0}
-
-        def producer() -> None:
-            try:
-                for piece, total in MODEL.stream(messages):
-                    if total is not None:
-                        usage_holder["tokens"] = total
-                    if piece:
-                        accumulated.append(piece)
-                        loop.call_soon_threadsafe(queue.put_nowait, {"type": "delta", "content": piece})
-            except Exception as exc:
-                loop.call_soon_threadsafe(queue.put_nowait, {"type": "error", "error": f"{type(exc).__name__}: {exc}"})
-            finally:
-                loop.call_soon_threadsafe(queue.put_nowait, {"type": "__eof__"})
-
-        threading.Thread(target=producer, name="chat-stream", daemon=True).start()
-        yield _sse("open", {"conversation_id": conversation_id})
-        while True:
-            item = await queue.get()
-            if item.get("type") == "__eof__":
-                break
-            if item.get("type") == "error":
-                yield _sse("error", item)
-                break
-            yield _sse("delta", item)
-        full = "".join(accumulated)
-        tokens = usage_holder["tokens"] or approx_tokens(full)
-        with contextlib.suppress(BudgetExceeded, AuthorizationDenied):
-            TENANTS.charge(tenant.tenant_id, tokens)
-        verdict = OutputClassifier.classify(full)
-        safe = full if verdict["allowed"] else OutputClassifier.redact(full)
-        stored = CONVERSATIONS.add_message(tenant.tenant_id, conversation_id, "assistant", safe,
-                                           {"tokens": tokens, "flags": verdict["flags"]})
-        yield _sse("done", {"conversation_id": conversation_id, "message": stored, "tokens": tokens,
-                            "flags": verdict["flags"]})
-
-    return StreamingResponse(generator(), media_type="text/event-stream", headers={
-        "Cache-Control": "no-cache, no-transform",
-        "X-Accel-Buffering": "no",
-        "Connection": "keep-alive",
-    })
-
-
-@app.post("/api/runs")
-async def create_run(body: CreateRunRequest, tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    conversation_id = ""
-    if body.conversation_id:
-        conv = CONVERSATIONS.get(tenant.tenant_id, body.conversation_id)
-        if conv is None:
-            raise HTTPException(status_code=404, detail="conversation not found")
-        conversation_id = conv["conversation_id"]
-    spec = SPECS.create(
-        tenant_id=tenant.tenant_id,
-        title=body.title,
-        objective=body.objective,
-        constraints=body.constraints,
-        success_criteria=body.success_criteria,
-        allowed_tools=body.allowed_tools,
-        max_steps=body.max_steps,
-        token_budget=body.token_budget,
-        verifier_program=body.verifier_program,
-    )
-    record = RUNS.create(tenant.tenant_id, spec, conversation_id)
-    launched = SUPERVISOR.launch(record.run_id) if body.autostart else False
     return {
-        "run_id": record.run_id,
-        "spec_id": spec.spec_id,
-        "status": RUNS.get(record.run_id).status.value if RUNS.get(record.run_id) else RunState.PENDING.value,
-        "launched": launched,
-        "stream_url": f"/api/runs/{record.run_id}/events",
-        "websocket_url": f"/ws/runs/{record.run_id}",
+        "conversation_id": conversation_id,
+        "title": row["title"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "messages": MESSAGES.history(tenant.tenant_id, conversation_id),
     }
 
 
+@app.patch("/api/conversations/{conversation_id}")
+async def rename_conversation(conversation_id: str, payload: RenameRequest, tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
+    MESSAGES.rename(tenant.tenant_id, conversation_id, payload.title)
+    return {"conversation_id": conversation_id, "title": payload.title}
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str, tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
+    MESSAGES.delete(tenant.tenant_id, conversation_id)
+    return {"deleted": True, "conversation_id": conversation_id}
+
+
+@app.post("/api/chat")
+async def chat(payload: ChatRequest, tenant: Tenant = Depends(resolve_tenant)) -> StreamingResponse:
+    tenant_id = tenant.tenant_id
+    conversation_id = MESSAGES.ensure_conversation(tenant_id, payload.conversation_id, payload.message[:80])
+    history = MESSAGES.history(tenant_id, conversation_id)
+    user_msg = MESSAGES.add(tenant_id, conversation_id, "user", payload.message, {})
+    if len(history) == 0:
+        MESSAGES.rename(tenant_id, conversation_id, payload.message[:80])
+    loop = asyncio.get_running_loop()
+
+    async def event_stream() -> Iterable[bytes]:
+        def sse(kind: str, data: Dict[str, Any]) -> bytes:
+            return f"event: {kind}\ndata: {jdump(data)}\n\n".encode("utf-8")
+
+        yield sse("conversation", {"conversation_id": conversation_id, "message": user_msg})
+        if not MODEL.available:
+            detail = "MODULAR_API_KEY is not configured on the server; the model backend is unavailable."
+            MESSAGES.add(tenant_id, conversation_id, "assistant", detail, {"error": "model_unconfigured"})
+            yield sse("error", {"detail": detail})
+            yield sse("done", {"conversation_id": conversation_id})
+            return
+        try:
+            plan = await loop.run_in_executor(None, CHAT.plan, tenant_id, payload.message, history)
+        except Exception as exc:
+            log.warning("planning failed: %s", exc)
+            plan = {
+                "mode": "agent",
+                "objective": payload.message[:4000],
+                "success_criteria": ["The user request is fully satisfied and verified."],
+                "constraints": [],
+                "max_steps": 60,
+                "verifiers": [{"type": "all_criteria_verified"}],
+                "reply": "",
+            }
+        mode = "agent" if payload.force_agent else plan["mode"]
+        yield sse("plan", {"mode": mode, "objective": plan["objective"], "success_criteria": plan["success_criteria"], "constraints": plan["constraints"], "max_steps": plan["max_steps"]})
+
+        if mode == "chat":
+            reply = str(plan.get("reply") or "").strip()
+            if reply:
+                sanitized, verdict = CLASSIFIER.sanitize(reply)
+                MESSAGES.add(tenant_id, conversation_id, "assistant", sanitized, {"mode": "chat", "classifier": verdict})
+                for i in range(0, len(sanitized), 320):
+                    yield sse("delta", {"delta": sanitized[i : i + 320]})
+                    await asyncio.sleep(0)
+                yield sse("message", {"role": "assistant", "content": sanitized})
+                yield sse("done", {"conversation_id": conversation_id})
+                return
+            queue: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
+
+            def push(delta: str) -> None:
+                loop.call_soon_threadsafe(queue.put_nowait, delta)
+
+            def worker() -> Dict[str, Any]:
+                msgs: List[Dict[str, str]] = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
+                for m in history[-16:]:
+                    if m.get("role") in ("user", "assistant"):
+                        msgs.append({"role": str(m["role"]), "content": str(m.get("content") or "")[:8000]})
+                msgs.append({"role": "user", "content": payload.message[:20000]})
+                try:
+                    return MODEL.stream(msgs, on_delta=push)
+                finally:
+                    loop.call_soon_threadsafe(queue.put_nowait, None)
+
+            task = loop.run_in_executor(None, worker)
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield sse("delta", {"delta": item})
+            try:
+                result = await task
+            except Exception as exc:
+                detail = f"model error: {exc}"[:800]
+                MESSAGES.add(tenant_id, conversation_id, "assistant", detail, {"error": "model_error"})
+                yield sse("error", {"detail": detail})
+                yield sse("done", {"conversation_id": conversation_id})
+                return
+            text = result["text"]
+            sanitized, verdict = CLASSIFIER.sanitize(text)
+            try:
+                TENANTS.charge_tokens(tenant_id, int(result["usage"].get("total_tokens") or 0))
+            except BudgetExceeded as exc:
+                yield sse("error", {"detail": str(exc)})
+            MESSAGES.add(tenant_id, conversation_id, "assistant", sanitized, {"mode": "chat", "classifier": verdict, "usage": result["usage"]})
+            yield sse("message", {"role": "assistant", "content": sanitized})
+            yield sse("done", {"conversation_id": conversation_id})
+            return
+
+        spec = ProceduralSpec.build(
+            tenant_id=tenant_id,
+            objective=plan["objective"],
+            success_criteria=plan["success_criteria"],
+            constraints=plan["constraints"],
+            allowed_tools=tenant.allowed_tools,
+            max_steps=int(payload.max_steps or plan["max_steps"]),
+            verifiers=plan["verifiers"],
+            metadata={"conversation_id": conversation_id, "origin": "chat"},
+        )
+        queue = BUS.subscribe(f"conv:{conversation_id}")
+        try:
+            run_id = await loop.run_in_executor(None, ORCHESTRATOR.start, tenant_id, conversation_id, spec, None)
+        except Exception as exc:
+            BUS.unsubscribe(f"conv:{conversation_id}", queue)
+            detail = f"failed to start run: {exc}"[:600]
+            MESSAGES.add(tenant_id, conversation_id, "assistant", detail, {"error": "run_start_failed"})
+            yield sse("error", {"detail": detail})
+            yield sse("done", {"conversation_id": conversation_id})
+            return
+        yield sse("run_started", {"run_id": run_id, "objective": spec.objective, "max_steps": spec.max_steps})
+        try:
+            while True:
+                try:
+                    evt = await asyncio.wait_for(queue.get(), timeout=25.0)
+                except asyncio.TimeoutError:
+                    row = RUNS.get(run_id, tenant_id)
+                    status = row["status"] if row else "unknown"
+                    yield sse("heartbeat", {"run_id": run_id, "status": status, "step": int(row["step"]) if row else 0})
+                    if status in (RunStatus.COMPLETED.value, RunStatus.FAILED.value, RunStatus.CANCELLED.value, RunStatus.ERROR.value):
+                        break
+                    continue
+                if evt.get("run_id") != run_id:
+                    continue
+                yield sse(evt["kind"], {"run_id": run_id, "seq": evt["seq"], **(evt.get("payload") or {})})
+                if evt["kind"] in ("run_finished", "run_error", "run_cancelled"):
+                    break
+        finally:
+            BUS.unsubscribe(f"conv:{conversation_id}", queue)
+        yield sse("done", {"conversation_id": conversation_id, "run_id": run_id})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
+@app.post("/api/runs")
+async def create_run(payload: StartRunRequest, tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
+    allowed = payload.allowed_tools or tenant.allowed_tools
+    invalid = [t for t in allowed if t not in TOOLS.names()]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"unknown tools requested: {invalid}")
+    denied = [t for t in allowed if t not in tenant.allowed_tools]
+    if denied:
+        raise HTTPException(status_code=403, detail=f"tools not authorized for tenant: {denied}")
+    conversation_id = MESSAGES.ensure_conversation(tenant.tenant_id, payload.conversation_id, payload.objective[:80]) if payload.conversation_id else None
+    spec = ProceduralSpec.build(
+        tenant_id=tenant.tenant_id,
+        objective=payload.objective,
+        success_criteria=payload.success_criteria,
+        constraints=payload.constraints,
+        allowed_tools=allowed,
+        max_steps=payload.max_steps,
+        verifiers=payload.verifiers,
+        metadata=payload.metadata,
+    )
+    loop = asyncio.get_running_loop()
+    run_id = await loop.run_in_executor(None, ORCHESTRATOR.start, tenant.tenant_id, conversation_id, spec, None)
+    return {"run_id": run_id, "status": RunStatus.RUNNING.value, "spec": spec.to_dict()}
+
+
 @app.get("/api/runs")
-async def list_runs(status_filter: Optional[str] = Query(default=None, alias="status"),
-                    limit: int = Query(default=100, ge=1, le=500),
-                    tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    runs = RUNS.list_runs(tenant.tenant_id, status_filter, limit)
-    return {"runs": [r.to_dict() for r in runs], "active": SUPERVISOR.active()}
+async def list_runs(tenant: Tenant = Depends(resolve_tenant), limit: int = 100, status: Optional[str] = None) -> Dict[str, Any]:
+    return {"runs": RUNS.list(tenant.tenant_id, min(500, max(1, limit)), status), "active": ORCHESTRATOR.active_runs()}
 
 
 @app.get("/api/runs/{run_id}")
-async def get_run(run_id: str, tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    record = RUNS.get_scoped(tenant.tenant_id, run_id)
-    if record is None:
+async def get_run(run_id: str, tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
+    row = RUNS.get(run_id, tenant.tenant_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="run not found")
-    spec = SPECS.get(record.spec_id)
-    payload = record.to_dict()
-    payload["spec"] = spec.frozen_view() if spec else None
-    payload["checkpoint"] = CHECKPOINTS.latest(run_id)
-    payload["traces"] = MEMORY.run_traces(run_id, 200)
-    reflection = REFLECTOR.latest(run_id)
-    payload["reflection"] = reflection.to_dict() if reflection else None
-    return payload
-
-
-@app.get("/api/runs/{run_id}/checkpoints")
-async def run_checkpoints(run_id: str, tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    if RUNS.get_scoped(tenant.tenant_id, run_id) is None:
-        raise HTTPException(status_code=404, detail="run not found")
-    return {"checkpoints": CHECKPOINTS.history(run_id), "latest": CHECKPOINTS.latest(run_id)}
+    ckpt = CHECKPOINTS.latest(run_id)
+    return {
+        "run_id": run_id,
+        "status": row["status"],
+        "step": int(row["step"]),
+        "spec": jload(row["spec"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "finished_at": row["finished_at"],
+        "tokens_used": int(row["tokens_used"]),
+        "wall_ms": int(row["wall_ms"]),
+        "verdict": jload(row["verdict"], None),
+        "terminal_state": jload(row["terminal_state"], None),
+        "error": row["error"],
+        "resume_count": int(row["resume_count"]),
+        "state": ckpt["sigma"] if ckpt else None,
+        "observation": ckpt["observation"] if ckpt else None,
+        "checkpoint_integrity": ckpt["integrity_ok"] if ckpt else None,
+        "working_memory": WM.load(tenant.tenant_id, run_id),
+        "cognition": COGNITION.latest(run_id),
+    }
 
 
 @app.get("/api/runs/{run_id}/traces")
-async def run_traces(run_id: str, tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    if RUNS.get_scoped(tenant.tenant_id, run_id) is None:
+async def run_traces(run_id: str, tenant: Tenant = Depends(resolve_tenant), limit: int = 200) -> Dict[str, Any]:
+    row = RUNS.get(run_id, tenant.tenant_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="run not found")
-    return {"traces": MEMORY.run_traces(run_id, 500)}
-
-
-@app.post("/api/runs/{run_id}/pause")
-async def pause_run(run_id: str, tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    if RUNS.get_scoped(tenant.tenant_id, run_id) is None:
-        raise HTTPException(status_code=404, detail="run not found")
-    return {"ok": SUPERVISOR.pause(run_id)}
-
-
-@app.post("/api/runs/{run_id}/resume")
-async def resume_run(run_id: str, tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    if RUNS.get_scoped(tenant.tenant_id, run_id) is None:
-        raise HTTPException(status_code=404, detail="run not found")
-    return {"ok": SUPERVISOR.resume(run_id)}
-
-
-@app.post("/api/runs/{run_id}/cancel")
-async def cancel_run(run_id: str, tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    if RUNS.get_scoped(tenant.tenant_id, run_id) is None:
-        raise HTTPException(status_code=404, detail="run not found")
-    return {"ok": SUPERVISOR.cancel(run_id)}
+    return {"run_id": run_id, "traces": TRACES.for_run(run_id, min(2000, max(1, limit)))}
 
 
 @app.get("/api/runs/{run_id}/events")
-async def run_events(run_id: str, request: Request, tenant: Tenant = Depends(require_tenant)) -> StreamingResponse:
-    record = RUNS.get_scoped(tenant.tenant_id, run_id)
-    if record is None:
+async def run_events(run_id: str, tenant: Tenant = Depends(resolve_tenant), after: int = 0, limit: int = 500) -> Dict[str, Any]:
+    row = RUNS.get(run_id, tenant.tenant_id)
+    if row is None:
         raise HTTPException(status_code=404, detail="run not found")
-    topic = f"run:{run_id}"
-    queue = await BUS.subscribe(topic)
+    rows = STORE.query(
+        "SELECT event_id, kind, payload, created_at, seq FROM events WHERE run_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
+        (run_id, int(after), min(2000, max(1, limit))),
+    )
+    return {
+        "run_id": run_id,
+        "events": [{"event_id": r["event_id"], "kind": r["kind"], "payload": jload(r["payload"], {}), "created_at": r["created_at"], "seq": int(r["seq"])} for r in rows],
+    }
 
-    async def generator() -> AsyncGenerator[str, None]:
+
+@app.get("/api/runs/{run_id}/checkpoints")
+async def run_checkpoints(run_id: str, tenant: Tenant = Depends(resolve_tenant), limit: int = 50) -> Dict[str, Any]:
+    row = RUNS.get(run_id, tenant.tenant_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    rows = STORE.query(
+        "SELECT checkpoint_id, step, node, digest, created_at FROM checkpoints WHERE run_id = ? ORDER BY step DESC, created_at DESC LIMIT ?",
+        (run_id, min(500, max(1, limit))),
+    )
+    return {"run_id": run_id, "checkpoints": [dict(r) for r in rows], "latest": CHECKPOINTS.latest(run_id)}
+
+
+@app.post("/api/runs/{run_id}/pause")
+async def pause_run(run_id: str, tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
+    if RUNS.get(run_id, tenant.tenant_id) is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return {"run_id": run_id, "paused": ORCHESTRATOR.pause(run_id)}
+
+
+@app.post("/api/runs/{run_id}/resume")
+async def resume_run(run_id: str, tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
+    row = RUNS.get(run_id, tenant.tenant_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    if ORCHESTRATOR.resume_paused(run_id):
+        return {"run_id": run_id, "resumed": True, "mode": "unpaused"}
+    spec = ProceduralSpec.from_dict(jload(row["spec"], {}) or {})
+    loop = asyncio.get_running_loop()
+    new_run = await loop.run_in_executor(None, ORCHESTRATOR.start, tenant.tenant_id, row["conversation_id"], spec, run_id)
+    return {"run_id": new_run, "resumed": True, "mode": "restarted_from_checkpoint"}
+
+
+@app.post("/api/runs/{run_id}/cancel")
+async def cancel_run(run_id: str, tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
+    if RUNS.get(run_id, tenant.tenant_id) is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return {"run_id": run_id, "cancelled": ORCHESTRATOR.cancel(run_id)}
+
+
+@app.get("/api/runs/{run_id}/stream")
+async def stream_run(run_id: str, tenant: Tenant = Depends(resolve_tenant)) -> StreamingResponse:
+    row = RUNS.get(run_id, tenant.tenant_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="run not found")
+
+    async def gen() -> Iterable[bytes]:
+        queue = BUS.subscribe(f"run:{run_id}")
         try:
-            yield _sse("snapshot", record.to_dict())
+            snapshot = CHECKPOINTS.latest(run_id)
+            yield f"event: snapshot\ndata: {jdump({'run_id': run_id, 'status': row['status'], 'step': int(row['step']), 'state': snapshot['sigma'] if snapshot else None})}\n\n".encode("utf-8")
             while True:
-                if await request.is_disconnected():
-                    break
                 try:
-                    message = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    evt = await asyncio.wait_for(queue.get(), timeout=25.0)
                 except asyncio.TimeoutError:
-                    live = RUNS.get(run_id)
-                    yield _sse("heartbeat", {"ts": iso(), "status": live.status.value if live else "unknown"})
-                    if live and live.status in (RunState.SUCCEEDED, RunState.FAILED, RunState.CANCELLED):
-                        yield _sse("closed", {"status": live.status.value})
+                    current = RUNS.get(run_id, tenant.tenant_id)
+                    status = current["status"] if current else "unknown"
+                    yield f"event: heartbeat\ndata: {jdump({'run_id': run_id, 'status': status})}\n\n".encode("utf-8")
+                    if status in (RunStatus.COMPLETED.value, RunStatus.FAILED.value, RunStatus.CANCELLED.value, RunStatus.ERROR.value):
                         break
                     continue
-                yield _sse(message.get("type", "message"), message)
-                if message.get("type") == "final":
-                    yield _sse("closed", {"status": message.get("status")})
+                yield f"event: {evt['kind']}\ndata: {jdump({'run_id': run_id, 'seq': evt['seq'], **(evt.get('payload') or {})})}\n\n".encode("utf-8")
+                if evt["kind"] in ("run_finished", "run_error", "run_cancelled"):
                     break
         finally:
-            await BUS.unsubscribe(topic, queue)
+            BUS.unsubscribe(f"run:{run_id}", queue)
 
-    return StreamingResponse(generator(), media_type="text/event-stream", headers={
-        "Cache-Control": "no-cache, no-transform",
-        "X-Accel-Buffering": "no",
-        "Connection": "keep-alive",
-    })
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
 
 
-@app.websocket("/ws/runs/{run_id}")
-async def ws_run(websocket: WebSocket, run_id: str) -> None:
+@app.websocket("/api/ws")
+async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
-    key = websocket.query_params.get("api_key") or os.environ.get("AGENT_DEFAULT_API_KEY", "local-dev-key")
-    tenant = TENANTS.by_api_key(key)
-    if tenant is None:
-        await websocket.send_text(jdump({"type": "error", "error": "unauthorized"}))
+    tenant_id = websocket.query_params.get("tenant_id") or "public"
+    api_key = websocket.query_params.get("api_key")
+    try:
+        tenant = TENANTS.authenticate(tenant_id, api_key)
+    except SecurityError as exc:
+        await websocket.send_text(jdump({"kind": "error", "detail": str(exc)}))
         await websocket.close(code=4401)
         return
-    record = RUNS.get_scoped(tenant.tenant_id, run_id)
-    if record is None:
-        await websocket.send_text(jdump({"type": "error", "error": "run not found"}))
-        await websocket.close(code=4404)
-        return
-    topic = f"run:{run_id}"
-    queue = await BUS.subscribe(topic)
-    await websocket.send_text(jdump({"type": "snapshot", **record.to_dict()}))
+    topic = "global"
+    run_id = websocket.query_params.get("run_id")
+    conversation_id = websocket.query_params.get("conversation_id")
+    if run_id:
+        topic = f"run:{run_id}"
+    elif conversation_id:
+        topic = f"conv:{conversation_id}"
+    queue = BUS.subscribe(topic)
+    await websocket.send_text(jdump({"kind": "connected", "topic": topic, "tenant_id": tenant.tenant_id, "time": iso()}))
 
     async def pump() -> None:
         while True:
-            try:
-                message = await asyncio.wait_for(queue.get(), timeout=15.0)
-            except asyncio.TimeoutError:
-                live = RUNS.get(run_id)
-                await websocket.send_text(jdump({"type": "heartbeat", "ts": iso(),
-                                                 "status": live.status.value if live else "unknown"}))
+            evt = await queue.get()
+            if evt.get("tenant_id") and evt.get("tenant_id") != tenant.tenant_id:
                 continue
-            await websocket.send_text(jdump(message))
-            if message.get("type") == "final":
-                return
+            await websocket.send_text(jdump(evt))
 
     pump_task = asyncio.create_task(pump())
     try:
         while True:
-            done, _pending = await asyncio.wait(
-                {pump_task, asyncio.create_task(websocket.receive_text())},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if pump_task in done:
-                break
-            for task in done:
-                if task is pump_task:
-                    continue
-                try:
-                    raw = task.result()
-                except (WebSocketDisconnect, RuntimeError):
-                    raise WebSocketDisconnect(code=1000)
-                command = jload(raw, {}) or {}
-                action = str(command.get("action", ""))
-                if action == "pause":
-                    await websocket.send_text(jdump({"type": "ack", "action": action, "ok": SUPERVISOR.pause(run_id)}))
-                elif action == "resume":
-                    await websocket.send_text(jdump({"type": "ack", "action": action, "ok": SUPERVISOR.resume(run_id)}))
-                elif action == "cancel":
-                    await websocket.send_text(jdump({"type": "ack", "action": action, "ok": SUPERVISOR.cancel(run_id)}))
-                elif action == "ping":
-                    await websocket.send_text(jdump({"type": "pong", "ts": iso()}))
+            msg = await websocket.receive_text()
+            try:
+                data = json.loads(msg)
+            except Exception:
+                data = {"kind": "ping"}
+            kind = str(data.get("kind") or "ping")
+            if kind == "ping":
+                await websocket.send_text(jdump({"kind": "pong", "time": iso()}))
+            elif kind == "cancel" and data.get("run_id"):
+                ORCHESTRATOR.cancel(str(data["run_id"]))
+                await websocket.send_text(jdump({"kind": "ack", "action": "cancel", "run_id": data["run_id"]}))
+            elif kind == "pause" and data.get("run_id"):
+                ORCHESTRATOR.pause(str(data["run_id"]))
+                await websocket.send_text(jdump({"kind": "ack", "action": "pause", "run_id": data["run_id"]}))
+            elif kind == "resume" and data.get("run_id"):
+                ORCHESTRATOR.resume_paused(str(data["run_id"]))
+                await websocket.send_text(jdump({"kind": "ack", "action": "resume", "run_id": data["run_id"]}))
     except WebSocketDisconnect:
         pass
     except Exception as exc:
-        LOG.warning("websocket error on %s: %s", run_id, exc)
+        log.debug("websocket closed: %s", exc)
     finally:
         pump_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await pump_task
-        await BUS.unsubscribe(topic, queue)
-        with contextlib.suppress(Exception):
-            await websocket.close()
+        BUS.unsubscribe(topic, queue)
 
 
 @app.get("/api/skills")
-async def list_skills(include_quarantined: bool = Query(default=False),
-                      tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    skills = MEMORY.em.list_skills(tenant.tenant_id, include_quarantined)
-    return {"skills": [{
-        **s.prompt_view(),
-        "description": s.description,
-        "success_count": s.success_count,
-        "failure_count": s.failure_count,
-        "quarantined": bool(s.quarantined),
-        "updated_at": s.updated_at,
-    } for s in skills]}
+async def list_skills(tenant: Tenant = Depends(resolve_tenant), limit: int = 200, query: Optional[str] = None) -> Dict[str, Any]:
+    if query:
+        found = EM.search(tenant.tenant_id, query, min(50, max(1, limit)))
+        return {"skills": [{**s.to_dict(), "relevance": sc} for s, sc in found]}
+    return {"skills": [s.to_dict() for s in EM.list(tenant.tenant_id, min(1000, max(1, limit)))]}
 
 
 @app.post("/api/skills")
-async def upsert_skill(body: SkillUpsertRequest, tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    registered = set(TOOLS.names())
-    tools = [t for t in body.tools if t in registered]
-    skill = MEMORY.em.upsert(
-        tenant_id=tenant.tenant_id,
-        name=re.sub(r"[^a-zA-Z0-9_]+", "_", body.name).strip("_").lower()[:48] or "skill",
-        description=body.description,
-        trigger_signature=body.when_to_use,
-        procedure=[str(p)[:400] for p in body.procedure][:32],
-        tools=tools[:16],
-        reason="operator upsert",
+async def upsert_skill(payload: SkillRequest, tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
+    skill = EM.upsert(
+        tenant.tenant_id,
+        payload.name,
+        payload.summary,
+        payload.procedure,
+        payload.preconditions,
+        payload.failure_modes,
+        payload.tags,
+        payload.category,
     )
-    MEMORY.em._write_disk(skill)
-    return {"skill": skill.prompt_view()}
+    return {"skill": skill.to_dict()}
 
 
-@app.post("/api/skills/{skill_id}/quarantine")
-async def quarantine_skill(skill_id: str, enabled: bool = Query(default=True),
-                           tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    skill = MEMORY.em.get(skill_id)
-    if skill is None or skill.tenant_id != tenant.tenant_id:
+@app.delete("/api/skills/{skill_id}")
+async def retire_skill(skill_id: str, tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
+    if EM.get(tenant.tenant_id, skill_id) is None:
         raise HTTPException(status_code=404, detail="skill not found")
-    MEMORY.em.set_quarantine(skill_id, enabled)
-    return {"ok": True, "skill_id": skill_id, "quarantined": enabled}
-
-
-@app.post("/api/skills/{skill_id}/rollback")
-async def rollback_skill(skill_id: str, tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    skill = MEMORY.em.get(skill_id)
-    if skill is None or skill.tenant_id != tenant.tenant_id:
-        raise HTTPException(status_code=404, detail="skill not found")
-    ok = MEMORY.em.rollback(skill_id)
-    return {"ok": ok, "skill": (MEMORY.em.get(skill_id).prompt_view() if MEMORY.em.get(skill_id) else None)}
-
-
-@app.get("/api/skills/{skill_id}/evaluate")
-async def evaluate_skill(skill_id: str, tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    skill = MEMORY.em.get(skill_id)
-    if skill is None or skill.tenant_id != tenant.tenant_id:
-        raise HTTPException(status_code=404, detail="skill not found")
-    return GATE.evaluate_skill(skill, GATE.diagnostics(tenant.tenant_id))
+    EM.retire(tenant.tenant_id, skill_id)
+    return {"skill_id": skill_id, "retired": True}
 
 
 @app.get("/api/wiki")
-async def list_wiki(tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    return {"pages": MEMORY.wiki.list_pages(tenant.tenant_id), "diff": MEMORY.wiki.diff(1)[:8000]}
-
-
-@app.get("/api/wiki/{slug}")
-async def get_wiki(slug: str, tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    page = MEMORY.wiki.get(tenant.tenant_id, slug)
-    if page is None:
-        raise HTTPException(status_code=404, detail="page not found")
-    page.pop("embedding", None)
-    return page
+async def list_wiki(tenant: Tenant = Depends(resolve_tenant), limit: int = 100, query: Optional[str] = None) -> Dict[str, Any]:
+    if query:
+        return {"pages": WIKI.search(tenant.tenant_id, query, min(50, max(1, limit)))}
+    return {"pages": WIKI.list_pages(tenant.tenant_id, min(500, max(1, limit)))}
 
 
 @app.post("/api/wiki")
-async def upsert_wiki(body: WikiUpsertRequest, tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    return MEMORY.wiki.upsert(tenant.tenant_id, body.slug, body.title or body.slug, body.body, reason="operator")
+async def upsert_wiki(payload: WikiRequest, tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
+    return {"page": WIKI.upsert(tenant.tenant_id, payload.title, payload.body, payload.category)}
 
 
-@app.get("/api/memory/search")
-async def memory_search(q: str = Query(min_length=1), limit: int = Query(default=5, ge=1, le=25),
-                        tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    skills = MEMORY.em.retrieve(tenant.tenant_id, q, limit)
-    pages = MEMORY.wiki.search(tenant.tenant_id, q, limit)
-    return {
-        "query": q,
-        "skills": [s.prompt_view() for s in skills],
-        "wiki": [{"slug": p["slug"], "title": p["title"], "excerpt": p["body"][:1200]} for p in pages],
-    }
-
-
-@app.get("/api/diagnostics")
-async def list_diagnostics(tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    return {"diagnostics": GATE.diagnostics(tenant.tenant_id)}
-
-
-@app.post("/api/diagnostics")
-async def add_diagnostic(body: DiagnosticRequest, tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    task_id = GATE.add_diagnostic(tenant.tenant_id, body.name, body.payload, body.expectation)
-    return {"task_id": task_id}
-
-
-@app.get("/api/distillation")
-async def distillation_stats(limit: int = Query(default=100, ge=1, le=1000),
-                             tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    rows = DB.query(
-        "SELECT sample_id, run_id, step, reverse_kl, weight, created_at FROM distillation_samples"
-        " WHERE tenant_id=? ORDER BY created_at DESC LIMIT ?",
-        (tenant.tenant_id, limit),
+@app.get("/api/wiki/{slug}")
+async def get_wiki(slug: str, tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
+    page = WIKI.get_page(tenant.tenant_id, slug)
+    if page is None:
+        raise HTTPException(status_code=404, detail="page not found")
+    revisions = STORE.query(
+        "SELECT revision_id, version, diff, created_at FROM wiki_revisions WHERE page_id = ? ORDER BY version DESC LIMIT 30",
+        (page["page_id"],),
     )
-    samples = [{k: r[k] for k in r.keys()} for r in rows]
-    agg = DB.query_one(
-        "SELECT COUNT(*) AS n, AVG(reverse_kl) AS mean_kl, MAX(reverse_kl) AS max_kl FROM distillation_samples"
-        " WHERE tenant_id=?",
-        (tenant.tenant_id,),
-    )
-    priors = DB.query(
-        "SELECT signature, directive, logit, updates, updated_at FROM policy_priors WHERE tenant_id=?"
-        " ORDER BY logit DESC LIMIT 50",
-        (tenant.tenant_id,),
-    )
-    return {
-        "samples": samples,
-        "summary": {
-            "count": int(agg["n"]) if agg else 0,
-            "mean_reverse_kl": round(float(agg["mean_kl"] or 0.0), 8) if agg else 0.0,
-            "max_reverse_kl": round(float(agg["max_kl"] or 0.0), 8) if agg else 0.0,
-        },
-        "priors": [{k: r[k] for k in r.keys()} for r in priors],
-    }
+    return {"page": page, "revisions": [dict(r) for r in revisions]}
 
 
-@app.get("/api/ledger")
-async def ledger(limit: int = Query(default=200, ge=1, le=2000),
-                 run_id: Optional[str] = Query(default=None),
-                 tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    if run_id:
-        rows = DB.query(
-            "SELECT event_id, kind, payload, hash, created_at FROM raw_events WHERE tenant_id=? AND run_id=?"
-            " ORDER BY rowid DESC LIMIT ?",
-            (tenant.tenant_id, run_id, limit),
+@app.get("/api/patches")
+async def list_patches(tenant: Tenant = Depends(resolve_tenant), limit: int = 100, status: Optional[str] = None) -> Dict[str, Any]:
+    if status:
+        rows = STORE.query(
+            "SELECT * FROM skill_patches WHERE tenant_id = ? AND status = ? ORDER BY created_at DESC LIMIT ?",
+            (tenant.tenant_id, status, min(500, max(1, limit))),
         )
     else:
-        rows = DB.query(
-            "SELECT event_id, kind, payload, hash, created_at FROM raw_events WHERE tenant_id=?"
-            " ORDER BY rowid DESC LIMIT ?",
-            (tenant.tenant_id, limit),
+        rows = STORE.query(
+            "SELECT * FROM skill_patches WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?",
+            (tenant.tenant_id, min(500, max(1, limit))),
         )
     return {
-        "events": [{"event_id": r["event_id"], "kind": r["kind"], "payload": jload(r["payload"], {}),
-                    "hash": r["hash"], "created_at": r["created_at"]} for r in rows],
-        "integrity": LEDGER.verify_chain(1000),
+        "patches": [
+            {
+                "patch_id": r["patch_id"],
+                "component": r["component"],
+                "status": r["status"],
+                "diagnosis": r["diagnosis"],
+                "proposal": jload(r["proposal"], {}),
+                "gate_report": jload(r["gate_report"], {}),
+                "created_at": r["created_at"],
+                "decided_at": r["decided_at"],
+            }
+            for r in rows
+        ]
     }
 
 
-@app.get("/api/audit")
-async def audit(limit: int = Query(default=200, ge=1, le=2000),
-                tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    rows = DB.query(
-        "SELECT audit_id, actor, action, resource, allowed, detail, created_at FROM audit_log WHERE tenant_id=?"
-        " ORDER BY rowid DESC LIMIT ?",
-        (tenant.tenant_id, limit),
-    )
-    return {"audit": [{k: r[k] for k in r.keys()} for r in rows]}
-
-
-@app.get("/api/workspace/{run_id}")
-async def workspace_listing(run_id: str, path: str = Query(default="."),
-                            tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    if RUNS.get_scoped(tenant.tenant_id, run_id) is None:
-        raise HTTPException(status_code=404, detail="run not found")
-    sandbox = FileSystemSandbox(WORKSPACE_ROOT / tenant.tenant_id / run_id)
-    try:
-        return sandbox.list_dir(path, 3)
-    except (FileNotFoundError, ValueError) as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.get("/api/workspace/{run_id}/file")
-async def workspace_file(run_id: str, path: str = Query(min_length=1),
-                         tenant: Tenant = Depends(require_tenant)) -> Dict[str, Any]:
-    if RUNS.get_scoped(tenant.tenant_id, run_id) is None:
-        raise HTTPException(status_code=404, detail="run not found")
-    sandbox = FileSystemSandbox(WORKSPACE_ROOT / tenant.tenant_id / run_id)
-    try:
-        result = sandbox.read_file(path)
-    except (FileNotFoundError, ValueError) as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    result["content"] = OutputClassifier.redact(result["content"])
+@app.post("/api/patches/evaluate")
+async def meta_evaluate(tenant: Tenant = Depends(resolve_tenant), run_id: Optional[str] = None) -> Dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, META.consider, tenant.tenant_id, run_id)
     return result
 
 
-@app.post("/api/admin/tenants")
-async def create_tenant(body: TenantCreateRequest, _admin: bool = Depends(require_admin)) -> Dict[str, Any]:
+@app.post("/api/patches/{patch_id}/gate")
+async def gate_patch(patch_id: str, tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, GATE.evaluate, tenant.tenant_id, patch_id)
+
+
+@app.post("/api/patches/{patch_id}/rollback")
+async def rollback_patch(patch_id: str, tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, GATE.rollback, tenant.tenant_id, patch_id)
+
+
+@app.get("/api/reflections")
+async def list_reflections(tenant: Tenant = Depends(resolve_tenant), limit: int = 50, run_id: Optional[str] = None) -> Dict[str, Any]:
+    if run_id:
+        rows = STORE.query(
+            "SELECT * FROM reflection_patches WHERE tenant_id = ? AND run_id = ? ORDER BY created_at DESC LIMIT ?",
+            (tenant.tenant_id, run_id, min(200, max(1, limit))),
+        )
+    else:
+        rows = STORE.query(
+            "SELECT * FROM reflection_patches WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?",
+            (tenant.tenant_id, min(200, max(1, limit))),
+        )
+    return {
+        "reflections": [
+            {
+                "reflection_id": r["reflection_id"],
+                "run_id": r["run_id"],
+                "verdict": r["verdict"],
+                "failure_points": jload(r["failure_points"], []),
+                "pivot_actions": jload(r["pivot_actions"], []),
+                "patch_text": r["patch_text"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.post("/api/distill/optimize")
+async def optimize_policy(payload: OptimizeRequest, tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    report = await loop.run_in_executor(
+        None,
+        DISTILLER.optimize,
+        tenant.tenant_id,
+        payload.run_id,
+        payload.learning_rate,
+        payload.epochs,
+        payload.limit,
+    )
+    return report
+
+
+@app.get("/api/distill/samples")
+async def distill_samples(tenant: Tenant = Depends(resolve_tenant), limit: int = 50, run_id: Optional[str] = None) -> Dict[str, Any]:
+    if run_id:
+        rows = STORE.query(
+            "SELECT sample_id, run_id, step, reverse_kl, advantage, created_at, tokens FROM distill_samples WHERE tenant_id = ? AND run_id = ? ORDER BY step ASC LIMIT ?",
+            (tenant.tenant_id, run_id, min(500, max(1, limit))),
+        )
+    else:
+        rows = STORE.query(
+            "SELECT sample_id, run_id, step, reverse_kl, advantage, created_at, tokens FROM distill_samples WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?",
+            (tenant.tenant_id, min(500, max(1, limit))),
+        )
+    return {
+        "samples": [
+            {
+                "sample_id": r["sample_id"],
+                "run_id": r["run_id"],
+                "step": int(r["step"]),
+                "reverse_kl": float(r["reverse_kl"]),
+                "advantage": float(r["advantage"]),
+                "token_count": len(jload(r["tokens"], []) or []),
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.get("/api/policy/weights")
+async def policy_weights(tenant: Tenant = Depends(resolve_tenant), limit: int = 200) -> Dict[str, Any]:
+    rows = STORE.query(
+        "SELECT feature, weight, updates, updated_at FROM policy_weights WHERE tenant_id = ? ORDER BY ABS(weight) DESC LIMIT ?",
+        (tenant.tenant_id, min(2000, max(1, limit))),
+    )
+    return {"weights": [dict(r) for r in rows]}
+
+
+@app.get("/api/memory/{run_id}")
+async def memory_snapshot(run_id: str, tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
+    if RUNS.get(run_id, tenant.tenant_id) is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    ckpt = CHECKPOINTS.latest(run_id)
+    sigma = ckpt["sigma"] if ckpt else empty_sigma()
+    query = WM.routing_query(ProceduralSpec.from_dict(jload(RUNS.get(run_id, tenant.tenant_id)["spec"], {}) or {}), sigma, Observation.initial(0, ""))
+    skills = EM.search(tenant.tenant_id, query, 3)
+    return {
+        "run_id": run_id,
+        "working_memory": WM.load(tenant.tenant_id, run_id),
+        "state": sigma,
+        "routed_skills": [{"skill": s.to_dict(), "relevance": sc} for s, sc in skills],
+        "cognition": COGNITION.latest(run_id),
+    }
+
+
+@app.get("/api/traces/failures")
+async def failure_traces(tenant: Tenant = Depends(resolve_tenant), limit: int = 60) -> Dict[str, Any]:
+    return {"failures": TRACES.failures(tenant.tenant_id, min(500, max(1, limit)))}
+
+
+@app.get("/api/audit")
+async def audit_log(tenant: Tenant = Depends(resolve_tenant), limit: int = 200) -> Dict[str, Any]:
+    rows = STORE.query(
+        "SELECT audit_id, run_id, actor, action, detail, allowed, created_at FROM audit_log WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?",
+        (tenant.tenant_id, min(2000, max(1, limit))),
+    )
+    return {"audit": [{**dict(r), "detail": jload(r["detail"], {}), "allowed": bool(r["allowed"])} for r in rows]}
+
+
+@app.get("/api/tools")
+async def list_tools(tenant: Tenant = Depends(resolve_tenant)) -> Dict[str, Any]:
+    return {
+        "tools": [
+            {"name": name, "description": spec.description, "schema": spec.schema, "mutating": spec.mutating, "authorized": name in tenant.allowed_tools}
+            for name, spec in TOOLS.tools.items()
+        ]
+    }
+
+
+@app.get("/api/workspace/{run_id}")
+async def workspace_list(run_id: str, tenant: Tenant = Depends(resolve_tenant), path: str = ".") -> Dict[str, Any]:
+    if RUNS.get(run_id, tenant.tenant_id) is None:
+        raise HTTPException(status_code=404, detail="run not found")
     try:
-        risk = ToolRisk(body.allowed_risk)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="allowed_risk must be safe, guarded or privileged")
-    if TENANTS.by_api_key(body.api_key) is not None:
-        raise HTTPException(status_code=409, detail="api key already in use")
-    tenant = TENANTS.create(body.name, body.api_key, body.token_budget, risk)
-    _seed_defaults()
-    return {"tenant_id": tenant.tenant_id, "name": tenant.name, "allowed_risk": tenant.allowed_risk.value,
-            "token_budget": tenant.token_budget}
+        return WORKSPACE.list_dir(tenant.tenant_id, run_id, path)
+    except SecurityError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
 
-@app.get("/api/admin/tenants")
-async def list_tenants(_admin: bool = Depends(require_admin)) -> Dict[str, Any]:
-    return {"tenants": [{"tenant_id": t.tenant_id, "name": t.name, "token_budget": t.token_budget,
-                         "tokens_used": t.tokens_used, "allowed_risk": t.allowed_risk.value}
-                        for t in TENANTS.list_all()]}
+@app.get("/api/workspace/{run_id}/file")
+async def workspace_file(run_id: str, path: str, tenant: Tenant = Depends(resolve_tenant), start: int = 1, end: Optional[int] = None) -> Dict[str, Any]:
+    if RUNS.get(run_id, tenant.tenant_id) is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    try:
+        return WORKSPACE.read_file(tenant.tenant_id, run_id, path, start, end)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except SecurityError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+
+
+@app.post("/api/admin/tenants")
+async def create_tenant(payload: TenantRequest, _: bool = Depends(require_admin)) -> Dict[str, Any]:
+    tenant = TENANTS.ensure_tenant(payload.tenant_id, payload.name, payload.api_key, payload.token_budget)
+    return {"tenant_id": tenant.tenant_id, "name": tenant.name, "token_budget": tenant.token_budget, "allowed_tools": tenant.allowed_tools}
+
+
+@app.get("/api/admin/stats")
+async def admin_stats(_: bool = Depends(require_admin)) -> Dict[str, Any]:
+    def scalar(sql: str, params: Iterable[Any] = ()) -> int:
+        row = STORE.one(sql, params)
+        return int(row[0]) if row else 0
+
+    return {
+        "tenants": scalar("SELECT COUNT(*) FROM tenants"),
+        "runs": scalar("SELECT COUNT(*) FROM runs"),
+        "runs_running": scalar("SELECT COUNT(*) FROM runs WHERE status = ?", (RunStatus.RUNNING.value,)),
+        "runs_completed": scalar("SELECT COUNT(*) FROM runs WHERE status = ?", (RunStatus.COMPLETED.value,)),
+        "runs_failed": scalar("SELECT COUNT(*) FROM runs WHERE status = ?", (RunStatus.FAILED.value,)),
+        "checkpoints": scalar("SELECT COUNT(*) FROM checkpoints"),
+        "traces": scalar("SELECT COUNT(*) FROM raw_traces"),
+        "skills": scalar("SELECT COUNT(*) FROM skills WHERE status = 'active'"),
+        "wiki_pages": scalar("SELECT COUNT(*) FROM wiki_pages"),
+        "patches_applied": scalar("SELECT COUNT(*) FROM skill_patches WHERE status = 'applied'"),
+        "patches_rejected": scalar("SELECT COUNT(*) FROM skill_patches WHERE status = 'rejected'"),
+        "distill_samples": scalar("SELECT COUNT(*) FROM distill_samples"),
+        "policy_features": scalar("SELECT COUNT(*) FROM policy_weights"),
+        "active_workers": ORCHESTRATOR.active_runs(),
+        "model_tokens": {"prompt": MODEL.total_prompt_tokens, "completion": MODEL.total_completion_tokens},
+    }
 
 
 @app.post("/api/admin/recover")
-async def admin_recover(_admin: bool = Depends(require_admin)) -> Dict[str, Any]:
-    return {"recovered": SUPERVISOR.recover_orphans(), "active": SUPERVISOR.active()}
+async def admin_recover(_: bool = Depends(require_admin)) -> Dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    recovered = await loop.run_in_executor(None, ORCHESTRATOR.recover)
+    return {"recovered": recovered}
 
 
-@app.get("/api/admin/graph")
-async def admin_graph(_admin: bool = Depends(require_admin)) -> Dict[str, Any]:
-    return {"graph": GRAPH.describe(), "nodes": [n.value for n in NodeKind]}
+INDEX_FALLBACK = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Autonomous Agent Runtime</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b0d11; color: #e6e8ec; margin: 0; padding: 48px; }
+main { max-width: 760px; margin: 0 auto; }
+h1 { font-weight: 600; letter-spacing: -0.02em; }
+code { background: #171a21; padding: 2px 6px; border-radius: 4px; }
+a { color: #7aa2f7; }
+ul { line-height: 1.9; }
+</style>
+</head>
+<body>
+<main>
+<h1>Autonomous Agent Runtime</h1>
+<p>The backend is running. Place <code>index.html</code> next to <code>main.py</code> (or set <code>AGENT_STATIC</code>) to serve the frontend from this route.</p>
+<ul>
+<li><a href="/api/health">/api/health</a></li>
+<li><a href="/api/docs">/api/docs</a></li>
+<li><code>POST /api/chat</code> streaming SSE chat and agent dispatch</li>
+<li><code>POST /api/runs</code> launch a durable autonomous run</li>
+<li><code>GET /api/runs/{run_id}/stream</code> live run telemetry</li>
+<li><code>WS /api/ws</code> bidirectional control channel</li>
+</ul>
+</main>
+</body>
+</html>"""
 
 
-@app.get("/", include_in_schema=False)
-async def serve_index() -> Response:
-    if STATIC_INDEX.exists():
-        return FileResponse(str(STATIC_INDEX), media_type="text/html")
-    return HTMLResponse(
-        "<!doctype html><html><head><meta charset='utf-8'><title>Autonomous Agent Runtime</title></head>"
-        "<body style='font-family:system-ui;background:#0b0f14;color:#e6edf3;padding:40px'>"
-        "<h1>Autonomous Agent Runtime</h1>"
-        "<p>index.html was not found next to main.py. The API is live at "
-        "<a style='color:#58a6ff' href='/api/docs'>/api/docs</a>.</p></body></html>",
-        status_code=200,
-    )
+@app.get("/", response_class=HTMLResponse)
+async def serve_index() -> HTMLResponse:
+    for candidate in (STATIC_ROOT / "index.html", Path.cwd() / "index.html", Path(__file__).resolve().parent / "index.html"):
+        if candidate.exists() and candidate.is_file():
+            return HTMLResponse(candidate.read_text(encoding="utf-8"))
+    return HTMLResponse(INDEX_FALLBACK)
 
 
-@app.get("/favicon.ico", include_in_schema=False)
-async def favicon() -> Response:
-    return Response(status_code=204)
+@app.get("/favicon.ico")
+async def favicon() -> PlainTextResponse:
+    return PlainTextResponse("", status_code=204)
 
 
-if (ROOT_DIR / "static").is_dir():
-    app.mount("/static", StaticFiles(directory=str(ROOT_DIR / "static")), name="static")
-
-
-@app.exception_handler(BudgetExceeded)
-async def budget_handler(_request: Request, exc: BudgetExceeded) -> JSONResponse:
-    return JSONResponse(status_code=429, content={"detail": str(exc)})
-
-
-@app.exception_handler(AuthorizationDenied)
-async def authz_handler(_request: Request, exc: AuthorizationDenied) -> JSONResponse:
-    return JSONResponse(status_code=403, content={"detail": str(exc)})
-
-
-@app.exception_handler(ValidationRejected)
-async def validation_handler(_request: Request, exc: ValidationRejected) -> JSONResponse:
-    return JSONResponse(status_code=422, content={"detail": exc.reasons})
-
-
-def _install_signal_handlers() -> None:
-    def handler(signum: int, _frame: Any) -> None:
-        LOG.info("received signal %s, draining workers", signum)
-        SUPERVISOR.shutdown()
-        raise SystemExit(0)
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        with contextlib.suppress(ValueError, AttributeError):
-            signal.signal(sig, handler)
+for _static_dir in ("assets", "static", "public"):
+    _candidate = STATIC_ROOT / _static_dir
+    if _candidate.exists() and _candidate.is_dir():
+        app.mount(f"/{_static_dir}", StaticFiles(directory=str(_candidate)), name=_static_dir)
 
 
 def main() -> None:
-    import uvicorn
-
-    _install_signal_handlers()
     host = os.environ.get("AGENT_HOST", "0.0.0.0")
     port = int(os.environ.get("AGENT_PORT", "8000"))
-    LOG.info("starting Autonomous Agent Runtime on %s:%s", host, port)
-    uvicorn.run(app, host=host, port=port, log_level=os.environ.get("LOG_LEVEL", "info").lower(),
-                timeout_keep_alive=75, access_log=False)
+    log.info("binding %s:%d", host, port)
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level=os.environ.get("UVICORN_LOG_LEVEL", "info"),
+        timeout_keep_alive=120,
+        access_log=False,
+    )
 
 
 if __name__ == "__main__":
